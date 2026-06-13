@@ -3,13 +3,19 @@
 Run from `projects/JobBots/jobbot-eng-ind`:
 
 ```powershell
-python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json
+python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json --drive
 ```
 
-The bot writes:
+The bot writes to Google Drive:
 
-- `D:\Job Search 2026\dd.MM.yyyy JobBot Eng Ind\email-report.txt`
-- `D:\Job Search 2026\dd.MM.yyyy JobBot Eng Ind\vacancies.json`
-- updates `D:\Job Search 2026\seen-vacancies.json`
+- `Projects/JobBots/jobbot-eng-ind/state/seen-vacancies.json`
+- `Projects/JobBots/jobbot-eng-ind/runs/yyyy-mm-dd/email-report.txt`
+- `Projects/JobBots/jobbot-eng-ind/runs/yyyy-mm-dd/vacancies.json`
+- `Projects/JobBots/jobbot-eng-ind/resumes/`
 
-Email sending is intentionally outside this script and is handled by the connected Gmail connector when requested in Codex.
+Credentials are expected at:
+
+- `credentials/google-oauth-client.json`
+- `credentials/google-token.json`
+
+The `credentials/` directory is ignored by git.
