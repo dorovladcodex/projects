@@ -1,7 +1,8 @@
 {
-  "output_root": "D:\\Job Search 2026",
-  "folder_suffix": "JobBot Eng Ind",
-  "state_file": "D:\\Job Search 2026\\seen-vacancies.json",
+  "drive_project_path": "Projects/JobBots/jobbot-eng-ind",
+  "state_file": "Projects/JobBots/jobbot-eng-ind/state/seen-vacancies.json",
+  "runs_path": "Projects/JobBots/jobbot-eng-ind/runs",
+  "resumes_path": "Projects/JobBots/jobbot-eng-ind/resumes",
   "recipient_email": "dorovlad@gmail.com",
   "focus": [
     "English-friendly Senior Data Engineer roles",
