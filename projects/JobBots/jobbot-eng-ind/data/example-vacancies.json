@@ -1,0 +1,14 @@
+[
+  {
+    "company": "Example Company",
+    "title": "Senior Data Engineer - Azure Databricks",
+    "location": "Remote, Germany",
+    "work_mode": "Remote",
+    "salary": "not specified",
+    "source": "manual indexed search",
+    "url": "https://example.com/job",
+    "language": "English required; German is a plus",
+    "priority": "A",
+    "analysis": "Example vacancy format for JobBot Eng Ind."
+  }
+]
