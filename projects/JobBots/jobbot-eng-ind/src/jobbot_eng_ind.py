@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_OUTPUT_ROOT = Path(r"D:\Job Search 2026")
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "seen-vacancies.json"
 DEFAULT_DRIVE_PATH = ["Projects", "JobBots", "jobbot-eng-ind"]
@@ -25,7 +24,7 @@ def vacancy_key(vacancy: dict[str, Any]) -> str:
 def load_json(path: Path, fallback: Any) -> Any:
     if not path.exists():
         return fallback
-    text = path.read_text(encoding="utf-8").strip()
+    text = path.read_text(encoding="utf-8-sig").strip()
     return json.loads(text) if text else fallback
 
 
