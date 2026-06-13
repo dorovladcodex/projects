@@ -23,3 +23,4 @@ Ask Codex:
 - Keep the active Codex automation TOML and this repository copy in sync.
 - Do not add Google Cloud resources for this bot unless explicitly requested.
 - Do not enable automatic CV generation.
+- Use Google Drive as primary storage: `Projects/JobBots/jobbot-nrw`.
