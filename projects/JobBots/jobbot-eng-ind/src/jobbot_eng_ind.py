@@ -6,8 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from drive_store import build_drive_service, download_json_file, ensure_path, upload_text_file
-
 
 DEFAULT_OUTPUT_ROOT = Path(r"D:\Job Search 2026")
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "seen-vacancies.json"
@@ -103,6 +101,8 @@ def main() -> None:
     now = datetime.now()
     vacancies = load_json(args.vacancies_json, [])
     if args.drive:
+        from drive_store import build_drive_service, download_json_file, ensure_path, upload_text_file
+
         drive = build_drive_service(args.google_client_file, args.google_token_file)
         project_folder = ensure_path(drive, DEFAULT_DRIVE_PATH)
         state_folder = ensure_path(drive, [*DEFAULT_DRIVE_PATH, "state"])
