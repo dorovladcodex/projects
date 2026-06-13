@@ -1,0 +1,9 @@
+[project]
+name = "jobbot-eng-ind"
+version = "0.1.0"
+description = "Manual English-friendly indexed job-search bot."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.ruff]
+line-length = 120
