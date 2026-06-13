@@ -1,0 +1,13 @@
+[project]
+name = "jobbot-nrw"
+version = "0.1.0"
+description = "Scheduled NRW/Germany job-search bot storage helpers."
+requires-python = ">=3.11"
+dependencies = [
+  "google-api-python-client>=2.170.0",
+  "google-auth>=2.40.0",
+  "google-auth-oauthlib>=1.2.0"
+]
+
+[tool.ruff]
+line-length = 120
