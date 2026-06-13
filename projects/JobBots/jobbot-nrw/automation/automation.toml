@@ -9,15 +9,24 @@ reasoning_effort = "medium"
 execution_environment = "worktree"
 cwds = ["C:\\Users\\dorov\\Documents\\Job Search"]
 
-# Repository copy of the Codex automation metadata.
-# The live full prompt is stored in the local Codex automation file:
-# C:\Users\dorov\.codex\automations\nrw-senior-data-oracle-job-monitor\automation.toml
-#
-# Core behavior:
-# - Search NRW/Germany remote Senior Data Engineer, Oracle PL/SQL, ERP/WMS, Azure Databricks roles.
-# - Prefer English-friendly roles, include German B1/B2 where strong, mark C1/C2 risk.
-# - Mix local NRW hybrid and full-remote roles by overall fit, not by work mode alone.
-# - Write reports under D:\Job Search 2026.
-# - Maintain D:\Job Search 2026\seen-vacancies.json.
-# - Send email report through connected Gmail.
-# - Do not generate tailored CVs automatically.
+prompt = """
+Search current job postings on German and Europe/Germany-remote job platforms, search-indexed job pages, recruiter pages, and company career pages for a Senior Data Engineer / Oracle PL/SQL / ERP-WMS / Azure Databricks specialist based near Dortmund, NRW.
+
+Candidate target: salary target at least EUR 85,000 gross/year where listed; hybrid, Homeoffice, mobiles Arbeiten, remote-first, full remote, 80-100% remote, or Germany-wide remote roles only. Hybrid is acceptable if the office is within about one hour from Dortmund or if onsite presence is low, for example 1 day/week or occasional workshops. Remote/Homeoffice/full remote must not automatically outrank strong local NRW hybrid vacancies. Produce a mixed list and rank by overall fit: technical match, seniority, salary likelihood, language fit, work mode, location practicality, domain match, company quality, and application urgency.
+
+Target roles: Senior Data Engineer, Azure Data Engineer, Databricks Data Engineer, Senior Azure & Databricks Engineer, Cloud Data Engineer, Data Platform Engineer, Data Integration Engineer, ETL Developer, SQL Developer, Oracle PL/SQL Developer, Oracle Developer, Oracle ERP Consultant, Oracle EBS/Cloud ERP Consultant, WMS Consultant, Logistics IT Consultant, Microsoft Fabric Data Engineer, Data Lakehouse Engineer, Analytics Engineer.
+
+Geography: Dortmund, Essen, Duesseldorf, Bochum, Duisburg, Muelheim an der Ruhr, Oberhausen, Wuppertal, Ratingen, Koeln and nearby NRW locations within roughly one hour of Dortmund, plus full remote Germany and Europe-based remote roles legally open to Germany-based candidates.
+
+Language: English-speaking roles preferred. Include roles requiring German B1/B2 when otherwise strong. Include German C1/C2 roles only when the technical/domain match is very strong and clearly mark the language risk.
+
+Source coverage: Search broadly across LinkedIn Jobs, StepStone, Indeed Germany, Glassdoor Germany, XING Jobs, Bundesagentur fuer Arbeit, Jobware, stellenanzeigen.de, Monster Germany, get in IT, WeAreDevelopers, Honeypot, GermanTechJobs, IT-Treff, Jobvector, Experteer, Talent.io, Join.com, Instaffo, Workwise, Remote OK, EU Remote Jobs, Remote Rocketship, Remotive, Wellfound, Welcome to the Jungle, Adzuna, Freelancermap, freelance.de, remotely.de, Joblift, Kimeta, recruiter sources, and company career pages. Treat Indeed, Glassdoor, and StepStone as explicit search-indexed sources and include direct domains plus indexed result snippets where direct crawling is limited.
+
+Source coverage reporting rule: Every email must include a compact section called Source coverage after the vacancy lists. Report which source groups were checked and their outcome: strong matches found, no relevant new matches, blocked/limited direct access, or skipped with reason. Always include at least these groups: StepStone-indexed, Indeed-indexed, Glassdoor-indexed, LinkedIn/XING-indexed, Adzuna/Joblift/Kimeta aggregators, Freelancermap/freelance.de projects, GermanTechJobs/get in IT/WeAreDevelopers, Remote-specific boards, recruiter sources, and company career pages.
+
+Email report rules: Put newly found interesting vacancies at the very top in a section called New / urgent matches. Sort by overall fit and urgency, not by remote status alone. After that include Still relevant / watchlist. For each vacancy include title, company, location, work mode, remote/Homeoffice details, source, link, salary if listed, language requirement as a separate line, contract type if visible, core tech match, fit score 1-10, NEW or previously seen, short analysis for Volodymyr, and recommendation whether to apply and how to adapt the CV. Send the email to dorovlad@gmail.com with subject NRW Senior Data/Oracle job monitor - daily results. If there are no strong new matches, still send a short email and list borderline roles worth watching.
+
+Output and state rules: Use Google Drive as the primary storage, not local folders. Use Drive path Projects/JobBots/jobbot-nrw. Store state at Projects/JobBots/jobbot-nrw/state/seen-vacancies.json. For every run, create or use Projects/JobBots/jobbot-nrw/runs/yyyy-mm-dd using the current Berlin date. For explicit initial/reset runs, append the requested suffix to the run folder name, for example yyyy-mm-dd Initial or yyyy-mm-dd Initial1. Save the email report as email-report.txt and structured vacancy data as vacancies.json in the run folder when possible. Store generated resumes only when explicitly requested under Projects/JobBots/jobbot-nrw/resumes/yyyy-mm-dd or the relevant run folder. In normal runs, update the Drive state file after the email report is prepared. In initial/reset runs, if the user asks to clear state first, back up seen-vacancies.json in the same Drive state folder, clear it, then write every listed vacancy as the new baseline. If Google Drive write access is unavailable, clearly state that in the email/report and do not silently fall back to local-only storage.
+
+CV generation rule: Do not automatically generate tailored resumes for every vacancy. Resume generation is manual. Only create a tailored DOCX and changes.txt when the user explicitly asks for a specific vacancy number, company, or title from a specific report. Use C:\\Users\\dorov\\Documents\\Job Search\\resume-template\\Senior Software Engineer - Volodymyr Doroshenko 2026.docx as the source template and never modify the template. Preserve original DOCX layout, styles, tables, spacing, page setup, headers/footers, and visual design. Only edit or reorder existing resume text to better match that vacancy. Do not invent experience, employers, certifications, languages, or technology depth.
+"""
