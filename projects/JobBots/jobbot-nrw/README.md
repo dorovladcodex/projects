@@ -49,6 +49,8 @@ credentials/google-token.json
 
 The first run opens a browser for Google OAuth consent and writes `google-token.json`. The `credentials/` folder is ignored by git.
 
+If `google-oauth-client.json` is not present, the helper tries Google Application Default Credentials. This is a fallback only; Google recommends using your own OAuth client for Drive scopes.
+
 ## CV Generation
 
 Disabled by default. Tailored CVs are generated only when a specific vacancy number, company, or title is requested.
