@@ -6,3 +6,6 @@ oauth-token.json
 oauth-client.json
 *.log
 credentials/
+.manual-runs/
+.jobbot-upload-tmp/
+.venv/
