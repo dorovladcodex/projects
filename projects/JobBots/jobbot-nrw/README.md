@@ -26,9 +26,11 @@ automation/automation.toml
 
 ## Output
 
-- Output root: `D:\Job Search 2026`
-- Report file: `email-report.txt`
-- State file: `D:\Job Search 2026\seen-vacancies.json`
+- Google Drive project path: `Projects/JobBots/jobbot-nrw`
+- State file: `Projects/JobBots/jobbot-nrw/state/seen-vacancies.json`
+- Run report: `Projects/JobBots/jobbot-nrw/runs/yyyy-mm-dd/email-report.txt`
+- Vacancy data: `Projects/JobBots/jobbot-nrw/runs/yyyy-mm-dd/vacancies.json`
+- Resumes: `Projects/JobBots/jobbot-nrw/resumes/`
 
 ## CV Generation
 
