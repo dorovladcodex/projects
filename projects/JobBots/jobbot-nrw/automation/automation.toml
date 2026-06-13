@@ -1,0 +1,23 @@
+version = 1
+id = "nrw-senior-data-oracle-job-monitor"
+kind = "cron"
+name = "JobBot NRW"
+status = "ACTIVE"
+rrule = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=18;BYMINUTE=0"
+model = "gpt-5.4"
+reasoning_effort = "medium"
+execution_environment = "worktree"
+cwds = ["C:\\Users\\dorov\\Documents\\Job Search"]
+
+# Repository copy of the Codex automation metadata.
+# The live full prompt is stored in the local Codex automation file:
+# C:\Users\dorov\.codex\automations\nrw-senior-data-oracle-job-monitor\automation.toml
+#
+# Core behavior:
+# - Search NRW/Germany remote Senior Data Engineer, Oracle PL/SQL, ERP/WMS, Azure Databricks roles.
+# - Prefer English-friendly roles, include German B1/B2 where strong, mark C1/C2 risk.
+# - Mix local NRW hybrid and full-remote roles by overall fit, not by work mode alone.
+# - Write reports under D:\Job Search 2026.
+# - Maintain D:\Job Search 2026\seen-vacancies.json.
+# - Send email report through connected Gmail.
+# - Do not generate tailored CVs automatically.
