@@ -8,6 +8,12 @@ From the project root:
 python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json
 ```
 
+Google Drive mode:
+
+```powershell
+python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json --drive
+```
+
 ## After Running
 
 1. Review the generated `email-report.txt`.
@@ -18,4 +24,4 @@ python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json
 
 - This bot is intentionally manual.
 - It should not be converted into the broad NRW scheduled automation.
-- It uses the shared state file so repeated vacancies can be marked as watchlist items.
+- Google Drive is the primary storage target for state and run outputs.
