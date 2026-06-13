@@ -6,9 +6,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from drive_store import build_drive_service, download_json_file, ensure_path, upload_text_file
+
 
 DEFAULT_OUTPUT_ROOT = Path(r"D:\Job Search 2026")
 DEFAULT_STATE_FILE = DEFAULT_OUTPUT_ROOT / "seen-vacancies.json"
+DEFAULT_DRIVE_PATH = ["Projects", "JobBots", "jobbot-eng-ind"]
 
 
 def vacancy_key(vacancy: dict[str, Any]) -> str:
@@ -92,18 +95,26 @@ def main() -> None:
     parser.add_argument("--vacancies-json", required=True, type=Path, help="JSON file with vacancy objects")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
+    parser.add_argument("--drive", action="store_true", help="Write reports and state to Google Drive")
+    parser.add_argument("--google-client-file", type=Path, default=Path("credentials/google-oauth-client.json"))
+    parser.add_argument("--google-token-file", type=Path, default=Path("credentials/google-token.json"))
     args = parser.parse_args()
 
     now = datetime.now()
-    run_dir = args.output_root / f"{now.strftime('%d.%m.%Y')} JobBot Eng Ind"
-    run_dir.mkdir(parents=True, exist_ok=True)
-
     vacancies = load_json(args.vacancies_json, [])
-    state = load_json(args.state_file, {})
+    if args.drive:
+        drive = build_drive_service(args.google_client_file, args.google_token_file)
+        project_folder = ensure_path(drive, DEFAULT_DRIVE_PATH)
+        state_folder = ensure_path(drive, [*DEFAULT_DRIVE_PATH, "state"])
+        runs_folder = ensure_path(drive, [*DEFAULT_DRIVE_PATH, "runs"])
+        run_folder = ensure_path(drive, [*DEFAULT_DRIVE_PATH, "runs", now.strftime("%Y-%m-%d")])
+        ensure_path(drive, [*DEFAULT_DRIVE_PATH, "resumes"])
+        state = download_json_file(drive, state_folder["id"], "seen-vacancies.json", {})
+    else:
+        run_dir = args.output_root / f"{now.strftime('%d.%m.%Y')} JobBot Eng Ind"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        state = load_json(args.state_file, {})
     report, new_items, _ = render_report(vacancies, state, now)
-
-    (run_dir / "email-report.txt").write_text(report, encoding="utf-8")
-    (run_dir / "vacancies.json").write_text(json.dumps(vacancies, ensure_ascii=False, indent=2), encoding="utf-8")
 
     for vacancy in new_items:
         key = vacancy_key(vacancy)
@@ -116,9 +127,22 @@ def main() -> None:
             "run": "JobBot Eng Ind",
             "language_priority": vacancy.get("priority"),
         }
-    args.state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    state_text = json.dumps(state, ensure_ascii=False, indent=2)
+    vacancies_text = json.dumps(vacancies, ensure_ascii=False, indent=2)
+    if args.drive:
+        upload_text_file(drive, run_folder["id"], "email-report.txt", report)
+        upload_text_file(drive, run_folder["id"], "vacancies.json", vacancies_text, mime_type="application/json")
+        upload_text_file(drive, state_folder["id"], "seen-vacancies.json", state_text, mime_type="application/json")
+        print(f"Drive project folder: {project_folder.get('webViewLink')}")
+        print(f"Drive runs folder: {runs_folder.get('webViewLink')}")
+        print(f"Drive run folder: {run_folder.get('webViewLink')}")
+    else:
+        (run_dir / "email-report.txt").write_text(report, encoding="utf-8")
+        (run_dir / "vacancies.json").write_text(vacancies_text, encoding="utf-8")
+        args.state_file.write_text(state_text, encoding="utf-8")
+        print(run_dir / "email-report.txt")
     print(f"Wrote {len(vacancies)} vacancies ({len(new_items)} new)")
-    print(run_dir / "email-report.txt")
 
 
 if __name__ == "__main__":
