@@ -43,3 +43,5 @@ OAuth credentials are local only:
 
 - `credentials/google-oauth-client.json`
 - `credentials/google-token.json`
+
+If `google-oauth-client.json` is missing, the helper tries Application Default Credentials. Use that only as a fallback because Google can block Drive scopes for the default `gcloud` OAuth client.
