@@ -1,0 +1,14 @@
+{
+  "output_root": "D:\\Job Search 2026",
+  "folder_suffix": "JobBot Eng Ind",
+  "state_file": "D:\\Job Search 2026\\seen-vacancies.json",
+  "recipient_email": "dorovlad@gmail.com",
+  "focus": [
+    "English-friendly Senior Data Engineer roles",
+    "Azure Databricks",
+    "Data Platform",
+    "remote Germany",
+    "NRW hybrid"
+  ],
+  "cv_generation": "manual_only"
+}
