@@ -14,13 +14,19 @@ It is intentionally separate from the scheduled NRW bot. It is useful when the s
 python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json
 ```
 
+Google Drive mode:
+
+```powershell
+python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json --drive
+```
+
 ## Output
 
-- Output root: `D:\Job Search 2026`
-- Folder format: `dd.MM.yyyy JobBot Eng Ind`
-- Report file: `email-report.txt`
-- Vacancy data: `vacancies.json`
-- State file: `D:\Job Search 2026\seen-vacancies.json`
+- Google Drive project path: `Projects/JobBots/jobbot-eng-ind`
+- State file: `Projects/JobBots/jobbot-eng-ind/state/seen-vacancies.json`
+- Run report: `Projects/JobBots/jobbot-eng-ind/runs/yyyy-mm-dd/email-report.txt`
+- Vacancy data: `Projects/JobBots/jobbot-eng-ind/runs/yyyy-mm-dd/vacancies.json`
+- Resumes: `Projects/JobBots/jobbot-eng-ind/resumes/`
 
 ## Email
 
