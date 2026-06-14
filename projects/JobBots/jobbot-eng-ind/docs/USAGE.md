@@ -3,19 +3,19 @@
 Run from `projects/JobBots/jobbot-eng-ind`:
 
 ```bash
-./scripts/run_jobbot_eng_ind.sh
+bash scripts/run_jobbot_eng_ind.sh
 ```
 
 To upload to Google Drive and send Gmail after the run:
 
 ```bash
-JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 ./scripts/run_jobbot_eng_ind.sh
+JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 bash scripts/run_jobbot_eng_ind.sh
 ```
 
 For a local smoke test without Codex web search:
 
 ```bash
-./scripts/smoke_test.sh
+bash scripts/smoke_test.sh
 ```
 
 For direct report generation from an existing JSON file:
