@@ -11,19 +11,19 @@ python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json
 Full Ubuntu/Codex CLI run:
 
 ```bash
-./scripts/run_jobbot_eng_ind.sh
+bash scripts/run_jobbot_eng_ind.sh
 ```
 
 Full run with Drive and Gmail:
 
 ```bash
-JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 ./scripts/run_jobbot_eng_ind.sh
+JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 bash scripts/run_jobbot_eng_ind.sh
 ```
 
 Smoke test:
 
 ```bash
-./scripts/smoke_test.sh
+bash scripts/smoke_test.sh
 ```
 
 Google Drive mode:
