@@ -1,6 +1,6 @@
 # JobBot Eng Ind
 
-Manual English-friendly indexed-search bot.
+English-friendly indexed-search bot for Senior Data Engineer roles.
 
 ## Purpose
 
@@ -8,10 +8,28 @@ JobBot Eng Ind is used for manual searches focused on English-friendly Senior Da
 
 It is intentionally separate from the scheduled NRW bot. It is useful when the search should prioritize weak-German-friendly roles and indexed job snippets from LinkedIn, English job boards, remote boards, aggregators, and company pages.
 
-## Current Entry Point
+## Current Entry Points
 
 ```powershell
 python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json
+```
+
+Ubuntu/Codex CLI pipeline:
+
+```bash
+./scripts/run_jobbot_eng_ind.sh
+```
+
+With Drive and Gmail enabled:
+
+```bash
+JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 ./scripts/run_jobbot_eng_ind.sh
+```
+
+Local smoke test:
+
+```bash
+./scripts/smoke_test.sh
 ```
 
 Google Drive mode:
@@ -30,7 +48,7 @@ python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json --
 
 ## Email
 
-This project prepares local report files. Email sending is performed through the connected Gmail connector when explicitly requested in Codex.
+This project prepares report files. In Codex App, email can be sent through the Gmail connector. On Ubuntu/Codex CLI, `src/send_gmail.py` can send through Gmail API when OAuth credentials are present.
 
 ## CV Generation
 
