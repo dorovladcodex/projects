@@ -27,11 +27,12 @@ fi
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 
-"$CODEX_BIN" exec \
+"$CODEX_BIN" \
   --search \
   --sandbox workspace-write \
   --ask-for-approval never \
   --cd "$ROOT_DIR" \
+  exec \
   --output-schema "$SCHEMA_FILE" \
   -o "$RAW_JSON" \
   "$(cat "$PROMPT_FILE")"
