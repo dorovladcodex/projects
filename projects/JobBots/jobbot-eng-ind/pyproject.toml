@@ -9,5 +9,9 @@ dependencies = [
   "google-auth-oauthlib>=1.2.0"
 ]
 
+[project.scripts]
+jobbot-eng-ind = "jobbot_eng_ind:main"
+jobbot-eng-ind-validate = "validate_and_rank:main"
+
 [tool.ruff]
 line-length = 120
