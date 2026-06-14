@@ -2,7 +2,7 @@
 
 You are running inside Codex CLI for `JobBot Eng Ind`. Produce current, English-friendly Senior Data Engineer job matches as valid JSON only.
 
-Return only a JSON array. Do not include Markdown, prose, comments, or code fences.
+Return only a JSON object with one top-level field: `vacancies`. Do not include Markdown, prose, comments, or code fences.
 
 ## Candidate
 
@@ -92,4 +92,4 @@ Every item must contain exactly these fields:
 - `language_risk`: one of `low`, `medium`, `high`.
 - `salary_likelihood`: one of `low`, `medium`, `high`, `unknown`.
 
-Return as many high-quality matches as you find. Do not stop at an arbitrary small number, but do not include low-quality filler.
+Return as many high-quality matches as you find in the `vacancies` array. Do not stop at an arbitrary small number, but do not include low-quality filler.
