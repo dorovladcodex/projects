@@ -26,6 +26,10 @@ Return only a JSON object with one top-level field: `vacancies`. Do not include 
 - Europe remote roles only if legally open to Germany-based candidates.
 - NRW hybrid roles around Dortmund, Essen, Duesseldorf, Bochum, Duisburg, Cologne, Wuppertal, Ratingen.
 - Freelance/project roles only when technically strong and remote-friendly.
+- Keep a mixed result set when possible:
+  - English-friendly Germany/EU remote roles with direct job links.
+  - Practical NRW hybrid/local roles within about one hour from Dortmund.
+  - Do not let one category dominate if strong matches exist in the other.
 
 ## Exclude
 
@@ -35,10 +39,14 @@ Return only a JSON object with one top-level field: `vacancies`. Do not include 
 - Roles requiring German C1/C2 unless the technical fit is exceptional.
 - Remote roles that are clearly US-only, UK-only, Spain-only, Poland-only, or outside Germany/EU unless they explicitly accept Germany-based candidates.
 - Jobs without a credible source URL.
+- Generic career landing pages, search landing pages, or broad company job portals without a vacancy-specific detail URL.
+- Invented vacancies inferred only from a company career page without evidence of a concrete posting.
 
 ## Source Coverage
 
 Search broadly. Use indexed snippets if direct pages are blocked.
+
+Prefer concrete vacancy detail pages over generic company career portals. If you use an indexed result, it must still clearly correspond to a specific vacancy.
 
 Check and represent these groups where possible:
 
@@ -68,6 +76,12 @@ Prioritize:
 - Seniority.
 - Logistics, retail, ERP, WMS, Oracle or enterprise data background relevance.
 
+Also ensure diversity in the final set:
+
+- Mix NRW hybrid/local matches with Germany/EU remote matches when both exist.
+- Prefer direct vacancy URLs, then high-confidence indexed vacancy URLs, then recruiter/project postings.
+- Do not fill the list with weak generic company-career guesses just to increase count.
+
 ## Output Schema
 
 Every item must contain exactly these fields:
@@ -93,3 +107,4 @@ Every item must contain exactly these fields:
 - `salary_likelihood`: one of `low`, `medium`, `high`, `unknown`.
 
 Return as many high-quality matches as you find in the `vacancies` array. Do not stop at an arbitrary small number, but do not include low-quality filler.
+Target up to 50 validated matches if that many strong matches exist.
