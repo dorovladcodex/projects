@@ -82,7 +82,12 @@ def format_vacancy(index: int, vacancy: dict[str, Any], status: str) -> list[str
         f"   Source: {vacancy.get('source', 'not specified')}",
         f"   Link: {vacancy.get('url', '')}",
         f"   Language: {vacancy.get('language', 'not specified')}",
+        f"   Language risk: {vacancy.get('language_risk', 'not specified')}",
+        f"   Contract type: {vacancy.get('contract_type', 'not specified')}",
+        f"   Core tech match: {vacancy.get('core_tech_match', 'not specified')}",
+        f"   Fit score: {vacancy.get('fit_score', 'not specified')}",
         f"   Analysis: {vacancy.get('analysis', '')}",
+        f"   Recommendation: {vacancy.get('recommendation', '')}",
         "",
     ]
 
