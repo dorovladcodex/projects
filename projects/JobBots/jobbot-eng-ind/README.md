@@ -20,11 +20,21 @@ Ubuntu/Codex CLI pipeline:
 bash scripts/run_jobbot_eng_ind.sh
 ```
 
-With Drive and Gmail enabled:
+Multi-source pipeline for scheduled runs:
+
+```bash
+bash scripts/run_scheduled_jobbot_eng_ind.sh
+```
+
+With Drive and email enabled:
 
 ```bash
 JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 bash scripts/run_jobbot_eng_ind.sh
 ```
+
+Email sending is enabled by default in `scripts/run_jobbot_eng_ind.sh`. Scheduled and normal runners now use `codex exec` plus the Gmail plugin by default. Set `JOBBOT_ENABLE_GMAIL=0` to skip mail for a specific run.
+
+Scheduled runs send to `dorovlad@gmail.com` by default, use the shared state file at `.manual-runs/state/seen-vacancies.json`, and include only newly discovered vacancies in the email report.
 
 Local smoke test:
 
@@ -48,7 +58,13 @@ python .\src\jobbot_eng_ind.py --vacancies-json .\data\example-vacancies.json --
 
 ## Email
 
-This project prepares report files. In Codex App, email can be sent through the Gmail connector. On Ubuntu/Codex CLI, `src/send_gmail.py` can send through Gmail API when OAuth credentials are present.
+This project prepares report files. On Ubuntu/Codex CLI, scheduled delivery now uses the Gmail plugin through `codex exec` via `scripts/send_report_via_codex_gmail.sh`. The old `src/send_gmail.py` path remains available only as an explicit fallback when `JOBBOT_GMAIL_DELIVERY_MODE=gmail-api`.
+
+For the Gmail API fallback only, provide Gmail API credentials locally or through environment variables:
+
+- `GOOGLE_CLIENT_FILE`
+- `GMAIL_TOKEN_FILE`
+- `JOBBOT_EMAIL_TO`
 
 ## CV Generation
 

@@ -28,7 +28,13 @@ def load_json(path: Path, fallback: Any) -> Any:
     return json.loads(text) if text else fallback
 
 
-def render_report(vacancies: list[dict[str, Any]], state: dict[str, Any], now: datetime) -> tuple[str, list[dict], list[dict]]:
+def render_report(
+    vacancies: list[dict[str, Any]],
+    state: dict[str, Any],
+    now: datetime,
+    *,
+    new_only: bool = False,
+) -> tuple[str, list[dict], list[dict]]:
     new_items: list[dict[str, Any]] = []
     watch_items: list[dict[str, Any]] = []
     for vacancy in vacancies:
@@ -58,9 +64,10 @@ def render_report(vacancies: list[dict[str, Any]], state: dict[str, Any], now: d
     for index, vacancy in enumerate(new_items, 1):
         lines.extend(format_vacancy(index, vacancy, "NEW"))
 
-    lines.extend(["", "Still relevant / watchlist", ""])
-    for index, vacancy in enumerate(watch_items, len(new_items) + 1):
-        lines.extend(format_vacancy(index, vacancy, "previously seen"))
+    if not new_only:
+        lines.extend(["", "Still relevant / watchlist", ""])
+        for index, vacancy in enumerate(watch_items, len(new_items) + 1):
+            lines.extend(format_vacancy(index, vacancy, "previously seen"))
 
     lines.extend(
         [
@@ -98,6 +105,7 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
     parser.add_argument("--drive", action="store_true", help="Write reports and state to Google Drive")
+    parser.add_argument("--new-only", action="store_true", help="Only include new vacancies in the report body")
     parser.add_argument("--google-client-file", type=Path, default=Path("credentials/google-oauth-client.json"))
     parser.add_argument("--google-token-file", type=Path, default=Path("credentials/google-token.json"))
     args = parser.parse_args()
@@ -118,7 +126,7 @@ def main() -> None:
         run_dir = args.output_root / f"{now.strftime('%d.%m.%Y')} JobBot Eng Ind"
         run_dir.mkdir(parents=True, exist_ok=True)
         state = load_json(args.state_file, {})
-    report, new_items, _ = render_report(vacancies, state, now)
+    report, new_items, _ = render_report(vacancies, state, now, new_only=args.new_only)
 
     for vacancy in new_items:
         key = vacancy_key(vacancy)
@@ -144,6 +152,7 @@ def main() -> None:
     else:
         (run_dir / "email-report.txt").write_text(report, encoding="utf-8")
         (run_dir / "vacancies.json").write_text(vacancies_text, encoding="utf-8")
+        args.state_file.parent.mkdir(parents=True, exist_ok=True)
         args.state_file.write_text(state_text, encoding="utf-8")
         print(run_dir / "email-report.txt")
     print(f"Wrote {len(vacancies)} vacancies ({len(new_items)} new)")

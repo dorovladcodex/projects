@@ -23,6 +23,7 @@ py-modules = [
   "jobbot_eng_ind",
   "send_gmail",
   "upload_run_to_drive",
+  "fetch_public_sources",
   "validate_and_rank"
 ]
 

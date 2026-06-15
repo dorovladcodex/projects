@@ -1,0 +1,10 @@
+[Unit]
+Description=Run JobBot Eng Ind at 12:00 and 16:00 Europe/Berlin
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 Europe/Berlin
+OnCalendar=*-*-* 16:00:00 Europe/Berlin
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=JobBot Eng Ind scheduled run
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/dorovlad_codex/projects/projects/JobBots/jobbot-eng-ind
+Environment=HOME=/home/dorovlad_codex
+Environment=PATH=/home/dorovlad_codex/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CODEX_BIN=/home/dorovlad_codex/.local/bin/codex
+ExecStart=/bin/bash /home/dorovlad_codex/projects/projects/JobBots/jobbot-eng-ind/scripts/run_scheduled_jobbot_eng_ind.sh

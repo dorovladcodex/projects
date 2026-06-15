@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: jobbot-eng-ind
+Version: 0.1.0
+Summary: Manual English-friendly indexed job-search bot.
+Requires-Python: >=3.11
+Requires-Dist: google-api-python-client>=2.170.0
+Requires-Dist: google-auth>=2.40.0
+Requires-Dist: google-auth-oauthlib>=1.2.0

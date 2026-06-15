@@ -14,7 +14,17 @@ from googleapiclient.discovery import build
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 
 
+def require_file(path: Path, description: str) -> None:
+    if path.exists():
+        return
+    raise FileNotFoundError(
+        f"Missing {description}: {path}\n"
+        "Provide Gmail OAuth credentials locally or via GOOGLE_CLIENT_FILE/GMAIL_TOKEN_FILE."
+    )
+
+
 def build_gmail_service(client_file: Path, token_file: Path):
+    require_file(client_file, "Google OAuth client file")
     credentials = None
     if token_file.exists():
         credentials = Credentials.from_authorized_user_file(str(token_file), SCOPES)

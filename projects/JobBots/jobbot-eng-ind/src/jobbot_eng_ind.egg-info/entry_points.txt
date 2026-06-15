@@ -1,0 +1,3 @@
+[console_scripts]
+jobbot-eng-ind = jobbot_eng_ind:main
+jobbot-eng-ind-validate = validate_and_rank:main

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -46,7 +47,7 @@ SOURCE_GROUPS = [
 
 PRIORITY_ORDER = {"A": 0, "A-": 1, "B+": 2, "B": 3, "B-": 4, "C": 5}
 LANGUAGE_RISK_PENALTY = {"low": 0.0, "medium": 0.25, "high": 0.75}
-MAX_OUTPUT_ITEMS = 50
+MAX_OUTPUT_ITEMS = 100
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -68,6 +69,7 @@ def normalize_vacancy(raw: dict[str, Any]) -> dict[str, Any]:
         "unknown",
     )
     vacancy["found_at"] = raw.get("found_at") or datetime.now(timezone.utc).isoformat()
+    vacancy.pop("_source_text", None)
     return vacancy
 
 
@@ -97,11 +99,18 @@ def score_vacancy(vacancy: dict[str, Any]) -> float:
 
 def should_reject(vacancy: dict[str, Any]) -> str | None:
     text = " ".join(str(value) for value in vacancy.values()).lower()
+    role_text = " ".join(
+        str(vacancy.get(field, ""))
+        for field in ["title", "core_tech_match", "contract_type", "source", "source_group"]
+    ).lower()
     if not vacancy.get("url") or vacancy["url"] == "not specified":
         return "missing url"
     if looks_like_generic_careers_page(vacancy["url"]):
         return "generic careers page without direct vacancy detail"
-    if not any(term in text for term in ["data engineer", "databricks", "data platform", "analytics engineer", "etl"]):
+    if not contains_any_role_term(
+        role_text,
+        ["data engineer", "databricks", "data platform", "analytics engineer", "etl", "elt", "lakehouse", "data warehouse", "fabric"],
+    ):
         return "weak role match"
     if "onsite" in text and not any(term in text for term in ["remote", "hybrid", "homeoffice", "home office"]):
         return "onsite without remote/hybrid signal"
@@ -153,6 +162,8 @@ def looks_like_generic_careers_page(url: str) -> bool:
         "jobs/view",
     ]
     path_parts = [part for part in path.split("/") if part]
+    if len(path_parts) >= 2 and path_parts[0] in {"jobs", "job"} and len(path_parts[-1]) >= 12:
+        return False
     if any(token in path for token in detail_tokens):
         return False
     if len(path_parts) >= 2 and any(char.isdigit() for char in path) and len(path) >= 30:
@@ -248,16 +259,22 @@ def main() -> None:
     accepted: list[dict[str, Any]] = []
     rejects: list[dict[str, str]] = []
     seen_keys: set[str] = set()
+    seen_urls: set[str] = set()
     for raw in raw_items:
         if not isinstance(raw, dict):
             rejects.append({"reason": "item is not an object", "item": str(raw)})
             continue
         vacancy = normalize_vacancy(raw)
+        url = str(vacancy.get("url", "")).strip().lower()
         key = "|".join(str(vacancy.get(part, "")).strip().lower() for part in ["company", "title", "location", "url"])
         if key in seen_keys:
             rejects.append({"reason": "duplicate", "item": vacancy.get("url", "")})
             continue
         seen_keys.add(key)
+        if url in seen_urls:
+            rejects.append({"reason": "duplicate url", "item": vacancy.get("url", "")})
+            continue
+        seen_urls.add(url)
         reason = should_reject(vacancy)
         if reason:
             rejects.append({"reason": reason, "item": vacancy.get("url", "")})
@@ -265,8 +282,8 @@ def main() -> None:
         vacancy["_rank_score"] = round(score_vacancy(vacancy), 3)
         accepted.append(vacancy)
 
-    accepted.sort(key=lambda item: (PRIORITY_ORDER.get(item["priority"], 99), -item["_rank_score"], -float(item["fit_score"])))
-    accepted = mix_and_limit(accepted, MAX_OUTPUT_ITEMS)
+    accepted.sort(key=lambda item: (-item["_rank_score"], -float(item["fit_score"]), PRIORITY_ORDER.get(item["priority"], 99)))
+    accepted = accepted[:MAX_OUTPUT_ITEMS]
     for item in accepted:
         item.pop("_rank_score", None)
 
@@ -288,6 +305,17 @@ def _number(value: Any, default: float) -> float:
 
 def _enum(value: str, allowed: dict[str, Any], default: str) -> str:
     return value if value in allowed else default
+
+
+def contains_any_role_term(text: str, terms: list[str]) -> bool:
+    return any(contains_role_term(text, term) for term in terms)
+
+
+def contains_role_term(text: str, term: str) -> bool:
+    term = term.lower()
+    if len(term) <= 3 or term in {"etl", "elt", "sql"}:
+        return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text) is not None
+    return term in text
 
 
 if __name__ == "__main__":
