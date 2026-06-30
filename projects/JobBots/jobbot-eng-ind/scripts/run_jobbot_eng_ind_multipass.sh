@@ -30,6 +30,15 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+SOURCE_PASS_RETRIES="${JOBBOT_SOURCE_PASS_RETRIES:-2}"
+SOURCE_PASS_RETRY_SLEEP_SECONDS="${JOBBOT_SOURCE_PASS_RETRY_SLEEP_SECONDS:-60}"
+SOURCE_PASS_TIMEOUT_SECONDS="${JOBBOT_SOURCE_PASS_TIMEOUT_SECONDS:-1200}"
+TOOL_BIN_DIR="$ROOT_DIR/.manual-runs/bin"
+mkdir -p "$TOOL_BIN_DIR"
+if [[ ! -x "$TOOL_BIN_DIR/python" ]] && command -v python3 >/dev/null 2>&1; then
+  ln -s "$(command -v python3)" "$TOOL_BIN_DIR/python"
+fi
+export PATH="$TOOL_BIN_DIR:$PATH"
 if [[ -n "${CODEX_BIN:-}" ]]; then
   :
 elif command -v codex >/dev/null 2>&1; then
@@ -52,17 +61,21 @@ run_source_pass() {
   local source_group="$2"
   local query_block="$3"
   local output_file="$RAW_DIR/$slug.json"
+  local attempt
+  local exit_code
 
   printf 'Running source pass: %s\n' "$source_group"
-  "$CODEX_BIN" \
-    --search \
-    --sandbox workspace-write \
-    --ask-for-approval never \
-    --cd "$ROOT_DIR" \
-    exec \
-    --output-schema "$SCHEMA_FILE" \
-    -o "$output_file" \
-    "$(cat <<PROMPT
+  for ((attempt = 1; attempt <= SOURCE_PASS_RETRIES + 1; attempt++)); do
+    set +e
+    timeout "$SOURCE_PASS_TIMEOUT_SECONDS" "$CODEX_BIN" \
+      --search \
+      --sandbox workspace-write \
+      --ask-for-approval never \
+      --cd "$ROOT_DIR" \
+      exec \
+      --output-schema "$SCHEMA_FILE" \
+      -o "$output_file" \
+      "$(cat <<PROMPT
 You are running a source-specific pass for JobBot Eng Ind.
 
 Return VALID JSON ONLY: one object with top-level field "vacancies".
@@ -126,6 +139,23 @@ Required searches:
 $query_block
 PROMPT
 )"
+    exit_code=$?
+    set -e
+
+    if [[ $exit_code -eq 0 && -s "$output_file" ]]; then
+      return 0
+    fi
+
+    printf 'Source pass failed: %s (attempt %d/%d, exit %d)\n' \
+      "$source_group" "$attempt" "$((SOURCE_PASS_RETRIES + 1))" "$exit_code" >&2
+
+    if (( attempt <= SOURCE_PASS_RETRIES )); then
+      sleep "$SOURCE_PASS_RETRY_SLEEP_SECONDS"
+    fi
+  done
+
+  printf '{"vacancies":[]}\n' > "$output_file"
+  printf 'Source pass fallback written with zero vacancies: %s\n' "$output_file" >&2
 }
 
 run_source_pass "linkedin" "LinkedIn-indexed" "

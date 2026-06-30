@@ -1,2 +1,5 @@
 CRON_TZ=Europe/Berlin
-0 12,16 * * * cd /home/dorovlad_codex/projects/projects/JobBots/jobbot-eng-ind && bash scripts/run_scheduled_jobbot_eng_ind.sh >> .manual-runs/scheduled.log 2>&1
+SHELL=/bin/bash
+PATH=/home/dorovlad_codex/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 12,16 * * * cd /home/dorovlad_codex/projects/projects/JobBots/jobbot-eng-ind && /bin/bash scripts/run_scheduled_jobbot_eng_ind.sh >> /home/dorovlad_codex/projects/projects/JobBots/jobbot-eng-ind/.manual-runs/scheduled-cron.log 2>&1
