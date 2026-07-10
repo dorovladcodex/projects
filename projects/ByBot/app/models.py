@@ -65,14 +65,20 @@ class MarketSnapshot(BaseModel):
     bid_price: float = Field(gt=0)
     ask_price: float = Field(gt=0)
     trend_score: float = Field(ge=-1, le=1)
-    volatility_pct: float = Field(gt=0)
+    volatility_pct: float = Field(ge=0)
     liquidity_ok: bool
     api_stable: bool = True
+    price_change_1m_pct: float = 0.0
+    volume_24h: float | None = Field(default=None, ge=0)
 
     @property
     def spread_bps(self) -> float:
         midpoint = (self.ask_price + self.bid_price) / 2
         return (self.ask_price - self.bid_price) / midpoint * 10_000
+
+    @property
+    def spread_pct(self) -> float:
+        return self.spread_bps / 100
 
 
 class TradeSignal(BaseModel):

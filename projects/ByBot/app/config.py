@@ -13,6 +13,11 @@ class BotMode(str, Enum):
     BYBIT_DEMO = "BYBIT_DEMO"
 
 
+class MarketDataProviderName(str, Enum):
+    MOCK = "MOCK"
+    BYBIT_REST = "BYBIT_REST"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -28,11 +33,15 @@ class Settings(BaseSettings):
 
     bybit_api_key: str | None = None
     bybit_api_secret: str | None = None
+    bybit_public_base_url: str = "https://api.bybit.com"
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     llm_api_key: str | None = None
 
     allowed_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
+    market_data_provider: MarketDataProviderName = MarketDataProviderName.MOCK
+    market_data_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    market_data_history_limit: int = Field(default=120, ge=2, le=2000)
     trading_paused: bool = False
     paper_starting_equity: float = Field(default=10_000.0, gt=0)
     paper_daily_pnl_pct: float = 0.0
@@ -51,6 +60,11 @@ class Settings(BaseSettings):
     def reject_unsupported_modes(cls, value: object) -> object:
         if isinstance(value, str) and value.upper() == "LIVE":
             raise ValueError("Live trading is blocked in v1")
+        return value.upper() if isinstance(value, str) else value
+
+    @field_validator("market_data_provider", mode="before")
+    @classmethod
+    def normalize_market_data_provider(cls, value: object) -> object:
         return value.upper() if isinstance(value, str) else value
 
     @field_validator("allowed_symbols")

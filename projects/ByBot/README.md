@@ -1,6 +1,6 @@
 # ByBot
 
-Lightweight, deterministic Bybit trading-bot foundation. Phase 1 supports only
+Lightweight, deterministic Bybit trading-bot foundation. Current builds support only
 `DATA_ONLY`, `PAPER`, and `BYBIT_DEMO`. **Live trading is intentionally blocked.**
 
 The LLM boundary is limited to compact news classification. Strategy, market
@@ -42,7 +42,8 @@ Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json
 Expected safety fields include `"status": "ok"` from `/health`. `/status`
 returns `"mode"`, `"live_trading": false`, `"trading_enabled"`,
 `"trading_paused"`, `"active_symbols"`, `"open_paper_position"`,
-`"last_signal"`, and `"risk_status"`. Stop the server with `Ctrl+C`.
+`"last_signal"`, `"market"`, and `"risk_status"`. Stop the server with
+`Ctrl+C`.
 
 If Python 3.11 is not installed but a newer supported version is available,
 replace both `py -3.11` occurrences with `py -3`.
@@ -61,8 +62,41 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The API is exposed on port 8000 and PostgreSQL on port 5432. Phase 1 does not
+The API is exposed on port 8000 and PostgreSQL on port 5432. Current code does not
 yet persist data; the database service is prepared for the next phase.
+
+## Market data
+
+By default, local development uses mock market data so the app and tests run
+without internet access:
+
+```powershell
+MARKET_DATA_PROVIDER=MOCK
+```
+
+To test public Bybit market data in `DATA_ONLY` mode, edit `.env`:
+
+```powershell
+BOT_MODE=DATA_ONLY
+MARKET_DATA_PROVIDER=BYBIT_REST
+BYBIT_PUBLIC_BASE_URL=https://api.bybit.com
+```
+
+Then start the API:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Verify market data:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/market | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
+```
+
+If Bybit is unreachable, `/market` and `/status.market` report
+`"DATA_UNAVAILABLE"` and the bot stays safe. No order-placement code exists.
 
 ## Safety
 
