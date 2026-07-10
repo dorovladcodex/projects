@@ -39,10 +39,23 @@ Deferred from Phase 2:
 - `BYBIT_ENABLE_TRADING=true` rejected during configuration validation
 - No live trading, no demo order placement, and no order-placement methods
 
-## Phase 3B - simulation quality
+## Phase 3B - paper trading loop (implemented)
 
-- Fees, funding, slippage, partial fills, and position lifecycle
-- Daily/weekly PnL accounting and pause state
+- In-memory `PaperTradingService`
+- Open/close internal LONG and SHORT paper positions
+- Update unrealized PnL from latest market price
+- Stop-loss, take-profit, and timeout closes
+- Realized/unrealized/total PnL accounting
+- `POST /paper/test-signal` manual test endpoint with RiskManager approval
+- `GET /paper/positions`, `GET /paper/trades`, and `GET /paper/pnl`
+- `/status` paper trading status, open paper position, last paper trade, and
+  last risk decision
+- No Bybit order placement, no demo order placement, no live trading
+
+Deferred from Phase 3B:
+
+- Fees, funding, slippage, and partial fills
+- Persistent paper trade storage
 - Replay/backtest harness and analytics
 - WebSocket stability monitoring and stale-data protection
 

@@ -5,7 +5,7 @@ import hmac
 import json
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -154,9 +154,12 @@ class BybitAccountService:
         self,
         client: BybitPrivateClient | MockBybitPrivateClient,
         symbols: tuple[Symbol, ...],
+        *,
+        refresh_interval: timedelta = timedelta(seconds=30),
     ) -> None:
         self.client = client
         self.symbols = symbols
+        self.refresh_interval = refresh_interval
         self.status = AccountStatus(
             connected=False,
             environment=client.environment,
@@ -165,6 +168,7 @@ class BybitAccountService:
         )
 
     def refresh(self) -> AccountStatus:
+        now = datetime.now(timezone.utc)
         if isinstance(self.client, MockBybitPrivateClient):
             self.status = self.client.get_account_status()
             return self.status
@@ -184,17 +188,47 @@ class BybitAccountService:
                 open_positions=[_parse_position(item) for item in positions],
                 open_orders=[_parse_order(item) for item in open_orders],
                 recent_closed_orders=[_parse_order(item) for item in closed_orders],
+                stale=False,
                 last_error=None,
-                updated_at=datetime.now(timezone.utc),
+                updated_at=now,
+                last_refresh_attempt_at=now,
             )
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-            self.status = AccountStatus(
-                connected=False,
-                environment=self.client.environment,
-                trading_enabled=False,
-                last_error=str(exc),
-                updated_at=datetime.now(timezone.utc),
-            )
+            message = str(exc)
+            if self.status.connected:
+                self.status = self.status.model_copy(
+                    update={
+                        "stale": True,
+                        "last_error": message,
+                        "last_refresh_attempt_at": now,
+                    }
+                )
+            else:
+                self.status = AccountStatus(
+                    connected=False,
+                    environment=self.client.environment,
+                    trading_enabled=False,
+                    stale=False,
+                    last_error=message,
+                    updated_at=now,
+                    last_refresh_attempt_at=now,
+                )
+        return self.status
+
+    def refresh_if_stale(self, *, force: bool = False) -> AccountStatus:
+        if isinstance(self.client, MockBybitPrivateClient):
+            return self.status if self.status.last_error != "not refreshed" else self.refresh()
+
+        now = datetime.now(timezone.utc)
+        last_attempt = self.status.last_refresh_attempt_at
+        never_refreshed = last_attempt is None or self.status.last_error == "not refreshed"
+        refresh_due = (
+            last_attempt is None
+            or now - last_attempt >= self.refresh_interval
+            or self.status.stale
+        )
+        if force or never_refreshed or refresh_due:
+            return self.refresh()
         return self.status
 
     def as_payload(self) -> dict[str, Any]:
@@ -203,13 +237,18 @@ class BybitAccountService:
 
 def build_account_service(settings: Settings) -> BybitAccountService:
     symbols = tuple(Symbol(symbol) for symbol in settings.allowed_symbols)
+    refresh_interval = timedelta(seconds=settings.bybit_account_refresh_interval_seconds)
     if (
         not settings.bybit_api_key
         or not settings.bybit_api_secret
         or _is_fake_placeholder(settings.bybit_api_key)
         or _is_fake_placeholder(settings.bybit_api_secret)
     ):
-        return BybitAccountService(MockBybitPrivateClient(settings.bybit_env.value), symbols)
+        return BybitAccountService(
+            MockBybitPrivateClient(settings.bybit_env.value),
+            symbols,
+            refresh_interval=refresh_interval,
+        )
 
     client = BybitPrivateClient(
         api_key=settings.bybit_api_key,
@@ -220,7 +259,7 @@ def build_account_service(settings: Settings) -> BybitAccountService:
         recv_window_ms=settings.bybit_private_recv_window_ms,
         timeout_seconds=settings.bybit_private_timeout_seconds,
     )
-    return BybitAccountService(client, symbols)
+    return BybitAccountService(client, symbols, refresh_interval=refresh_interval)
 
 
 def order_placement_blocked_reason(settings: Settings, account: AccountStatus) -> str:

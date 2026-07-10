@@ -126,6 +126,50 @@ def test_account_service_stays_safe_on_private_api_error() -> None:
     assert "invalid api key" in str(status.last_error)
 
 
+def test_stale_account_state_does_not_become_disconnected_after_refresh_failure() -> None:
+    calls = 0
+
+    def fake_http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {
+                    "list": [
+                        {
+                            "totalEquity": "1000",
+                            "totalAvailableBalance": "900",
+                            "coin": [{"coin": "USDT", "walletBalance": "900"}],
+                        }
+                    ]
+                },
+            }
+        if calls <= 4:
+            return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
+        return {"retCode": 10006, "retMsg": "timeout", "result": {}}
+
+    client = BybitPrivateClient(
+        api_key="fake_key",
+        api_secret="fake_secret",
+        environment=BybitEnvironment.DEMO,
+        demo_base_url="https://api-demo.bybit.com",
+        mainnet_base_url="https://api.bybit.com",
+        http_get=fake_http_get,
+    )
+    service = BybitAccountService(client, (Symbol.BTCUSDT,))
+
+    connected = service.refresh()
+    stale = service.refresh()
+
+    assert connected.connected is True
+    assert stale.connected is True
+    assert stale.stale is True
+    assert stale.equity == 1000
+    assert "timeout" in str(stale.last_error)
+
+
 def test_order_placement_is_always_blocked_in_phase_3a() -> None:
     settings = Settings()
     service = BybitAccountService(

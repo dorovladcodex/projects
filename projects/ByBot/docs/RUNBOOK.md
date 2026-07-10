@@ -36,6 +36,10 @@ Expected results:
 - `/account`: returns `connected=false` without crashing if private keys are
   absent or invalid; with valid demo read-only keys it returns wallet, positions,
   and orders.
+- `/status`: uses cached account data and refreshes it when missing or stale.
+  If refresh fails after a previous success, the account remains connected with
+  `stale=true` and a clear `last_error`.
+- `/paper/pnl`: returns internal paper realized/unrealized/total PnL.
 
 Stop with `Ctrl+C`.
 
@@ -64,6 +68,17 @@ Expected safety fields:
 
 Set `BOT_MODE=PAPER`. Paper positions must remain local simulations. Confirm
 that no authenticated production Bybit client is configured or instantiated.
+Use `POST /paper/test-signal` only for local/manual paper testing. Confirm that
+`/status` still reports `order_placement_blocked=true`.
+
+Useful checks:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/paper/positions | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/paper/trades | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/paper/pnl | ConvertTo-Json -Depth 10
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/paper/close-position | ConvertTo-Json -Depth 10
+```
 
 ### BYBIT_DEMO
 

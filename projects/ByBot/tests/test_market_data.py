@@ -10,6 +10,7 @@ from app.bybit.market_data import (
 from app.bybit.private import build_account_service
 from app.config import Settings
 from app.models import MarketSnapshot, Symbol
+from app.portfolio.paper_trading import PaperTradingService
 from app.runtime import build_status
 
 
@@ -133,7 +134,12 @@ def test_status_blocks_trading_when_market_data_is_unavailable() -> None:
     service.refresh_all()
 
     settings = Settings(bot_mode="PAPER", bybit_api_key=None, bybit_api_secret=None)
-    payload = build_status(settings, service, build_account_service(settings))
+    payload = build_status(
+        settings,
+        service,
+        build_account_service(settings),
+        PaperTradingService(),
+    )
 
     assert payload["market_data_status"] == "DATA_UNAVAILABLE"
     assert payload["trading_enabled"] is False

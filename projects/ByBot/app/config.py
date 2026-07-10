@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     bybit_private_mainnet_base_url: str = "https://api.bybit.com"
     bybit_private_recv_window_ms: int = Field(default=5000, gt=0, le=60_000)
     bybit_private_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    bybit_account_refresh_interval_seconds: int = Field(default=30, ge=1, le=3600)
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     llm_api_key: str | None = None
@@ -58,6 +59,8 @@ class Settings(BaseSettings):
     paper_daily_pnl_pct: float = 0.0
     paper_weekly_pnl_pct: float = 0.0
     paper_consecutive_losses: int = Field(default=0, ge=0)
+    paper_take_profit_pct: float = Field(default=1.0, gt=0)
+    paper_position_timeout_minutes: int = Field(default=60, gt=0)
     max_risk_per_trade_pct: float = Field(default=0.5, gt=0, le=0.5)
     max_daily_loss_pct: float = Field(default=2.0, gt=0, le=2.0)
     max_weekly_loss_pct: float = Field(default=5.0, gt=0, le=5.0)

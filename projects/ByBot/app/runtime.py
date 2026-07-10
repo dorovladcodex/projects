@@ -8,6 +8,7 @@ from app.config import BotMode, Settings
 from app.models import RiskContext, Symbol
 from app.news.classifier import MockNewsClassifier
 from app.news.mock import mock_news_item
+from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
 from app.strategy import NewsMomentumStrategy
 
@@ -16,6 +17,7 @@ def build_status(
     settings: Settings,
     market_data: MarketDataService,
     account_service: BybitAccountService,
+    paper_trading: PaperTradingService,
 ) -> dict[str, Any]:
     """Build a deterministic status snapshot.
 
@@ -55,12 +57,10 @@ def build_status(
         min_confidence=settings.min_llm_confidence,
         min_expected_edge_bps=settings.min_expected_edge_bps,
     )
-    private_api_blocked = not account_status.connected
     if (
         signal is not None
         and market is not None
         and market_data.status == "OK"
-        and not private_api_blocked
     ):
         risk_decision = RiskManager(risk_rules).assess(signal, market, risk_context)
         risk_reasons = risk_decision.reasons
@@ -70,8 +70,6 @@ def build_status(
         risk_reasons = []
         if market_data.status != "OK":
             risk_reasons.append("market data unavailable")
-        if private_api_blocked:
-            risk_reasons.append("private API is not connected")
         if not risk_reasons:
             risk_reasons.append("strategy did not produce a trade")
         risk_approved = False
@@ -91,6 +89,7 @@ def build_status(
     risk_state = "OK" if risk_approved else "BLOCKED"
     btc_snapshot = market_data.latest_snapshot(Symbol.BTCUSDT)
     eth_snapshot = market_data.latest_snapshot(Symbol.ETHUSDT)
+    paper_status = paper_trading.as_status()
 
     return {
         "name": settings.bot_name,
@@ -107,13 +106,19 @@ def build_status(
         "allowed_symbols": list(settings.allowed_symbols),
         "strategy": "NewsMomentumStrategy",
         "execution": "paper" if settings.bot_mode == BotMode.PAPER else "disabled",
-        "open_paper_position": None,
+        "open_paper_position": paper_status["open_position"],
         "last_signal": signal.model_dump(mode="json") if signal else None,
         "market_data_status": market_data.status,
         "latest_btcusdt_snapshot": snapshot_to_payload(btc_snapshot) if btc_snapshot else None,
         "latest_ethusdt_snapshot": snapshot_to_payload(eth_snapshot) if eth_snapshot else None,
         "market": market_payload,
         "account": account_status.model_dump(mode="json"),
+        "paper_trading": paper_status,
+        "paper_trading_status": paper_status["status"],
+        "paper_realized_pnl": paper_status["realized_pnl"],
+        "paper_unrealized_pnl": paper_status["unrealized_pnl"],
+        "last_paper_trade": paper_status["last_trade"],
+        "last_risk_decision": paper_status["last_risk_decision"],
         "risk_status": {
             "state": risk_state,
             "approved": risk_approved,

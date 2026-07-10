@@ -137,12 +137,85 @@ Invoke-RestMethod http://127.0.0.1:8000/account | ConvertTo-Json -Depth 10
 Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
 ```
 
+`/account` force-refreshes private account data. On startup and on `/status`,
+the app refreshes account data when the cached state is missing or stale. If a
+refresh fails after a previous success, the last connected account state is kept
+and marked `stale=true` with `last_error`, instead of crashing or falsely
+disconnecting paper trading context.
+
 Expected safety fields:
 
 - `trading_enabled` is `false`
 - `order_placement_blocked` is `true`
 - `account.trading_enabled` is `false`
 - invalid keys show `connected=false` and `last_error`, without crashing
+
+## Paper trading simulation
+
+Phase 3B simulates internal paper trades using current market data. It never
+submits Bybit orders. Keep:
+
+```env
+BYBIT_ENABLE_TRADING=false
+BOT_MODE=PAPER
+```
+
+Start the API:
+
+```powershell
+cd D:\VibeProjects\projects\projects\ByBot
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Inject a manual paper test signal:
+
+```powershell
+$body = @{
+  symbol = "BTCUSDT"
+  side = "BUY"
+  confidence = 0.9
+  expected_edge_bps = 20
+  stop_loss_pct = 0.5
+  take_profit_pct = 1.0
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8000/paper/test-signal `
+  -ContentType "application/json" `
+  -Body $body | ConvertTo-Json -Depth 10
+```
+
+Inspect paper state:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/paper/positions | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/paper/trades | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/paper/pnl | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
+```
+
+Manually close the open paper position at the latest market price:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8000/paper/close-position | ConvertTo-Json -Depth 10
+```
+
+Closed positions move from `/paper/positions` to `/paper/trades`. Realized PnL
+is reflected in `/paper/pnl` and `/status`.
+
+Safety rules enforced:
+
+- max one open paper position
+- stop-loss is mandatory
+- no averaging down
+- no martingale
+- market data must be available
+- RiskManager approval is required
+- automatic closes run for `stop_loss`, `take_profit`, and `timeout`
+- real exchange execution remains blocked
 
 ## Safety
 

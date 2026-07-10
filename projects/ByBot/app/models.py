@@ -33,6 +33,11 @@ class SignalAction(str, Enum):
     NO_TRADE = "NO_TRADE"
 
 
+class PositionStatus(str, Enum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
 class SimpleTrend(str, Enum):
     BULLISH = "bullish"
     BEARISH = "bearish"
@@ -155,6 +160,42 @@ class Position(BaseModel):
     unrealized_pnl: float = 0
 
 
+class PaperPosition(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    symbol: Symbol
+    side: Side
+    size: float = Field(gt=0)
+    entry_price: float = Field(gt=0)
+    current_price: float = Field(gt=0)
+    stop_loss: float = Field(gt=0)
+    take_profit: float = Field(gt=0)
+    unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    closed_at: datetime | None = None
+    status: PositionStatus = PositionStatus.OPEN
+    reason: str = "opened"
+
+
+class PaperPnl(BaseModel):
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    total_pnl: float = 0.0
+    open_positions: int = 0
+    closed_trades: int = 0
+
+
+class PaperTestSignalRequest(BaseModel):
+    symbol: Symbol = Symbol.BTCUSDT
+    side: Side = Side.BUY
+    confidence: float = Field(default=0.9, ge=0, le=1)
+    expected_edge_bps: float = 20.0
+    stop_loss_pct: float = Field(default=0.5, gt=0)
+    take_profit_pct: float | None = Field(default=None, gt=0)
+    requested_risk_pct: float | None = Field(default=None, gt=0)
+    leverage: int | None = Field(default=None, ge=1, le=2)
+
+
 class BotEvent(BaseModel):
     event_type: str
     message: str
@@ -196,5 +237,7 @@ class AccountStatus(BaseModel):
     open_positions: list[AccountPosition] = Field(default_factory=list)
     open_orders: list[AccountOrder] = Field(default_factory=list)
     recent_closed_orders: list[AccountOrder] = Field(default_factory=list)
+    stale: bool = False
     last_error: str | None = None
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    last_refresh_attempt_at: datetime | None = None

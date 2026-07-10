@@ -4,8 +4,10 @@ from pydantic import ValidationError
 
 import app.main as main_module
 from app.bybit.market_data import build_market_data_service
-from app.bybit.private import build_account_service
-from app.config import MarketDataProviderName, Settings
+from app.bybit.private import BybitAccountService, BybitPrivateClient, build_account_service
+from app.config import BybitEnvironment, MarketDataProviderName, Settings
+from app.models import PaperTestSignalRequest, Side, Symbol
+from app.portfolio.paper_trading import PaperTradingService
 
 
 main_module.market_data_service = build_market_data_service(
@@ -14,6 +16,7 @@ main_module.market_data_service = build_market_data_service(
 main_module.account_service = build_account_service(
     Settings(bybit_api_key=None, bybit_api_secret=None)
 )
+main_module.paper_trading_service = PaperTradingService()
 
 
 def test_live_mode_is_rejected() -> None:
@@ -49,6 +52,7 @@ def test_health_and_status_report_live_disabled() -> None:
     assert payload["private_api_connected"] is False
     assert payload["order_placement_blocked"] is True
     assert payload["account"]["trading_enabled"] is False
+    assert payload["paper_trading_status"] in {"IDLE", "OPEN_POSITION"}
     assert payload["risk_status"]["state"] in {"OK", "BLOCKED"}
 
 
@@ -88,3 +92,97 @@ def test_account_endpoint_returns_safe_disconnected_status() -> None:
     assert payload["connected"] is False
     assert payload["environment"] == "demo"
     assert payload["trading_enabled"] is False
+
+
+def test_account_endpoint_and_status_show_connected_after_refresh() -> None:
+    def fake_http_get(url: str, headers: dict[str, str], timeout: float) -> dict[str, object]:
+        if "/v5/account/wallet-balance" in url:
+            return {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {
+                    "list": [
+                        {
+                            "totalEquity": "1234",
+                            "totalAvailableBalance": "1200",
+                            "coin": [{"coin": "USDT", "walletBalance": "1200"}],
+                        }
+                    ]
+                },
+            }
+        return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
+
+    previous_account_service = main_module.account_service
+    try:
+        main_module.account_service = BybitAccountService(
+            BybitPrivateClient(
+                api_key="fake_key",
+                api_secret="fake_secret",
+                environment=BybitEnvironment.DEMO,
+                demo_base_url="https://api-demo.bybit.com",
+                mainnet_base_url="https://api.bybit.com",
+                http_get=fake_http_get,
+            ),
+            (Symbol.BTCUSDT, Symbol.ETHUSDT),
+        )
+
+        account_payload = main_module.account()
+        status_payload = main_module.status()
+
+        assert account_payload["connected"] is True
+        assert status_payload["private_api_connected"] is True
+        assert status_payload["account_connection_status"] == "CONNECTED"
+        assert status_payload["account"]["equity"] == 1234
+        assert "private API is not connected" not in status_payload["risk_status"]["reasons"]
+    finally:
+        main_module.account_service = previous_account_service
+
+
+def test_paper_test_signal_and_state_endpoints() -> None:
+    main_module.paper_trading_service = PaperTradingService()
+
+    response = main_module.paper_test_signal(
+        PaperTestSignalRequest(symbol=Symbol.BTCUSDT, side=Side.BUY)
+    )
+
+    assert response["accepted"] is True
+    assert main_module.paper_positions()["positions"]
+    assert "realized_pnl" in main_module.paper_pnl()
+    assert "trades" in main_module.paper_trades()
+    assert main_module.status()["order_placement_blocked"] is True
+
+
+def test_paper_close_position_endpoint_moves_open_position_to_trades() -> None:
+    main_module.paper_trading_service = PaperTradingService()
+
+    opened = main_module.paper_test_signal(
+        PaperTestSignalRequest(symbol=Symbol.BTCUSDT, side=Side.BUY)
+    )
+    closed = main_module.paper_close_position()
+
+    assert opened["accepted"] is True
+    assert closed["closed"] is True
+    assert closed["position"]["reason"] == "manual_close"
+    assert main_module.paper_positions()["positions"] == []
+    trades = main_module.paper_trades()["trades"]
+    assert len(trades) == 1
+    assert trades[0]["status"] == "CLOSED"
+    assert trades[0]["reason"] == "manual_close"
+    pnl = main_module.paper_pnl()
+    assert pnl["closed_trades"] == 1
+    assert pnl["unrealized_pnl"] == 0
+
+
+def test_paper_test_signal_blocks_second_position() -> None:
+    main_module.paper_trading_service = PaperTradingService()
+
+    first = main_module.paper_test_signal(
+        PaperTestSignalRequest(symbol=Symbol.BTCUSDT, side=Side.BUY)
+    )
+    second = main_module.paper_test_signal(
+        PaperTestSignalRequest(symbol=Symbol.BTCUSDT, side=Side.BUY)
+    )
+
+    assert first["accepted"] is True
+    assert second["accepted"] is False
+    assert second["risk_decision"]["approved"] is False
