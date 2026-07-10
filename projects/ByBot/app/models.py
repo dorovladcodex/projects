@@ -33,6 +33,13 @@ class SignalAction(str, Enum):
     NO_TRADE = "NO_TRADE"
 
 
+class SimpleTrend(str, Enum):
+    BULLISH = "bullish"
+    BEARISH = "bearish"
+    SIDEWAYS = "sideways"
+    UNKNOWN = "unknown"
+
+
 class NewsItem(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     title: str = Field(min_length=1, max_length=300)
@@ -64,21 +71,27 @@ class MarketSnapshot(BaseModel):
     last_price: float = Field(gt=0)
     bid_price: float = Field(gt=0)
     ask_price: float = Field(gt=0)
+    spread: float = Field(default=0, ge=0)
+    spread_pct: float = Field(default=0, ge=0)
+    price_change_1m_pct: float = 0.0
+    simple_trend: SimpleTrend = SimpleTrend.UNKNOWN
+    simple_volatility: float = Field(default=0, ge=0)
+    volume_24h: float | None = Field(default=None, ge=0)
     trend_score: float = Field(ge=-1, le=1)
     volatility_pct: float = Field(ge=0)
     liquidity_ok: bool
     api_stable: bool = True
-    price_change_1m_pct: float = 0.0
-    volume_24h: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def calculate_spread_fields(self) -> "MarketSnapshot":
+        self.spread = self.ask_price - self.bid_price
+        midpoint = (self.ask_price + self.bid_price) / 2
+        self.spread_pct = self.spread / midpoint * 100 if midpoint > 0 else 0
+        return self
 
     @property
     def spread_bps(self) -> float:
-        midpoint = (self.ask_price + self.bid_price) / 2
-        return (self.ask_price - self.bid_price) / midpoint * 10_000
-
-    @property
-    def spread_pct(self) -> float:
-        return self.spread_bps / 100
+        return self.spread_pct * 100
 
 
 class TradeSignal(BaseModel):

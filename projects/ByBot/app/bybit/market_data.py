@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.config import MarketDataProviderName, Settings
-from app.models import MarketSnapshot, Symbol
+from app.models import MarketSnapshot, SimpleTrend, Symbol
 
 
 class MarketDataProvider(Protocol):
@@ -152,6 +152,10 @@ class MarketDataService:
     def latest_snapshots(self) -> list[MarketSnapshot]:
         return [items[-1] for items in self.history.values() if items]
 
+    def latest_snapshot(self, symbol: Symbol) -> MarketSnapshot | None:
+        items = self.history.get(symbol, [])
+        return items[-1] if items else None
+
     def as_payload(self) -> dict[str, Any]:
         return {
             "status": self.status,
@@ -171,9 +175,12 @@ class MarketDataService:
         price_change_1m_pct = _price_change_since(prior, snapshot, timedelta(minutes=1))
         volatility_pct = _simple_volatility_pct([*prior, snapshot])
         trend_score = _trend_score(price_change_1m_pct)
+        simple_trend = _simple_trend(price_change_1m_pct)
         return snapshot.model_copy(
             update={
                 "price_change_1m_pct": price_change_1m_pct,
+                "simple_trend": simple_trend,
+                "simple_volatility": volatility_pct,
                 "volatility_pct": volatility_pct,
                 "trend_score": trend_score,
             }
@@ -198,25 +205,26 @@ def build_market_data_service(settings: Settings) -> MarketDataService:
 
 
 def snapshot_to_payload(snapshot: MarketSnapshot) -> dict[str, Any]:
-    trend_direction = "FLAT"
-    if snapshot.trend_score > 0:
-        trend_direction = "UP"
-    elif snapshot.trend_score < 0:
-        trend_direction = "DOWN"
-
     return {
         "symbol": snapshot.symbol.value,
+        "last_price": snapshot.last_price,
+        "bid_price": snapshot.bid_price,
+        "ask_price": snapshot.ask_price,
+        "spread": snapshot.spread,
+        "spread_pct": snapshot.spread_pct,
+        "simple_trend": snapshot.simple_trend.value,
+        "simple_volatility": snapshot.simple_volatility,
+        "volume_24h": snapshot.volume_24h,
+        "timestamp": snapshot.timestamp.isoformat(),
+        # Backward-compatible dashboard aliases.
         "price": snapshot.last_price,
         "bid": snapshot.bid_price,
         "ask": snapshot.ask_price,
         "spread_bps": snapshot.spread_bps,
-        "spread_pct": snapshot.spread_pct,
         "price_change_1m_pct": snapshot.price_change_1m_pct,
-        "volume_24h": snapshot.volume_24h,
         "volatility_pct": snapshot.volatility_pct,
         "trend_score": snapshot.trend_score,
-        "trend_direction": trend_direction,
-        "timestamp": snapshot.timestamp.isoformat(),
+        "trend_direction": snapshot.simple_trend.value.upper(),
     }
 
 
@@ -271,3 +279,11 @@ def _trend_score(price_change_1m_pct: float) -> float:
     if price_change_1m_pct == 0:
         return 0.0
     return max(-1.0, min(1.0, price_change_1m_pct / 0.5))
+
+
+def _simple_trend(price_change_1m_pct: float) -> SimpleTrend:
+    if price_change_1m_pct >= 0.05:
+        return SimpleTrend.BULLISH
+    if price_change_1m_pct <= -0.05:
+        return SimpleTrend.BEARISH
+    return SimpleTrend.SIDEWAYS

@@ -58,6 +58,8 @@ is in-memory paper execution.
 ### Phase A — DATA_ONLY
 
 - Read news and public Bybit market data.
+- Phase 2 uses public Bybit V5 REST polling for market tickers first. WebSocket
+  can be added later behind the same market-data provider interface.
 - Classify, calculate filters, and record hypothetical signals.
 - Never create orders or positions.
 - Validate freshness, reconnect behavior, deduplication, and observability.

@@ -2,8 +2,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from app.bybit.market_data import BybitRestMarketDataClient, MarketDataService
+from app.bybit.market_data import (
+    BybitRestMarketDataClient,
+    MarketDataService,
+    snapshot_to_payload,
+)
+from app.config import Settings
 from app.models import MarketSnapshot, Symbol
+from app.runtime import build_status
 
 
 def test_bybit_rest_client_parses_public_ticker_response() -> None:
@@ -36,6 +42,7 @@ def test_bybit_rest_client_parses_public_ticker_response() -> None:
     assert snapshot.last_price == 60_000
     assert snapshot.bid_price == 59_999
     assert snapshot.ask_price == 60_001
+    assert snapshot.spread == 2
     assert snapshot.volume_24h == 12_345.67
     assert snapshot.spread_pct > 0
 
@@ -82,4 +89,51 @@ def test_market_data_service_calculates_basic_metrics() -> None:
     snapshot = service.latest_snapshots()[0]
     assert snapshot.price_change_1m_pct > 0
     assert snapshot.volatility_pct >= 0
+    assert snapshot.simple_volatility >= 0
     assert snapshot.trend_score > 0
+    assert snapshot.simple_trend.value in {"bullish", "sideways"}
+
+
+def test_snapshot_payload_contains_phase_2_contract_fields() -> None:
+    snapshot = MarketSnapshot(
+        symbol=Symbol.BTCUSDT,
+        timestamp=datetime.now(timezone.utc),
+        last_price=60_000,
+        bid_price=59_999,
+        ask_price=60_001,
+        trend_score=0,
+        volatility_pct=0,
+        liquidity_ok=True,
+    )
+
+    payload = snapshot_to_payload(snapshot)
+
+    assert {
+        "symbol",
+        "last_price",
+        "bid_price",
+        "ask_price",
+        "spread",
+        "spread_pct",
+        "price_change_1m_pct",
+        "simple_trend",
+        "simple_volatility",
+        "volume_24h",
+        "timestamp",
+    } <= set(payload)
+
+
+def test_status_blocks_trading_when_market_data_is_unavailable() -> None:
+    class FailingProvider:
+        def get_snapshot(self, symbol: Symbol) -> MarketSnapshot:
+            raise ValueError("network unavailable")
+
+    service = MarketDataService(FailingProvider(), [Symbol.BTCUSDT, Symbol.ETHUSDT])
+    service.refresh_all()
+
+    payload = build_status(Settings(bot_mode="PAPER"), service)
+
+    assert payload["market_data_status"] == "DATA_UNAVAILABLE"
+    assert payload["trading_enabled"] is False
+    assert payload["trading_blocked_data_unavailable"] is True
+    assert payload["risk_status"]["state"] == "BLOCKED"

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.bybit.market_data import MarketDataService
+from app.bybit.market_data import MarketDataService, snapshot_to_payload
 from app.config import BotMode, Settings
-from app.models import RiskContext
+from app.models import RiskContext, Symbol
 from app.news.classifier import MockNewsClassifier
 from app.news.mock import mock_news_item
 from app.risk import RiskManager, RiskRules
@@ -59,9 +59,13 @@ def build_status(settings: Settings, market_data: MarketDataService) -> dict[str
         risk_approved = False
         max_loss_amount = 0.0
 
+    trading_blocked_data_unavailable = market_data.status != "OK"
     trading_enabled = settings.bot_mode in {BotMode.PAPER, BotMode.BYBIT_DEMO}
     trading_enabled = trading_enabled and not settings.trading_paused
+    trading_enabled = trading_enabled and not trading_blocked_data_unavailable
     risk_state = "OK" if risk_approved else "BLOCKED"
+    btc_snapshot = market_data.latest_snapshot(Symbol.BTCUSDT)
+    eth_snapshot = market_data.latest_snapshot(Symbol.ETHUSDT)
 
     return {
         "name": settings.bot_name,
@@ -69,12 +73,16 @@ def build_status(settings: Settings, market_data: MarketDataService) -> dict[str
         "live_trading": False,
         "trading_enabled": trading_enabled,
         "trading_paused": settings.trading_paused,
+        "trading_blocked_data_unavailable": trading_blocked_data_unavailable,
         "active_symbols": list(settings.allowed_symbols),
         "allowed_symbols": list(settings.allowed_symbols),
         "strategy": "NewsMomentumStrategy",
         "execution": "paper" if settings.bot_mode == BotMode.PAPER else "disabled",
         "open_paper_position": None,
         "last_signal": signal.model_dump(mode="json") if signal else None,
+        "market_data_status": market_data.status,
+        "latest_btcusdt_snapshot": snapshot_to_payload(btc_snapshot) if btc_snapshot else None,
+        "latest_ethusdt_snapshot": snapshot_to_payload(eth_snapshot) if eth_snapshot else None,
         "market": market_payload,
         "risk_status": {
             "state": risk_state,

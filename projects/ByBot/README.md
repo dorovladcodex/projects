@@ -92,11 +92,16 @@ Verify market data:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/market | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/market/BTCUSDT | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/market/ETHUSDT | ConvertTo-Json -Depth 10
 Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
 ```
 
 If Bybit is unreachable, `/market` and `/status.market` report
 `"DATA_UNAVAILABLE"` and the bot stays safe. No order-placement code exists.
+The Phase 2 adapter uses public Bybit V5 REST polling first. The interface is
+kept small so a WebSocket provider can replace it later without changing
+strategy, risk, or API code.
 
 ## Safety
 

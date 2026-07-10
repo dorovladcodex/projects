@@ -30,6 +30,9 @@ Expected results:
 - `/health`: `status` is `ok`.
 - `/status`: `live_trading` is `false`.
 - `/status`: `mode` matches the intended safe mode.
+- `/market`: returns `status=OK` and latest BTCUSDT/ETHUSDT snapshots, or
+  `status=DATA_UNAVAILABLE` if public market data cannot be refreshed.
+- `/market/BTCUSDT` and `/market/ETHUSDT`: return one latest snapshot.
 
 Stop with `Ctrl+C`.
 

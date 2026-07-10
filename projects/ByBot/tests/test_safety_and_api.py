@@ -1,8 +1,15 @@
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.config import Settings
-from app.main import health, market, status
+import app.main as main_module
+from app.bybit.market_data import build_market_data_service
+from app.config import MarketDataProviderName, Settings
+
+
+main_module.market_data_service = build_market_data_service(
+    Settings(market_data_provider=MarketDataProviderName.MOCK)
+)
 
 
 def test_live_mode_is_rejected() -> None:
@@ -16,8 +23,8 @@ def test_unsupported_symbols_are_rejected() -> None:
 
 
 def test_health_and_status_report_live_disabled() -> None:
-    assert health()["status"] == "ok"
-    payload = status()
+    assert main_module.health()["status"] == "ok"
+    payload = main_module.status()
     assert payload["live_trading"] is False
     assert payload["mode"] in {"DATA_ONLY", "PAPER", "BYBIT_DEMO"}
     assert isinstance(payload["trading_enabled"], bool)
@@ -26,14 +33,38 @@ def test_health_and_status_report_live_disabled() -> None:
     assert payload["open_paper_position"] is None
     assert payload["last_signal"] is not None
     assert payload["market"]["status"] == "OK"
+    assert payload["market_data_status"] == "OK"
+    assert payload["latest_btcusdt_snapshot"] is not None
+    assert payload["latest_ethusdt_snapshot"] is not None
+    assert payload["trading_blocked_data_unavailable"] is False
     assert payload["risk_status"]["state"] in {"OK", "BLOCKED"}
 
 
 def test_market_endpoint_returns_snapshots() -> None:
-    payload = market()
+    payload = main_module.market()
 
     assert payload["status"] == "OK"
     assert {item["symbol"] for item in payload["snapshots"]} == {"BTCUSDT", "ETHUSDT"}
-    assert {"price", "bid", "ask", "spread_pct", "price_change_1m_pct"} <= set(
-        payload["snapshots"][0]
-    )
+    assert {
+        "last_price",
+        "bid_price",
+        "ask_price",
+        "spread",
+        "spread_pct",
+        "price_change_1m_pct",
+        "simple_trend",
+        "simple_volatility",
+    } <= set(payload["snapshots"][0])
+
+
+def test_market_symbol_endpoint_returns_single_snapshot() -> None:
+    payload = main_module.market_symbol("BTCUSDT")
+
+    assert payload["status"] == "OK"
+    assert payload["snapshot"]["symbol"] == "BTCUSDT"
+
+
+def test_market_symbol_endpoint_rejects_unsupported_symbol() -> None:
+    with pytest.raises(HTTPException) as exc:
+        main_module.market_symbol("SOLUSDT")
+    assert exc.value.status_code == 404

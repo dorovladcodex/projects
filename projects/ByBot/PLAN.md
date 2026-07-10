@@ -11,10 +11,19 @@
 - Minimal FastAPI `/health` and `/status`
 - Unit tests for strategy and risk controls
 
-## Phase 2 — data and observability
+## Phase 2 — data-only market data (implemented)
 
+- Bybit V5 public REST ticker adapter for BTCUSDT and ETHUSDT
+- In-memory latest market snapshot cache
+- `/market` and `/market/{symbol}` API endpoints
+- `/status` market-data status, latest BTC/ETH snapshots, and data-unavailable block
+- Safe `DATA_UNAVAILABLE` behavior when Bybit is unreachable
+- No authenticated Bybit client and no order placement
+
+Deferred from Phase 2:
+
+- WebSocket market-data provider
 - PostgreSQL persistence and migrations
-- Bybit V5 read-only market-data adapter
 - News provider adapters, filters, deduplication, and classifier cache
 - Dashboard views and Telegram notifications
 - Structured logs, metrics, and bot-event audit trail
