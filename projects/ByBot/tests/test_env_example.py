@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+def test_env_example_contains_required_phase_1_variables() -> None:
+    content = Path(".env.example").read_text(encoding="utf-8")
+    keys = {
+        line.split("=", 1)[0]: line.split("=", 1)[1]
+        for line in content.splitlines()
+        if line and not line.startswith("#") and "=" in line
+    }
+
+    required = {
+        "BOT_NAME",
+        "BOT_MODE",
+        "LOG_LEVEL",
+        "DATABASE_URL",
+        "BYBIT_API_KEY",
+        "BYBIT_API_SECRET",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "LLM_API_KEY",
+        "ALLOWED_SYMBOLS",
+        "TRADING_PAUSED",
+        "PAPER_STARTING_EQUITY",
+        "PAPER_DAILY_PNL_PCT",
+        "PAPER_WEEKLY_PNL_PCT",
+        "PAPER_CONSECUTIVE_LOSSES",
+        "MAX_RISK_PER_TRADE_PCT",
+        "MAX_DAILY_LOSS_PCT",
+        "MAX_WEEKLY_LOSS_PCT",
+        "MAX_LEVERAGE",
+        "MAX_SPREAD_BPS",
+        "MIN_LLM_CONFIDENCE",
+        "MIN_EXPECTED_EDGE_BPS",
+    }
+
+    assert required <= set(keys)
+    assert keys["BOT_MODE"] != "LIVE"
+    assert all(keys[key] for key in required)

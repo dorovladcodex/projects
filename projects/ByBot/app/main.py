@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 
 from app.config import get_settings
+from app.runtime import build_status
 
 settings = get_settings()
 app = FastAPI(title="ByBot", version="0.1.0")
@@ -17,11 +18,4 @@ def health() -> dict[str, str]:
 
 @app.get("/status")
 def status() -> dict[str, object]:
-    return {
-        "name": settings.bot_name,
-        "mode": settings.bot_mode.value,
-        "live_trading": False,
-        "allowed_symbols": list(settings.allowed_symbols),
-        "strategy": "NewsMomentumStrategy",
-        "execution": "paper" if settings.bot_mode.value == "PAPER" else "disabled",
-    }
+    return build_status(settings)

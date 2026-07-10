@@ -10,6 +10,19 @@ def test_live_mode_is_rejected() -> None:
         Settings(bot_mode="LIVE")
 
 
+def test_unsupported_symbols_are_rejected() -> None:
+    with pytest.raises(ValidationError, match="Unsupported symbols"):
+        Settings(allowed_symbols=("SOLUSDT",))
+
+
 def test_health_and_status_report_live_disabled() -> None:
     assert health()["status"] == "ok"
-    assert status()["live_trading"] is False
+    payload = status()
+    assert payload["live_trading"] is False
+    assert payload["mode"] == "PAPER"
+    assert payload["trading_enabled"] is True
+    assert payload["trading_paused"] is False
+    assert payload["active_symbols"] == ["BTCUSDT", "ETHUSDT"]
+    assert payload["open_paper_position"] is None
+    assert payload["last_signal"] is not None
+    assert payload["risk_status"]["state"] in {"OK", "BLOCKED"}

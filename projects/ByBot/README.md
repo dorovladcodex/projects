@@ -21,7 +21,7 @@ Prerequisites: install Python 3.11 or newer from `python.org` with the Python
 Launcher (`py`) enabled. Run the following commands from PowerShell:
 
 ```powershell
-cd C:\Users\dorov\Documents\ByBot
+cd D:\VibeProjects\projects\projects\ByBot
 py -3.11 --version
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
@@ -39,8 +39,10 @@ Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json
 Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json
 ```
 
-Expected safety fields include `"status": "ok"` from `/health` and
-`"live_trading": false` from `/status`. Stop the server with `Ctrl+C`.
+Expected safety fields include `"status": "ok"` from `/health`. `/status`
+returns `"mode"`, `"live_trading": false`, `"trading_enabled"`,
+`"trading_paused"`, `"active_symbols"`, `"open_paper_position"`,
+`"last_signal"`, and `"risk_status"`. Stop the server with `Ctrl+C`.
 
 If Python 3.11 is not installed but a newer supported version is available,
 replace both `py -3.11` occurrences with `py -3`.
@@ -48,7 +50,7 @@ replace both `py -3.11` occurrences with `py -3`.
 ### Run tests later
 
 ```powershell
-cd C:\Users\dorov\Documents\ByBot
+cd D:\VibeProjects\projects\projects\ByBot
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 

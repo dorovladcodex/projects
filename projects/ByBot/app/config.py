@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     llm_api_key: str | None = None
 
     allowed_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
+    trading_paused: bool = False
+    paper_starting_equity: float = Field(default=10_000.0, gt=0)
+    paper_daily_pnl_pct: float = 0.0
+    paper_weekly_pnl_pct: float = 0.0
+    paper_consecutive_losses: int = Field(default=0, ge=0)
     max_risk_per_trade_pct: float = Field(default=0.5, gt=0, le=0.5)
     max_daily_loss_pct: float = Field(default=2.0, gt=0, le=2.0)
     max_weekly_loss_pct: float = Field(default=5.0, gt=0, le=5.0)
@@ -47,6 +52,18 @@ class Settings(BaseSettings):
         if isinstance(value, str) and value.upper() == "LIVE":
             raise ValueError("Live trading is blocked in v1")
         return value.upper() if isinstance(value, str) else value
+
+    @field_validator("allowed_symbols")
+    @classmethod
+    def restrict_symbols(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        supported = {"BTCUSDT", "ETHUSDT"}
+        symbols = tuple(symbol.upper() for symbol in value)
+        if not symbols:
+            raise ValueError("At least one active symbol is required")
+        unsupported = sorted(set(symbols) - supported)
+        if unsupported:
+            raise ValueError(f"Unsupported symbols in v1: {', '.join(unsupported)}")
+        return symbols
 
 
 @lru_cache
