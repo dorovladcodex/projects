@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 
 from app.bybit.market_data import build_market_data_service, snapshot_to_payload
+from app.bybit.private import build_account_service
 from app.config import get_settings
 from app.models import Symbol
 from app.runtime import build_status
@@ -12,6 +13,7 @@ from app.runtime import build_status
 settings = get_settings()
 app = FastAPI(title="ByBot", version="0.1.0")
 market_data_service = build_market_data_service(settings)
+account_service = build_account_service(settings)
 
 
 @app.get("/health")
@@ -22,7 +24,8 @@ def health() -> dict[str, str]:
 @app.get("/status")
 def status() -> dict[str, object]:
     market_data_service.refresh_all()
-    return build_status(settings, market_data_service)
+    account_service.refresh()
+    return build_status(settings, market_data_service, account_service)
 
 
 @app.get("/market")
@@ -52,3 +55,9 @@ def market_symbol(symbol: str) -> dict[str, object]:
         "last_error": market_data_service.last_error,
         "snapshot": snapshot_to_payload(snapshot),
     }
+
+
+@app.get("/account")
+def account() -> dict[str, object]:
+    account_service.refresh()
+    return account_service.as_payload()

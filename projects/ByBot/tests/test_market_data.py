@@ -7,6 +7,7 @@ from app.bybit.market_data import (
     MarketDataService,
     snapshot_to_payload,
 )
+from app.bybit.private import build_account_service
 from app.config import Settings
 from app.models import MarketSnapshot, Symbol
 from app.runtime import build_status
@@ -131,7 +132,8 @@ def test_status_blocks_trading_when_market_data_is_unavailable() -> None:
     service = MarketDataService(FailingProvider(), [Symbol.BTCUSDT, Symbol.ETHUSDT])
     service.refresh_all()
 
-    payload = build_status(Settings(bot_mode="PAPER"), service)
+    settings = Settings(bot_mode="PAPER", bybit_api_key=None, bybit_api_secret=None)
+    payload = build_status(settings, service, build_account_service(settings))
 
     assert payload["market_data_status"] == "DATA_UNAVAILABLE"
     assert payload["trading_enabled"] is False

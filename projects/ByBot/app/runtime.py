@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.bybit.market_data import MarketDataService, snapshot_to_payload
+from app.bybit.private import BybitAccountService, order_placement_blocked_reason
 from app.config import BotMode, Settings
 from app.models import RiskContext, Symbol
 from app.news.classifier import MockNewsClassifier
@@ -11,7 +12,11 @@ from app.risk import RiskManager, RiskRules
 from app.strategy import NewsMomentumStrategy
 
 
-def build_status(settings: Settings, market_data: MarketDataService) -> dict[str, Any]:
+def build_status(
+    settings: Settings,
+    market_data: MarketDataService,
+    account_service: BybitAccountService,
+) -> dict[str, Any]:
     """Build a deterministic status snapshot.
 
     There is no real Bybit order placement here. Market data may be real public
@@ -19,6 +24,7 @@ def build_status(settings: Settings, market_data: MarketDataService) -> dict[str
     """
 
     market_payload = market_data.as_payload()
+    account_status = account_service.status
     snapshots = market_data.latest_snapshots()
 
     news = mock_news_item()
@@ -49,20 +55,39 @@ def build_status(settings: Settings, market_data: MarketDataService) -> dict[str
         min_confidence=settings.min_llm_confidence,
         min_expected_edge_bps=settings.min_expected_edge_bps,
     )
-    if signal is not None and market is not None and market_data.status == "OK":
+    private_api_blocked = not account_status.connected
+    if (
+        signal is not None
+        and market is not None
+        and market_data.status == "OK"
+        and not private_api_blocked
+    ):
         risk_decision = RiskManager(risk_rules).assess(signal, market, risk_context)
         risk_reasons = risk_decision.reasons
         risk_approved = risk_decision.approved
         max_loss_amount = risk_decision.max_loss_amount
     else:
-        risk_reasons = ["market data unavailable"]
+        risk_reasons = []
+        if market_data.status != "OK":
+            risk_reasons.append("market data unavailable")
+        if private_api_blocked:
+            risk_reasons.append("private API is not connected")
+        if not risk_reasons:
+            risk_reasons.append("strategy did not produce a trade")
         risk_approved = False
         max_loss_amount = 0.0
 
     trading_blocked_data_unavailable = market_data.status != "OK"
+    order_placement_blocked = True
+    order_placement_blocked_reason_text = order_placement_blocked_reason(
+        settings,
+        account_status,
+    )
     trading_enabled = settings.bot_mode in {BotMode.PAPER, BotMode.BYBIT_DEMO}
     trading_enabled = trading_enabled and not settings.trading_paused
     trading_enabled = trading_enabled and not trading_blocked_data_unavailable
+    trading_enabled = trading_enabled and account_status.connected
+    trading_enabled = trading_enabled and not order_placement_blocked
     risk_state = "OK" if risk_approved else "BLOCKED"
     btc_snapshot = market_data.latest_snapshot(Symbol.BTCUSDT)
     eth_snapshot = market_data.latest_snapshot(Symbol.ETHUSDT)
@@ -74,6 +99,10 @@ def build_status(settings: Settings, market_data: MarketDataService) -> dict[str
         "trading_enabled": trading_enabled,
         "trading_paused": settings.trading_paused,
         "trading_blocked_data_unavailable": trading_blocked_data_unavailable,
+        "private_api_connected": account_status.connected,
+        "account_connection_status": "CONNECTED" if account_status.connected else "DISCONNECTED",
+        "order_placement_blocked": order_placement_blocked,
+        "order_placement_blocked_reason": order_placement_blocked_reason_text,
         "active_symbols": list(settings.allowed_symbols),
         "allowed_symbols": list(settings.allowed_symbols),
         "strategy": "NewsMomentumStrategy",
@@ -84,6 +113,7 @@ def build_status(settings: Settings, market_data: MarketDataService) -> dict[str
         "latest_btcusdt_snapshot": snapshot_to_payload(btc_snapshot) if btc_snapshot else None,
         "latest_ethusdt_snapshot": snapshot_to_payload(eth_snapshot) if eth_snapshot else None,
         "market": market_payload,
+        "account": account_status.model_dump(mode="json"),
         "risk_status": {
             "state": risk_state,
             "approved": risk_approved,

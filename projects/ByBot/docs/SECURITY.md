@@ -26,10 +26,13 @@ deployment host.
 ## Bybit controls
 
 - Phase 1 uses mocks and does not require a Bybit key.
+- Phase 3A may use Bybit demo read-only keys for private account data only.
 - DATA_ONLY and shadow-live public data should use no authenticated key.
 - BYBIT_DEMO must use demo-only endpoints and demo-only credentials.
 - Never grant withdrawal permission.
 - Apply the narrowest API permissions and IP allowlisting available.
+- `BYBIT_ENABLE_TRADING=true` is rejected during configuration validation in
+  Phase 3A.
 - The application must reject production trading endpoints in v1.
 - A configured credential must not imply permission to execute.
 

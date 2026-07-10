@@ -33,6 +33,9 @@ Expected results:
 - `/market`: returns `status=OK` and latest BTCUSDT/ETHUSDT snapshots, or
   `status=DATA_UNAVAILABLE` if public market data cannot be refreshed.
 - `/market/BTCUSDT` and `/market/ETHUSDT`: return one latest snapshot.
+- `/account`: returns `connected=false` without crashing if private keys are
+  absent or invalid; with valid demo read-only keys it returns wallet, positions,
+  and orders.
 
 Stop with `Ctrl+C`.
 
@@ -42,6 +45,20 @@ Stop with `Ctrl+C`.
 
 Set `BOT_MODE=DATA_ONLY`. Confirm execution is reported as disabled. Use this
 mode first for new data providers, schema changes, and production public feeds.
+
+### Private account read-only
+
+Use only demo read-only keys. Keep `BYBIT_ENABLE_TRADING=false`. Verify:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/account | ConvertTo-Json -Depth 10
+```
+
+Expected safety fields:
+
+- `trading_enabled=false`
+- `/status` has `order_placement_blocked=true`
+- invalid private API credentials produce `connected=false` and `last_error`
 
 ### PAPER
 

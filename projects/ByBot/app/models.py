@@ -165,3 +165,36 @@ class ErrorRecord(BaseModel):
     component: str
     message: str
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class AccountPosition(BaseModel):
+    symbol: Symbol
+    side: str
+    size: float = Field(ge=0)
+    entry_price: float | None = Field(default=None, ge=0)
+    mark_price: float | None = Field(default=None, ge=0)
+    unrealized_pnl: float | None = None
+
+
+class AccountOrder(BaseModel):
+    symbol: Symbol
+    order_id: str
+    side: str | None = None
+    order_type: str | None = None
+    qty: float | None = Field(default=None, ge=0)
+    price: float | None = Field(default=None, ge=0)
+    order_status: str | None = None
+    created_time: str | None = None
+
+
+class AccountStatus(BaseModel):
+    connected: bool = False
+    environment: str
+    trading_enabled: bool = False
+    equity: float | None = Field(default=None, ge=0)
+    available_balance: float | None = Field(default=None, ge=0)
+    open_positions: list[AccountPosition] = Field(default_factory=list)
+    open_orders: list[AccountOrder] = Field(default_factory=list)
+    recent_closed_orders: list[AccountOrder] = Field(default_factory=list)
+    last_error: str | None = None
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -103,10 +103,52 @@ The Phase 2 adapter uses public Bybit V5 REST polling first. The interface is
 kept small so a WebSocket provider can replace it later without changing
 strategy, risk, or API code.
 
+## Private account connection, read-only
+
+Phase 3A can connect to Bybit private account data for reconciliation only.
+It does not place orders. Use demo API keys with read-only permissions.
+
+Edit `.env`:
+
+```powershell
+notepad .env
+```
+
+Set these values:
+
+```env
+BYBIT_ENV=demo
+BYBIT_ENABLE_TRADING=false
+BYBIT_API_KEY=your_demo_read_only_key
+BYBIT_API_SECRET=your_demo_read_only_secret
+BYBIT_PRIVATE_DEMO_BASE_URL=https://api-demo.bybit.com
+```
+
+Start the API:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Verify account status:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/account | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/status | ConvertTo-Json -Depth 10
+```
+
+Expected safety fields:
+
+- `trading_enabled` is `false`
+- `order_placement_blocked` is `true`
+- `account.trading_enabled` is `false`
+- invalid keys show `connected=false` and `last_error`, without crashing
+
 ## Safety
 
 `BOT_MODE=LIVE` (or any unsupported mode) fails configuration validation and
 prevents application startup. `PaperExecutionEngine` only accepts PAPER mode.
+`BYBIT_ENABLE_TRADING=true` fails configuration validation in Phase 3A.
 No module in v1 sends orders to Bybit.
 
 See [PLAN.md](PLAN.md) for phase boundaries.

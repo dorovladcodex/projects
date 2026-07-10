@@ -18,6 +18,11 @@ class MarketDataProviderName(str, Enum):
     BYBIT_REST = "BYBIT_REST"
 
 
+class BybitEnvironment(str, Enum):
+    DEMO = "demo"
+    MAINNET = "mainnet"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -33,7 +38,13 @@ class Settings(BaseSettings):
 
     bybit_api_key: str | None = None
     bybit_api_secret: str | None = None
+    bybit_env: BybitEnvironment = BybitEnvironment.DEMO
+    bybit_enable_trading: bool = False
     bybit_public_base_url: str = "https://api.bybit.com"
+    bybit_private_demo_base_url: str = "https://api-demo.bybit.com"
+    bybit_private_mainnet_base_url: str = "https://api.bybit.com"
+    bybit_private_recv_window_ms: int = Field(default=5000, gt=0, le=60_000)
+    bybit_private_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     llm_api_key: str | None = None
@@ -66,6 +77,18 @@ class Settings(BaseSettings):
     @classmethod
     def normalize_market_data_provider(cls, value: object) -> object:
         return value.upper() if isinstance(value, str) else value
+
+    @field_validator("bybit_env", mode="before")
+    @classmethod
+    def normalize_bybit_env(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("bybit_enable_trading")
+    @classmethod
+    def reject_bybit_trading_enabled(cls, value: bool) -> bool:
+        if value:
+            raise ValueError("Bybit order placement is blocked in Phase 3A")
+        return value
 
     @field_validator("allowed_symbols")
     @classmethod
