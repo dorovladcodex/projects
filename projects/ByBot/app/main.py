@@ -13,6 +13,7 @@ from app.bybit.private import build_account_service
 from app.config import BotMode, get_settings
 from app.models import (
     MarketSnapshot,
+    ClassifierTestRequest,
     NewsItem,
     PaperTestSignalRequest,
     RiskContext,
@@ -22,7 +23,13 @@ from app.models import (
     TestMarketSnapshotRequest,
     TradeSignal,
 )
-from app.news import MockNewsClassifier, NewsService, RSSNewsSource
+from app.news import (
+    NewsService,
+    RSSNewsSource,
+    apply_trade_eligibility,
+    build_news_classifier,
+)
+from app.news.service import normalize_item
 from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
 from app.runtime import build_status
@@ -36,9 +43,10 @@ paper_trading_service = PaperTradingService(
 )
 news_service = NewsService(
     [RSSNewsSource(url) for url in settings.news_rss_urls] if settings.news_enable_rss else [],
-    MockNewsClassifier() if settings.news_enable_mock_classifier else None,
+    build_news_classifier(settings),
     max_item_age=timedelta(minutes=settings.news_max_item_age_minutes),
     min_importance_to_classify=settings.news_min_importance_to_classify,
+    min_classification_confidence=settings.signal_min_classification_confidence,
 )
 signal_candidate_service = SignalCandidateService(
     settings,
@@ -112,6 +120,44 @@ def news_classifications() -> dict[str, object]:
         "llm_cache_hits": news_service.llm_cache_hits,
         "estimated_input_tokens": news_service.estimated_input_tokens,
         "estimated_output_tokens": news_service.estimated_output_tokens,
+    }
+
+
+@app.get("/news/classifier/status")
+def news_classifier_status() -> dict[str, object]:
+    return news_service.classifier_status_payload()
+
+
+@app.get("/news/classifier/metrics")
+def news_classifier_metrics() -> dict[str, object]:
+    return news_service.classifier_metrics_payload()
+
+
+@app.post("/news/classifier/test")
+def test_news_classifier(request: ClassifierTestRequest) -> dict[str, object]:
+    if not (settings.app_env.lower() == "local" and settings.test_mode):
+        raise HTTPException(status_code=404, detail="classifier test endpoint is disabled")
+    if news_service.classifier is None:
+        raise HTTPException(status_code=503, detail="news classifier is disabled")
+    item = normalize_item(
+        NewsItem(
+            title=request.title,
+            summary=request.summary,
+            source="local-classifier-test",
+            published_at=datetime.now(timezone.utc),
+        )
+    )
+    classification = apply_trade_eligibility(
+        news_service.classifier.classify(item),
+        minimum_confidence=settings.signal_min_classification_confidence,
+    )
+    return {
+        "classification": classification.model_dump(mode="json"),
+        "news_stored": False,
+        "signal_created": False,
+        "execution_attempted": False,
+        "paper_position_opened": False,
+        "exchange_order_placement": "blocked",
     }
 
 

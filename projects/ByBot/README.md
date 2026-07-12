@@ -379,6 +379,48 @@ Invoke-RestMethod -Method Post `
 The endpoint returns `404` outside local test mode. It always reports
 `execution_attempted=false`, `paper_position_opened=false`, and blocked exchange
 order placement.
+
+## Optional real LLM classifier (Phase 4E)
+
+The default remains deterministic mock classification:
+
+```env
+NEWS_CLASSIFIER_MODE=mock
+```
+
+To configure an OpenAI-compatible structured-output provider, keep credentials
+only in the ignored `.env` file and set:
+
+```env
+NEWS_CLASSIFIER_MODE=llm
+LLM_API_KEY=replace-with-secret-provider-key
+LLM_API_URL=https://api.openai.com/v1/chat/completions
+LLM_MODEL=gpt-4.1-mini
+LLM_CLASSIFIER_VERSION=news-v1
+LLM_ALLOW_MOCK_FALLBACK=false
+```
+
+The classifier sends only normalized filtered-news fields. It never receives
+Bybit credentials, wallet/account data, positions, orders, market snapshots,
+logs, links to follow, or raw webpage HTML. Invalid output, provider errors,
+timeouts, budget rejection, and open circuit breakers produce a non-tradeable
+neutral `FAILED` classification.
+
+Trade eligibility is calculated centrally. Only `SUCCESS` or `CACHE_HIT`
+classifications with directional sentiment, sufficient confidence, a supported
+BTC/ETH/MARKET asset, valid category, and no error may enter signal generation.
+Neutral, failed, low-confidence, OTHER-asset, and mock-fallback results include
+explicit `eligibility_reasons` and remain non-tradeable.
+
+Inspect classifier health and budgets:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/news/classifier/status | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/news/classifier/metrics | ConvertTo-Json -Depth 10
+```
+
+`POST /news/classifier/test` is available only under `APP_ENV=local` and
+`TEST_MODE=true`. It does not store news, create a signal, or execute a trade.
 - real exchange execution remains blocked
 
 Sizing defaults in `.env`:

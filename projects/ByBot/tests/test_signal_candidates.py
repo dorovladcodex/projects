@@ -134,22 +134,18 @@ def test_neutral_and_low_confidence_classifications_create_no_trade() -> None:
     )
     classification.sentiment = Sentiment.NEUTRAL
     classification.confidence = 0.9
-    neutral = signals.process_news_id(classification.news_id)[0]
-    assert neutral.candidate.state == CandidateLifecycleState.BLOCKED
-    assert neutral.candidate.final_action == NewsSignalAction.NO_TRADE
-    assert "neutral classification" in neutral.candidate.reasons
-    assert neutral.risk_preview.preview_performed is False
-    assert neutral.risk_preview.preview_reason == "candidate is not tradeable yet"
+    neutral = signals.process_news_id(classification.news_id)
+    assert neutral == []
+    assert signals.candidates == []
 
     low_signals, _, low_classification = pipeline(
         "SEC approves Bitcoin ETF",
         "BTC ETF approval.",
     )
     low_classification.confidence = 0.5
-    low = low_signals.process_news_id(low_classification.news_id)[0]
-    assert low.candidate.state == CandidateLifecycleState.BLOCKED
-    assert low.candidate.final_action == NewsSignalAction.NO_TRADE
-    assert "classification confidence below signal threshold" in low.candidate.reasons
+    low = low_signals.process_news_id(low_classification.news_id)
+    assert low == []
+    assert low_signals.candidates == []
 
 
 def test_strong_conflict_blocks_but_stale_market_waits() -> None:

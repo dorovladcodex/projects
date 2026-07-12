@@ -5,8 +5,9 @@ from hashlib import sha256
 import re
 
 from app.models import Asset, NewsClassification, NewsFilterDebug, NewsItem
-from app.news.classifier import LLMNewsClassifier
+from app.news.classifier import BaseNewsClassifier
 from app.news.keywords import KeywordMatcher
+from app.news.eligibility import apply_trade_eligibility
 from app.news.sources import BaseNewsSource
 from app.news.text import clean_news_text
 
@@ -31,15 +32,17 @@ class NewsService:
     def __init__(
         self,
         sources: list[BaseNewsSource],
-        classifier: LLMNewsClassifier | None,
+        classifier: BaseNewsClassifier | None,
         *,
         max_item_age: timedelta,
         min_importance_to_classify: float = 0.3,
+        min_classification_confidence: float = 0.8,
     ) -> None:
         self.sources = sources
         self.classifier = classifier
         self.max_item_age = max_item_age
         self.min_importance_to_classify = min_importance_to_classify
+        self.min_classification_confidence = min_classification_confidence
         self.items: list[NewsItem] = []
         self.filtered_items: list[NewsItem] = []
         self.classifications: list[NewsClassification] = []
@@ -122,19 +125,23 @@ class NewsService:
         self.items_filtered_count += 1
         if self.classifier is None:
             return finish(True, "accepted")
-        classification = self.classifier.classify(normalized)
+        classification = apply_trade_eligibility(
+            self.classifier.classify(normalized),
+            minimum_confidence=self.min_classification_confidence,
+        )
         self.classifications.append(classification)
         self.last_news_classification = classification
         self.items_classified_count += 1
-        if classification.model_name.startswith("mock-"):
+        if classification.provider_name in {"mock", "mock-fallback"}:
             self.mock_classifier_calls_count += 1
-        else:
-            self.real_llm_calls_count += 1
-        compact_input = " ".join(
-            (normalized.title, normalized.summary, normalized.source, normalized.published_at.isoformat(), normalized.asset_hint.value)
+        self.real_llm_calls_count = int(
+            self.classifier.metrics_payload().get("real_llm_calls_count", 0)
         )
-        self.estimated_input_tokens += _estimate_tokens(compact_input)
-        self.estimated_output_tokens += _estimate_tokens(classification.model_dump_json())
+        self.llm_cache_hits = int(
+            self.classifier.metrics_payload().get("llm_cache_hits", 0)
+        )
+        self.estimated_input_tokens += classification.estimated_input_tokens
+        self.estimated_output_tokens += classification.estimated_output_tokens
         return finish(True, "accepted", classification)
 
     def as_payload(self) -> dict[str, object]:
@@ -148,6 +155,16 @@ class NewsService:
 
     def filter_debug_payload(self) -> list[dict[str, object]]:
         return [item.model_dump(mode="json") for item in self.filter_debug[-100:]]
+
+    def classifier_status_payload(self) -> dict[str, object]:
+        if self.classifier is None:
+            return {"mode": "disabled", "status": "DISABLED"}
+        return self.classifier.status_payload()
+
+    def classifier_metrics_payload(self) -> dict[str, object]:
+        if self.classifier is None:
+            return {}
+        return self.classifier.metrics_payload()
 
 
 def normalize_item(item: NewsItem) -> NewsItem:

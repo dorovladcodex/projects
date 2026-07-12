@@ -48,6 +48,23 @@ deployment host.
 - Validate all external data and cap lengths, timestamps, and numeric ranges.
 - Add authentication before exposing the dashboard beyond localhost.
 
+## LLM classifier boundary
+
+- Mock classification remains the default; real LLM use is explicit through
+  `NEWS_CLASSIFIER_MODE=llm`.
+- Send only normalized filtered-news title, truncated summary, asset hint,
+  source, publication timestamp, and importance.
+- Never include Bybit keys, authorization headers, account balances, positions,
+  orders, private market data, logs, raw HTML, or arbitrary application state.
+- Treat article text as untrusted data and instruct the provider to ignore
+  embedded instructions, links, and commands.
+- Validate strict structured output and fail closed to neutral, zero-confidence,
+  non-tradeable classifications on any provider/schema/budget failure.
+- Do not log complete provider requests/responses or authorization metadata.
+- Mock fallback is local-test-only, explicit, visibly marked, and non-tradeable.
+- Recalculate trade eligibility at classifier, ingestion, test-endpoint, and
+  signal boundaries; never trust a provider-supplied eligibility flag.
+
 ## Host and network controls
 
 - Do not expose PostgreSQL port 5432 publicly.

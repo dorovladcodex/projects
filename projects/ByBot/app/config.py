@@ -23,6 +23,11 @@ class BybitEnvironment(str, Enum):
     MAINNET = "mainnet"
 
 
+class NewsClassifierMode(str, Enum):
+    MOCK = "mock"
+    LLM = "llm"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -50,6 +55,25 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     llm_api_key: str | None = None
+    news_classifier_mode: NewsClassifierMode = NewsClassifierMode.MOCK
+    llm_provider_name: str = "openai-compatible"
+    llm_api_url: str = "https://api.openai.com/v1/chat/completions"
+    llm_model: str = "gpt-4.1-mini"
+    llm_classifier_version: str = "news-v1"
+    llm_allow_mock_fallback: bool = False
+    llm_cache_ttl_seconds: int = Field(default=3600, ge=1, le=86400)
+    llm_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    llm_max_retries: int = Field(default=2, ge=0, le=5)
+    llm_backoff_base_seconds: float = Field(default=0.5, ge=0, le=10)
+    llm_rate_limit_per_minute: int = Field(default=20, ge=1, le=1000)
+    llm_max_concurrent_requests: int = Field(default=2, ge=1, le=20)
+    llm_circuit_breaker_failure_threshold: int = Field(default=5, ge=1, le=100)
+    llm_circuit_breaker_cooldown_seconds: int = Field(default=60, ge=1, le=3600)
+    llm_max_input_characters: int = Field(default=4000, ge=500, le=20000)
+    llm_max_output_tokens: int = Field(default=250, ge=32, le=2000)
+    llm_hourly_request_budget: int = Field(default=100, ge=1, le=100000)
+    llm_daily_request_budget: int = Field(default=500, ge=1, le=1000000)
+    llm_daily_token_budget: int = Field(default=100000, ge=100, le=100000000)
 
     news_poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
     news_max_item_age_minutes: int = Field(default=60, ge=1, le=1440)
@@ -110,6 +134,11 @@ class Settings(BaseSettings):
     @field_validator("bybit_env", mode="before")
     @classmethod
     def normalize_bybit_env(cls, value: object) -> object:
+        return value.lower() if isinstance(value, str) else value
+
+    @field_validator("news_classifier_mode", mode="before")
+    @classmethod
+    def normalize_news_classifier_mode(cls, value: object) -> object:
         return value.lower() if isinstance(value, str) else value
 
     @field_validator("bybit_enable_trading")

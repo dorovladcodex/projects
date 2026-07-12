@@ -97,6 +97,8 @@ def build_status(
     btc_snapshot = market_data.latest_snapshot(Symbol.BTCUSDT)
     eth_snapshot = market_data.latest_snapshot(Symbol.ETHUSDT)
     paper_status = paper_trading.as_status()
+    classifier_status = news_service.classifier_status_payload()
+    classifier_metrics = news_service.classifier_metrics_payload()
 
     return {
         "name": settings.bot_name,
@@ -161,8 +163,21 @@ def build_status(
         "news_items_filtered_count": news_service.items_filtered_count,
         "items_classified_count": news_service.items_classified_count,
         "mock_classifier_calls_count": news_service.mock_classifier_calls_count,
-        "real_llm_calls_count": news_service.real_llm_calls_count,
-        "llm_cache_hits": news_service.llm_cache_hits,
+        "news_classifier_mode": classifier_status.get("mode", "disabled"),
+        "news_classifier_status": classifier_status.get("status", "DISABLED"),
+        "real_llm_calls_count": classifier_metrics.get("real_llm_calls_count", 0),
+        "successful_llm_calls_count": classifier_metrics.get("successful_llm_calls_count", 0),
+        "failed_llm_calls_count": classifier_metrics.get("failed_llm_calls_count", 0),
+        "llm_cache_hits": classifier_metrics.get("llm_cache_hits", 0),
+        "llm_circuit_breaker_state": classifier_metrics.get(
+            "llm_circuit_breaker_state", "DISABLED"
+        ),
+        "llm_requests_this_hour": classifier_metrics.get("llm_requests_this_hour", 0),
+        "llm_requests_today": classifier_metrics.get("llm_requests_today", 0),
+        "llm_input_tokens_today": classifier_metrics.get("llm_input_tokens_today", 0),
+        "llm_output_tokens_today": classifier_metrics.get("llm_output_tokens_today", 0),
+        "last_llm_error": classifier_metrics.get("last_llm_error"),
+        "last_llm_call_at": classifier_metrics.get("last_llm_call_at"),
         "estimated_input_tokens": news_service.estimated_input_tokens,
         "estimated_output_tokens": news_service.estimated_output_tokens,
         "news_last_error": news_service.last_error,

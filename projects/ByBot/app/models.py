@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Asset(str, Enum):
@@ -13,6 +13,13 @@ class Asset(str, Enum):
     MARKET = "MARKET"
     OTHER = "OTHER"
     UNKNOWN = "UNKNOWN"
+
+
+class LLMAsset(str, Enum):
+    BTC = "BTC"
+    ETH = "ETH"
+    MARKET = "MARKET"
+    OTHER = "OTHER"
 
 
 class Symbol(str, Enum):
@@ -24,6 +31,32 @@ class Sentiment(str, Enum):
     BULLISH = "BULLISH"
     BEARISH = "BEARISH"
     NEUTRAL = "NEUTRAL"
+
+
+class ClassificationStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    CACHE_HIT = "CACHE_HIT"
+    FAILED = "FAILED"
+    FALLBACK_MOCK = "FALLBACK_MOCK"
+
+
+class NewsCategory(str, Enum):
+    ETF = "etf"
+    REGULATION = "regulation"
+    SECURITY = "security"
+    MACRO = "macro"
+    EXCHANGE = "exchange"
+    LISTING = "listing"
+    ADOPTION = "adoption"
+    FUND_FLOW = "fund_flow"
+    OTHER = "other"
+
+
+class NewsUrgency(str, Enum):
+    LOW = "low"
+    NORMAL = "normal"
+    HIGH = "high"
+    CRITICAL = "critical"
 
 
 class Side(str, Enum):
@@ -90,7 +123,36 @@ class NewsClassification(BaseModel):
     reason: str = Field(default="", max_length=300)
     rationale: str = Field(default="", max_length=300)
     model_name: str
+    classification_status: ClassificationStatus = ClassificationStatus.SUCCESS
+    trade_eligible: bool = True
+    eligibility_reasons: list[str] = Field(default_factory=list)
+    provider_name: str = "mock"
+    classifier_version: str = "mock-v1"
+    latency_ms: float = Field(default=0, ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    estimated_input_tokens: int = Field(default=0, ge=0)
+    estimated_output_tokens: int = Field(default=0, ge=0)
+    cache_hit: bool = False
+    error_code: str | None = None
     classified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class LLMClassificationPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    asset: LLMAsset
+    sentiment: Sentiment
+    confidence: float = Field(ge=0, le=1)
+    category: NewsCategory
+    urgency: NewsUrgency
+    reason: str = Field(min_length=1, max_length=250)
+
+
+
+class ClassifierTestRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=300)
+    summary: str = Field(min_length=1, max_length=4000)
 
 
 class NewsFilterDebug(BaseModel):

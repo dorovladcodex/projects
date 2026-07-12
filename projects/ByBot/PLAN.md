@@ -101,6 +101,18 @@ Deferred from Phase 4A:
 - Local-test-only snapshot injection through the production confirmation path,
   isolated from the global Bybit market cache
 
+## Phase 4E - production-safe optional LLM classification (implemented)
+
+- Default mock/optional LLM classifier modes behind one typed interface
+- Strict structured response validation with fail-closed neutral results
+- Normalized filtered-news-only prompt boundary and injection-resistant instructions
+- Deterministic TTL cache, retries/backoff, concurrency/rate limits, budgets,
+  token accounting, and circuit breaker
+- Explicit local-only non-tradeable mock fallback
+- Classifier status, metrics, and isolated local test endpoints
+- Failed/fallback classifications cannot enter the signal pipeline
+- No automatic paper execution and no Bybit order placement
+
 ## Phase 4B - Bybit demo only
 
 - Authenticated Bybit Demo adapter with strict environment checks

@@ -10,6 +10,7 @@ from app.config import Settings
 from app.models import (
     Asset,
     CandidateLifecycleState,
+    ClassificationStatus,
     MarketConfirmation,
     MarketSnapshot,
     NewsClassification,
@@ -28,6 +29,7 @@ from app.models import (
     TradeSignal,
 )
 from app.news.service import NewsService
+from app.news.eligibility import calculate_trade_eligibility
 from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
 
@@ -104,6 +106,24 @@ class SignalCandidateService:
                     raise PermissionError("explicit signal reprocessing requires TEST_MODE=true")
 
             news, classification = self._find_news_and_classification(news_id)
+            eligibility = calculate_trade_eligibility(
+                classification_status=classification.classification_status,
+                sentiment=classification.sentiment,
+                confidence=classification.confidence,
+                asset=classification.asset,
+                category=classification.category,
+                error_code=classification.error_code,
+                minimum_confidence=self.settings.signal_min_classification_confidence,
+            )
+            if (
+                classification.classification_status
+                not in {ClassificationStatus.SUCCESS, ClassificationStatus.CACHE_HIT}
+                or not classification.trade_eligible
+                or not eligibility.trade_eligible
+                or classification.sentiment == Sentiment.NEUTRAL
+            ):
+                self.processed_news_ids.add(news_id)
+                return []
             symbols = _symbols_for_asset(classification.asset)
             new_results = [
                 self._new_result(news, classification, symbol, now=now) for symbol in symbols
