@@ -50,6 +50,22 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = None
     llm_api_key: str | None = None
 
+    news_poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    news_max_item_age_minutes: int = Field(default=60, ge=1, le=1440)
+    news_min_importance_to_classify: float = Field(default=0.3, ge=0, le=1)
+    news_enable_rss: bool = True
+    news_rss_urls: tuple[str, ...] = ("https://cointelegraph.com/rss",)
+    news_enable_mock_classifier: bool = True
+    test_mode: bool = False
+
+    signal_min_classification_confidence: float = Field(default=0.80, ge=0, le=1)
+    signal_min_news_importance: float = Field(default=0.70, ge=0, le=1)
+    signal_ttl_seconds: int = Field(default=300, ge=1, le=3600)
+    signal_confirmation_window_seconds: int = Field(default=60, ge=1, le=600)
+    signal_min_expected_edge_bps: float = Field(default=12.0, ge=0)
+    signal_default_stop_loss_pct: float = Field(default=0.5, gt=0)
+    signal_default_take_profit_pct: float = Field(default=1.0, gt=0)
+
     allowed_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
     market_data_provider: MarketDataProviderName = MarketDataProviderName.MOCK
     market_data_timeout_seconds: float = Field(default=5.0, gt=0, le=30)

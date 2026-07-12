@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
@@ -10,15 +11,19 @@ from app.bybit.market_data import build_market_data_service, snapshot_to_payload
 from app.bybit.private import build_account_service
 from app.config import get_settings
 from app.models import (
+    NewsItem,
     PaperTestSignalRequest,
     RiskContext,
     SignalAction,
+    SignalTestFromNewsRequest,
     Symbol,
     TradeSignal,
 )
+from app.news import MockNewsClassifier, NewsService, RSSNewsSource
 from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
 from app.runtime import build_status
+from app.signals import SignalCandidateService
 
 settings = get_settings()
 market_data_service = build_market_data_service(settings)
@@ -26,12 +31,34 @@ account_service = build_account_service(settings)
 paper_trading_service = PaperTradingService(
     timeout=timedelta(minutes=settings.paper_position_timeout_minutes)
 )
+news_service = NewsService(
+    [RSSNewsSource(url) for url in settings.news_rss_urls] if settings.news_enable_rss else [],
+    MockNewsClassifier() if settings.news_enable_mock_classifier else None,
+    max_item_age=timedelta(minutes=settings.news_max_item_age_minutes),
+    min_importance_to_classify=settings.news_min_importance_to_classify,
+)
+signal_candidate_service = SignalCandidateService(
+    settings,
+    news_service,
+    market_data_service,
+    account_service,
+    paper_trading_service,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     account_service.refresh_if_stale(force=True)
-    yield
+    await asyncio.to_thread(news_service.poll)
+    market_data_service.refresh_all()
+    signal_candidate_service.process_pending()
+    task = asyncio.create_task(news_polling_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
@@ -45,7 +72,101 @@ def health() -> dict[str, str]:
 @app.get("/status")
 def status() -> dict[str, object]:
     refresh_runtime_state(refresh_account=True)
-    return build_status(settings, market_data_service, account_service, paper_trading_service)
+    return build_status(
+        settings,
+        market_data_service,
+        account_service,
+        paper_trading_service,
+        news_service,
+        signal_candidate_service,
+    )
+
+
+@app.get("/news")
+def news() -> dict[str, object]:
+    return news_service.as_payload()
+
+
+@app.get("/news/filtered")
+def filtered_news() -> dict[str, object]:
+    return {
+        "items": [item.model_dump(mode="json") for item in news_service.filtered_items],
+        "items_filtered_count": news_service.items_filtered_count,
+    }
+
+
+@app.get("/news/classifications")
+def news_classifications() -> dict[str, object]:
+    return {
+        "classifications": [item.model_dump(mode="json") for item in news_service.classifications],
+        "items_classified_count": news_service.items_classified_count,
+        "mock_classifier_calls_count": news_service.mock_classifier_calls_count,
+        "real_llm_calls_count": news_service.real_llm_calls_count,
+        "llm_cache_hits": news_service.llm_cache_hits,
+        "estimated_input_tokens": news_service.estimated_input_tokens,
+        "estimated_output_tokens": news_service.estimated_output_tokens,
+    }
+
+
+@app.get("/news/filter-debug")
+def news_filter_debug() -> dict[str, object]:
+    return {"items": news_service.filter_debug_payload()}
+
+
+@app.post("/news/test-item")
+def news_test_item(item: NewsItem) -> dict[str, object]:
+    accepted, reason, classification = news_service.ingest(item)
+    return {
+        "accepted": accepted,
+        "reason": reason,
+        "item": news_service.last_news_item.model_dump(mode="json") if news_service.last_news_item else None,
+        "classification": classification.model_dump(mode="json") if classification else None,
+        "filter_debug": (
+            news_service.last_filter_debug.model_dump(mode="json")
+            if news_service.last_filter_debug else None
+        ),
+    }
+
+
+@app.get("/signals/candidates")
+def signal_candidates() -> dict[str, object]:
+    return {"candidates": signal_candidate_service.as_candidates_payload()}
+
+
+@app.get("/signals/latest")
+def latest_signal_candidate() -> dict[str, object]:
+    result = signal_candidate_service.last_result
+    return {"result": result.model_dump(mode="json") if result else None}
+
+
+@app.get("/signals/dry-run")
+def signal_dry_run() -> dict[str, object]:
+    signal_candidate_service.process_pending()
+    return {
+        "results": signal_candidate_service.as_dry_run_payload(),
+        "execution_attempted": False,
+        "paper_position_opened": False,
+    }
+
+
+@app.post("/signals/test-from-news")
+def test_signal_from_news(request: SignalTestFromNewsRequest) -> dict[str, object]:
+    market_data_service.refresh_all()
+    try:
+        results = signal_candidate_service.process_news_id(
+            request.news_id,
+            allow_reprocess=request.reprocess,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "results": [result.model_dump(mode="json") for result in results],
+        "execution_attempted": False,
+        "paper_position_opened": False,
+        "exchange_order_placement": "blocked",
+    }
 
 
 @app.get("/market")
@@ -222,3 +343,11 @@ def refresh_runtime_state(*, refresh_account: bool) -> None:
         account_service.refresh_if_stale()
     for snapshot in market_data_service.latest_snapshots():
         paper_trading_service.update_from_market(snapshot)
+
+
+async def news_polling_loop() -> None:
+    while True:
+        await asyncio.sleep(settings.news_poll_interval_seconds)
+        await asyncio.to_thread(news_service.poll)
+        market_data_service.refresh_all()
+        signal_candidate_service.process_pending()

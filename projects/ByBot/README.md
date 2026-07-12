@@ -218,6 +218,97 @@ Safety rules enforced:
   and max percentage of equity
 - paper PnL subtracts estimated fees and slippage
 - automatic closes run for `stop_loss`, `take_profit`, and `timeout`
+
+## News ingestion (Phase 4A)
+
+The bot can read public RSS news and filters it locally before passing only a
+compact title/summary/source/timestamp/asset hint to the deterministic mock
+classifier. It never sends market ticks, order books, candles, full articles,
+or API credentials to a classifier.
+
+For local development, enable the RSS reader in `.env` (the defaults below are
+also in `.env.example`):
+
+```env
+BOT_MODE=PAPER
+BYBIT_ENABLE_TRADING=false
+NEWS_ENABLE_RSS=true
+NEWS_RSS_URLS=["https://cointelegraph.com/rss"]
+NEWS_POLL_INTERVAL_SECONDS=60
+NEWS_MAX_ITEM_AGE_MINUTES=60
+NEWS_MIN_IMPORTANCE_TO_CLASSIFY=0.3
+NEWS_ENABLE_MOCK_CLASSIFIER=true
+```
+
+Run the app, then inspect the in-memory feed state:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/news | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/news/filtered | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/news/classifications | ConvertTo-Json -Depth 10
+Invoke-RestMethod http://127.0.0.1:8000/news/filter-debug | ConvertTo-Json -Depth 10
+```
+
+To test filtering without any external request:
+
+```powershell
+$body = @{
+  title = "Bitcoin ETF sees major BlackRock inflow"
+  summary = "Fresh BTC fund flow may affect the crypto market."
+  source = "local-test"
+  url = "https://example.invalid/news"
+  published_at = (Get-Date).ToUniversalTime().ToString("o")
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/news/test-item `
+  -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 10
+```
+
+RSS failures only set `news_status`/`news_last_error` in `/status`; they do not
+stop the API. This phase remains paper-only and contains no Bybit order
+placement.
+
+`/news/filter-debug` shows each recent decision, including `matched_keywords`,
+importance, and one of `accepted`, `old_news`, `duplicate`, `unrelated_asset`,
+`missing_keywords`, or `low_importance`.
+
+## News-to-signal dry run (Phase 4C)
+
+Accepted classifications can be evaluated against deterministic market data
+without opening a paper position. Keep these safety settings in `.env`:
+
+```env
+BOT_MODE=PAPER
+BYBIT_ENABLE_TRADING=false
+TEST_MODE=false
+SIGNAL_MIN_CLASSIFICATION_CONFIDENCE=0.80
+SIGNAL_MIN_NEWS_IMPORTANCE=0.70
+SIGNAL_TTL_SECONDS=300
+SIGNAL_CONFIRMATION_WINDOW_SECONDS=60
+SIGNAL_MIN_EXPECTED_EDGE_BPS=12
+SIGNAL_DEFAULT_STOP_LOSS_PCT=0.5
+SIGNAL_DEFAULT_TAKE_PROFIT_PCT=1.0
+```
+
+List dry-run state:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/signals/candidates | ConvertTo-Json -Depth 12
+Invoke-RestMethod http://127.0.0.1:8000/signals/latest | ConvertTo-Json -Depth 12
+Invoke-RestMethod http://127.0.0.1:8000/signals/dry-run | ConvertTo-Json -Depth 12
+```
+
+Create a candidate from an already classified `news_id`:
+
+```powershell
+$body = @{ news_id = "replace-with-news-id"; reprocess = $false } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/signals/test-from-news `
+  -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 12
+```
+
+The response contains a candidate and RiskManager preview with capped size,
+notional, and rejection reasons. `execution_attempted=false` and
+`paper_position_opened=false` are invariant in this phase.
 - real exchange execution remains blocked
 
 Sizing defaults in `.env`:

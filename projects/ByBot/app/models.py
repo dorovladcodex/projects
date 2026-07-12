@@ -10,6 +10,9 @@ from pydantic import BaseModel, Field, model_validator
 class Asset(str, Enum):
     BTC = "BTC"
     ETH = "ETH"
+    MARKET = "MARKET"
+    OTHER = "OTHER"
+    UNKNOWN = "UNKNOWN"
 
 
 class Symbol(str, Enum):
@@ -33,6 +36,12 @@ class SignalAction(str, Enum):
     NO_TRADE = "NO_TRADE"
 
 
+class NewsSignalAction(str, Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+    NO_TRADE = "NO_TRADE"
+
+
 class PositionStatus(str, Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
@@ -50,24 +59,81 @@ class NewsItem(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     summary: str = Field(min_length=1, max_length=1000)
     source: str = Field(min_length=1, max_length=100)
+    url: str | None = Field(default=None, max_length=2000)
     published_at: datetime
-    asset_hint: Asset
-    importance: float = Field(ge=0, le=1)
+    received_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    asset_hint: Asset = Asset.OTHER
+    raw_category: str | None = Field(default=None, max_length=100)
+    importance: float = Field(default=0.0, ge=0, le=1)
 
     @model_validator(mode="after")
     def timestamp_must_be_aware(self) -> "NewsItem":
-        if self.published_at.tzinfo is None:
-            raise ValueError("published_at must be timezone-aware")
+        if self.published_at.tzinfo is None or self.received_at.tzinfo is None:
+            raise ValueError("news timestamps must be timezone-aware")
         return self
 
 
 class NewsClassification(BaseModel):
     news_id: UUID
+    asset: Asset = Asset.OTHER
     sentiment: Sentiment
     confidence: float = Field(ge=0, le=1)
-    rationale: str = Field(max_length=300)
+    category: str = Field(default="general", max_length=100)
+    urgency: str = Field(default="normal", max_length=30)
+    reason: str = Field(default="", max_length=300)
+    rationale: str = Field(default="", max_length=300)
     model_name: str
     classified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class NewsFilterDebug(BaseModel):
+    news_id: UUID
+    title: str
+    asset_hint: Asset
+    importance: float = Field(ge=0, le=1)
+    matched_keywords: list[str] = Field(default_factory=list)
+    accepted: bool
+    rejection_reasons: list[str] = Field(default_factory=list)
+
+
+class MarketConfirmation(BaseModel):
+    available: bool = False
+    fresh: bool = False
+    direction_confirmed: bool = False
+    price_change_1m_pct: float | None = None
+    trend_direction: str = "unknown"
+    trend_score: float | None = None
+    spread_bps: float | None = None
+    volatility_pct: float | None = None
+    volume_24h: float | None = None
+    volume_change_pct: float | None = None
+    volume_spike: bool | None = None
+    reasons: list[str] = Field(default_factory=list)
+
+
+class NewsSignalCandidate(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    news_id: UUID
+    symbol: Symbol | None = None
+    action: NewsSignalAction
+    sentiment: Sentiment
+    classification_confidence: float = Field(ge=0, le=1)
+    news_importance: float = Field(ge=0, le=1)
+    category: str
+    urgency: str
+    market_confirmation: MarketConfirmation
+    expected_edge_bps: float
+    proposed_stop_loss_pct: float = Field(gt=0)
+    proposed_take_profit_pct: float = Field(gt=0)
+    ttl_seconds: int = Field(gt=0)
+    reasons: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    expires_at: datetime
+
+
+class SignalTestFromNewsRequest(BaseModel):
+    news_id: UUID
+    reprocess: bool = False
 
 
 class MarketSnapshot(BaseModel):
@@ -141,6 +207,13 @@ class RiskDecision(BaseModel):
     effective_expected_edge_bps: float = 0.0
     expected_net_edge_bps: float = 0.0
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class SignalDryRunResult(BaseModel):
+    candidate: NewsSignalCandidate
+    risk_preview: RiskDecision | None = None
+    execution_attempted: bool = False
+    paper_position_opened: bool = False
 
 
 class PaperOrder(BaseModel):

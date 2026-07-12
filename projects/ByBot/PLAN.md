@@ -62,7 +62,33 @@ Deferred from Phase 3B:
 - Replay/backtest harness and analytics
 - WebSocket stability monitoring and stale-data protection
 
-## Phase 4 - Bybit demo only
+## Phase 4A - real news ingestion and filtering (implemented)
+
+- Dependency-free public RSS source adapter and source interfaces/placeholders
+  for CryptoPanic, GDELT, and Bybit announcements
+- Normalized in-memory news items with title/source deduplication
+- Freshness, relevance, keyword, and BTC/ETH/MARKET classification filters
+- Compact deterministic mock news classifier and `/news` API endpoints
+- Safe background polling with visible error state in `/status`
+- No Bybit order placement, demo order placement, or live trading
+
+Deferred from Phase 4A:
+
+- Real LLM provider and persistent classification cache
+- Source API credentials/adapters and persistent news storage
+- Connecting accepted news signals to automatic paper entry
+
+## Phase 4C - news-to-signal dry run (implemented)
+
+- Deterministic BTC/ETH/MARKET news-to-symbol candidate mapping
+- Price direction, trend, volume, spread, volatility, freshness, edge, and TTL checks
+- RiskManager preview with capped size/notional and complete rejection reasons
+- Candidate deduplication by processed news ID
+- `/signals/candidates`, `/signals/latest`, `/signals/dry-run`, and
+  `POST /signals/test-from-news`
+- No automatic paper entry and no Bybit order execution
+
+## Phase 4B - Bybit demo only
 
 - Authenticated Bybit Demo adapter with strict environment checks
 - Idempotent order lifecycle and reconciliation

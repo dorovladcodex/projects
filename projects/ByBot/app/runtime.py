@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from app.bybit.market_data import MarketDataService, snapshot_to_payload
 from app.bybit.private import BybitAccountService, order_placement_blocked_reason
 from app.config import BotMode, Settings
-from app.models import RiskContext, Symbol
+from app.models import Asset, RiskContext, Symbol
 from app.news.classifier import MockNewsClassifier
-from app.news.mock import mock_news_item
+from app.news.service import NewsService
 from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
-from app.strategy import NewsMomentumStrategy
+from app.signals.service import SignalCandidateService
 
 
 def build_status(
@@ -18,6 +19,8 @@ def build_status(
     market_data: MarketDataService,
     account_service: BybitAccountService,
     paper_trading: PaperTradingService,
+    news_service: NewsService | None = None,
+    signal_candidates: SignalCandidateService | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic status snapshot.
 
@@ -25,18 +28,15 @@ def build_status(
     DATA_ONLY data or mock data depending on configuration.
     """
 
+    news_service = news_service or NewsService(
+        [], MockNewsClassifier(), max_item_age=timedelta(minutes=60)
+    )
     market_payload = market_data.as_payload()
     account_status = account_service.status
     snapshots = market_data.latest_snapshots()
 
-    news = mock_news_item()
-    classification = MockNewsClassifier().classify(news)
-    market = snapshots[0] if snapshots else None
-    signal = (
-        NewsMomentumStrategy().evaluate(news, classification, market)
-        if market is not None
-        else None
-    )
+    signal = None
+    market = None
 
     risk_context = RiskContext(
         equity=settings.paper_starting_equity,
@@ -115,6 +115,37 @@ def build_status(
         "execution": "paper" if settings.bot_mode == BotMode.PAPER else "disabled",
         "open_paper_position": paper_status["open_position"],
         "last_signal": signal.model_dump(mode="json") if signal else None,
+        "last_signal_candidate": (
+            signal_candidates.last_result.candidate.model_dump(mode="json")
+            if signal_candidates and signal_candidates.last_result else None
+        ),
+        "signal_candidates_count": len(signal_candidates.candidates) if signal_candidates else 0,
+        "no_trade_candidates_count": signal_candidates.no_trade_candidates_count if signal_candidates else 0,
+        "risk_preview_approved_count": (
+            signal_candidates.risk_preview_approved_count if signal_candidates else 0
+        ),
+        "risk_preview_blocked_count": (
+            signal_candidates.risk_preview_blocked_count if signal_candidates else 0
+        ),
+        "news_status": news_service.status,
+        "last_news_item": news_service.last_news_item.model_dump(mode="json") if news_service.last_news_item else None,
+        "last_filtered_news_item": (
+            news_service.last_filtered_news_item.model_dump(mode="json")
+            if news_service.last_filtered_news_item else None
+        ),
+        "last_news_classification": (
+            news_service.last_news_classification.model_dump(mode="json")
+            if news_service.last_news_classification else None
+        ),
+        "news_items_seen_count": news_service.items_seen_count,
+        "news_items_filtered_count": news_service.items_filtered_count,
+        "items_classified_count": news_service.items_classified_count,
+        "mock_classifier_calls_count": news_service.mock_classifier_calls_count,
+        "real_llm_calls_count": news_service.real_llm_calls_count,
+        "llm_cache_hits": news_service.llm_cache_hits,
+        "estimated_input_tokens": news_service.estimated_input_tokens,
+        "estimated_output_tokens": news_service.estimated_output_tokens,
+        "news_last_error": news_service.last_error,
         "market_data_status": market_data.status,
         "latest_btcusdt_snapshot": snapshot_to_payload(btc_snapshot) if btc_snapshot else None,
         "latest_ethusdt_snapshot": snapshot_to_payload(eth_snapshot) if eth_snapshot else None,

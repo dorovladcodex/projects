@@ -43,7 +43,7 @@ def test_health_and_status_report_live_disabled() -> None:
     assert payload["trading_paused"] is False
     assert payload["active_symbols"] == ["BTCUSDT", "ETHUSDT"]
     assert payload["open_paper_position"] is None
-    assert payload["last_signal"] is not None
+    assert payload["last_signal"] is None or payload["last_signal"]["action"] in {"TRADE", "NO_TRADE"}
     assert payload["market"]["status"] == "OK"
     assert payload["market_data_status"] == "OK"
     assert payload["latest_btcusdt_snapshot"] is not None
