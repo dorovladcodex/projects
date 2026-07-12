@@ -18,7 +18,12 @@ from app.models import (
     NewsItem,
     Sentiment,
 )
-from app.news.classifier import LLMNewsClassifier, MockNewsClassifier, ProviderResponse
+from app.news.classifier import (
+    LLMNewsClassifier,
+    MockNewsClassifier,
+    ProviderResponse,
+    build_news_classifier,
+)
 from app.news.service import NewsService
 from app.portfolio.paper_trading import PaperTradingService
 from app.runtime import build_status
@@ -72,7 +77,7 @@ def llm_settings(**overrides: object) -> Settings:
         "news_classifier_mode": "llm",
         "app_env": "local",
         "test_mode": True,
-        "llm_api_key": "fake-test-key",
+        "llm_api_key": "test-secret-key",
         "llm_max_retries": 0,
         "llm_backoff_base_seconds": 0,
         "llm_max_input_characters": 1000,
@@ -466,6 +471,82 @@ def test_classifier_test_endpoint_is_hidden_outside_local_test_mode(
 
 
 def test_classifier_mode_defaults_to_mock() -> None:
-    settings = Settings(news_enable_rss=False)
+    settings = Settings(_env_file=None, news_enable_rss=False)
 
     assert settings.news_classifier_mode.value == "mock"
+
+
+def test_llm_mode_without_credentials_reports_unavailable_and_does_not_call_provider() -> None:
+    settings = llm_settings(llm_api_key=None)
+    llm = build_news_classifier(settings)
+
+    status_before = llm.status_payload()
+    result = llm.classify(news_item())
+    status_after = llm.status_payload()
+    metrics = llm.metrics_payload()
+
+    assert status_before["status"] == "UNAVAILABLE"
+    assert status_before["configured"] is False
+    assert status_before["provider_available"] is False
+    assert status_before["credentials_present"] is False
+    assert status_before["error_code"] == "PROVIDER_UNAVAILABLE"
+    assert result.classification_status == ClassificationStatus.FAILED
+    assert result.error_code == "PROVIDER_UNAVAILABLE"
+    assert result.trade_eligible is False
+    assert status_after["status"] == "UNAVAILABLE"
+    assert metrics["real_llm_calls_count"] == 0
+    assert metrics["llm_requests_this_hour"] == 0
+    assert metrics["llm_requests_today"] == 0
+    assert metrics["last_llm_call_at"] is None
+    assert metrics["failed_llm_calls_count"] == 1
+
+    placeholder_classifier = build_news_classifier(
+        llm_settings(llm_api_key="fake_llm_key_do_not_use")
+    )
+    assert placeholder_classifier.status_payload()["status"] == "UNAVAILABLE"
+    assert placeholder_classifier.status_payload()["credentials_present"] is False
+
+
+def test_mock_and_configured_provider_status_semantics() -> None:
+    mock_status = MockNewsClassifier().status_payload()
+    configured_status = classifier(FakeProvider([ProviderResponse(VALID_RESPONSE)])).status_payload()
+
+    assert mock_status["status"] == "OK"
+    assert mock_status["configured"] is True
+    assert mock_status["provider_available"] is True
+    assert configured_status["status"] == "OK"
+    assert configured_status["configured"] is True
+    assert configured_status["provider_available"] is True
+    assert configured_status["credentials_present"] is True
+    assert configured_status["error_code"] is None
+
+
+def test_missing_credentials_failure_creates_no_signal_or_execution() -> None:
+    settings = llm_settings(llm_api_key=None)
+    news = NewsService(
+        [],
+        build_news_classifier(settings),
+        max_item_age=timedelta(minutes=60),
+    )
+    accepted, _, classification_result = news.ingest(news_item())
+    market = build_market_data_service(settings)
+    market.refresh_all()
+    paper = PaperTradingService()
+    signals = SignalCandidateService(
+        settings,
+        news,
+        market,
+        build_account_service(settings),
+        paper,
+    )
+
+    created = signals.process_pending()
+
+    assert accepted is True
+    assert classification_result is not None
+    assert classification_result.classification_status == ClassificationStatus.FAILED
+    assert created == []
+    assert signals.candidates == []
+    assert paper.open_position is None
+    assert settings.auto_paper_execution is False
+    assert settings.bybit_enable_trading is False

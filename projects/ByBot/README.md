@@ -421,6 +421,11 @@ Invoke-RestMethod http://127.0.0.1:8000/news/classifier/metrics | ConvertTo-Json
 
 `POST /news/classifier/test` is available only under `APP_ENV=local` and
 `TEST_MODE=true`. It does not store news, create a signal, or execute a trade.
+
+When `NEWS_CLASSIFIER_MODE=llm` has no usable credential (including the fake
+`.env.example` placeholder), `/news/classifier/status` reports `UNAVAILABLE`,
+`configured=false`, `provider_available=false`, and `PROVIDER_UNAVAILABLE`.
+No provider request or request/token budget is consumed.
 - real exchange execution remains blocked
 
 Sizing defaults in `.env`:

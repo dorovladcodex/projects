@@ -184,7 +184,15 @@ class MockNewsClassifier:
         )
 
     def status_payload(self) -> dict[str, object]:
-        return {"mode": self.mode, "status": "OK", "circuit_breaker_state": "DISABLED"}
+        return {
+            "mode": self.mode,
+            "status": "OK",
+            "configured": True,
+            "provider_available": True,
+            "credentials_present": False,
+            "error_code": None,
+            "circuit_breaker_state": "DISABLED",
+        }
 
     def metrics_payload(self) -> dict[str, object]:
         return _empty_metrics()
@@ -378,13 +386,33 @@ class LLMNewsClassifier:
 
     def status_payload(self) -> dict[str, object]:
         now = self._clock()
+        credentials_present = _credentials_present(self.settings.llm_api_key)
+        provider_available = self.provider is not None
+        configured = credentials_present and provider_available
+        circuit_state = self._circuit_state(now)
+        if not configured:
+            status = "UNAVAILABLE"
+            error_code = "PROVIDER_UNAVAILABLE"
+        elif circuit_state == "OPEN":
+            status = "UNAVAILABLE"
+            error_code = "CIRCUIT_OPEN"
+        elif self._last_error:
+            status = "DEGRADED"
+            error_code = self._last_error
+        else:
+            status = "OK"
+            error_code = None
         return {
             "mode": self.mode,
-            "status": "DEGRADED" if self._last_error else "OK",
+            "status": status,
+            "configured": configured,
+            "provider_available": provider_available,
+            "credentials_present": credentials_present,
+            "error_code": error_code,
             "provider_name": self.provider.name if self.provider else self.settings.llm_provider_name,
             "model_name": self.settings.llm_model,
             "classifier_version": self.settings.llm_classifier_version,
-            "circuit_breaker_state": self._circuit_state(now),
+            "circuit_breaker_state": circuit_state,
             "last_error": self._last_error,
             "last_call_at": self._last_call_at.isoformat() if self._last_call_at else None,
         }
@@ -600,7 +628,7 @@ def build_news_classifier(settings: Settings) -> BaseNewsClassifier:
             model=settings.llm_model,
             provider_name=settings.llm_provider_name,
         )
-        if settings.llm_api_key
+        if _credentials_present(settings.llm_api_key)
         else None
     )
     return LLMNewsClassifier(settings, provider)
@@ -623,6 +651,14 @@ def _optional_int(mapping: object, key: str) -> int | None:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
+
+
+def _credentials_present(api_key: str | None) -> bool:
+    if not api_key or not api_key.strip():
+        return False
+    normalized = api_key.strip().lower()
+    placeholder_markers = ("fake_", "do_not_use", "replace-with", "your_api", "your_llm")
+    return not any(marker in normalized for marker in placeholder_markers)
 
 
 def _empty_metrics() -> dict[str, object]:
