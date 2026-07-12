@@ -42,6 +42,13 @@ class NewsSignalAction(str, Enum):
     NO_TRADE = "NO_TRADE"
 
 
+class CandidateLifecycleState(str, Enum):
+    PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
+    READY = "READY"
+    BLOCKED = "BLOCKED"
+    EXPIRED = "EXPIRED"
+
+
 class PositionStatus(str, Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
@@ -111,11 +118,27 @@ class MarketConfirmation(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+class SignalEvaluation(BaseModel):
+    evaluated_at: datetime
+    price: float | None = Field(default=None, gt=0)
+    price_change_1m_pct: float | None = None
+    trend_direction: str = "unknown"
+    volume_change_pct: float | None = None
+    spread_bps: float | None = None
+    volatility_pct: float | None = None
+    market_confirmed: bool = False
+    expected_edge_bps: float = 0.0
+    state: CandidateLifecycleState
+    reasons: list[str] = Field(default_factory=list)
+
+
 class NewsSignalCandidate(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     news_id: UUID
     symbol: Symbol | None = None
-    action: NewsSignalAction
+    state: CandidateLifecycleState
+    proposed_action: NewsSignalAction
+    final_action: NewsSignalAction = NewsSignalAction.NO_TRADE
     sentiment: Sentiment
     classification_confidence: float = Field(ge=0, le=1)
     news_importance: float = Field(ge=0, le=1)
@@ -127,6 +150,7 @@ class NewsSignalCandidate(BaseModel):
     proposed_take_profit_pct: float = Field(gt=0)
     ttl_seconds: int = Field(gt=0)
     reasons: list[str] = Field(default_factory=list)
+    evaluation_history: list[SignalEvaluation] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: datetime
 
@@ -134,6 +158,37 @@ class NewsSignalCandidate(BaseModel):
 class SignalTestFromNewsRequest(BaseModel):
     news_id: UUID
     reprocess: bool = False
+
+
+class TestMarketSnapshotRequest(BaseModel):
+    price: float = Field(gt=0)
+    bid: float = Field(gt=0)
+    ask: float = Field(gt=0)
+    price_change_1m_pct: float
+    trend_direction: SimpleTrend
+    trend_score: float = Field(ge=-1, le=1)
+    volatility_pct: float = Field(ge=0)
+    volume_24h: float | None = Field(default=None, ge=0)
+    volume_change_pct: float | None = None
+    volume_spike: bool | None = None
+    timestamp: datetime | None = None
+    fresh: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_trend_direction(cls, data: object) -> object:
+        if isinstance(data, dict) and isinstance(data.get("trend_direction"), str):
+            data = dict(data)
+            data["trend_direction"] = data["trend_direction"].lower()
+        return data
+
+    @model_validator(mode="after")
+    def validate_test_snapshot(self) -> "TestMarketSnapshotRequest":
+        if self.ask < self.bid:
+            raise ValueError("ask must be greater than or equal to bid")
+        if self.timestamp is not None and self.timestamp.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
+        return self
 
 
 class MarketSnapshot(BaseModel):
@@ -209,9 +264,19 @@ class RiskDecision(BaseModel):
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class SignalRiskPreview(BaseModel):
+    preview_performed: bool = False
+    preview_reason: str | None = None
+    approved: bool | None = None
+    capped_size: float = Field(default=0, ge=0)
+    position_notional: float = Field(default=0, ge=0)
+    max_allowed_notional: float = Field(default=0, ge=0)
+    rejection_reasons: list[str] = Field(default_factory=list)
+
+
 class SignalDryRunResult(BaseModel):
     candidate: NewsSignalCandidate
-    risk_preview: RiskDecision | None = None
+    risk_preview: SignalRiskPreview
     execution_attempted: bool = False
     paper_position_opened: bool = False
 

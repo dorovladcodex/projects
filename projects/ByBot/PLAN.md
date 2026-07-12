@@ -88,6 +88,19 @@ Deferred from Phase 4A:
   `POST /signals/test-from-news`
 - No automatic paper entry and no Bybit order execution
 
+## Phase 4D - pending signal confirmation (implemented)
+
+- Candidate lifecycle: `PENDING_CONFIRMATION`, `READY`, `BLOCKED`, `EXPIRED`
+- Separate proposed and final actions
+- Five-second configurable market re-evaluation until confirmation or TTL
+- Configurable adverse-move tolerance before early blocking
+- Per-candidate evaluation history without duplicate candidate creation
+- RiskManager preview only for `READY` candidates
+- Pending/history/detail/manual-recheck API endpoints and lifecycle status counts
+- Dry-run only: no automatic paper trade and no exchange order placement
+- Local-test-only snapshot injection through the production confirmation path,
+  isolated from the global Bybit market cache
+
 ## Phase 4B - Bybit demo only
 
 - Authenticated Bybit Demo adapter with strict environment checks

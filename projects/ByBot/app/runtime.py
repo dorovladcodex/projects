@@ -6,7 +6,7 @@ from typing import Any
 from app.bybit.market_data import MarketDataService, snapshot_to_payload
 from app.bybit.private import BybitAccountService, order_placement_blocked_reason
 from app.config import BotMode, Settings
-from app.models import Asset, RiskContext, Symbol
+from app.models import CandidateLifecycleState, RiskContext, Symbol
 from app.news.classifier import MockNewsClassifier
 from app.news.service import NewsService
 from app.portfolio.paper_trading import PaperTradingService
@@ -126,6 +126,26 @@ def build_status(
         ),
         "risk_preview_blocked_count": (
             signal_candidates.risk_preview_blocked_count if signal_candidates else 0
+        ),
+        "pending_signal_candidates_count": (
+            signal_candidates.state_count(CandidateLifecycleState.PENDING_CONFIRMATION)
+            if signal_candidates else 0
+        ),
+        "ready_signal_candidates_count": (
+            signal_candidates.state_count(CandidateLifecycleState.READY)
+            if signal_candidates else 0
+        ),
+        "blocked_signal_candidates_count": (
+            signal_candidates.state_count(CandidateLifecycleState.BLOCKED)
+            if signal_candidates else 0
+        ),
+        "expired_signal_candidates_count": (
+            signal_candidates.state_count(CandidateLifecycleState.EXPIRED)
+            if signal_candidates else 0
+        ),
+        "last_signal_evaluation_at": (
+            signal_candidates.last_signal_evaluation_at.isoformat()
+            if signal_candidates and signal_candidates.last_signal_evaluation_at else None
         ),
         "news_status": news_service.status,
         "last_news_item": news_service.last_news_item.model_dump(mode="json") if news_service.last_news_item else None,

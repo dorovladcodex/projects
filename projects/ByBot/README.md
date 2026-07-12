@@ -281,10 +281,13 @@ without opening a paper position. Keep these safety settings in `.env`:
 BOT_MODE=PAPER
 BYBIT_ENABLE_TRADING=false
 TEST_MODE=false
+AUTO_PAPER_EXECUTION=false
 SIGNAL_MIN_CLASSIFICATION_CONFIDENCE=0.80
 SIGNAL_MIN_NEWS_IMPORTANCE=0.70
 SIGNAL_TTL_SECONDS=300
 SIGNAL_CONFIRMATION_WINDOW_SECONDS=60
+SIGNAL_REEVALUATION_INTERVAL_SECONDS=5
+SIGNAL_CONFLICT_THRESHOLD_PCT=0.30
 SIGNAL_MIN_EXPECTED_EDGE_BPS=12
 SIGNAL_DEFAULT_STOP_LOSS_PCT=0.5
 SIGNAL_DEFAULT_TAKE_PROFIT_PCT=1.0
@@ -309,6 +312,73 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/signals/test-from-news
 The response contains a candidate and RiskManager preview with capped size,
 notional, and rejection reasons. `execution_attempted=false` and
 `paper_position_opened=false` are invariant in this phase.
+
+### Pending confirmation lifecycle (Phase 4D)
+
+Strong classifications now remain `PENDING_CONFIRMATION` while the market is
+sideways or confirmation data is temporarily insufficient. Every five seconds
+the app refreshes market data and updates the same candidate until it becomes
+`READY`, `BLOCKED`, or `EXPIRED`. RiskManager preview runs only for `READY`.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/signals/pending | ConvertTo-Json -Depth 12
+Invoke-RestMethod http://127.0.0.1:8000/signals/history | ConvertTo-Json -Depth 12
+Invoke-RestMethod http://127.0.0.1:8000/signals/latest | ConvertTo-Json -Depth 12
+```
+
+Inspect or manually recheck one candidate:
+
+```powershell
+$candidateId = "replace-with-candidate-id"
+Invoke-RestMethod "http://127.0.0.1:8000/signals/$candidateId" | ConvertTo-Json -Depth 12
+Invoke-RestMethod -Method Post "http://127.0.0.1:8000/signals/$candidateId/recheck" |
+  ConvertTo-Json -Depth 12
+```
+
+Candidate output separates `proposed_action` from `final_action` and includes
+the complete `evaluation_history`. Pending, blocked, and expired candidates
+return `preview_performed=false` with `candidate is not tradeable yet` instead
+of irrelevant order-validation errors.
+
+### Deterministic local market confirmation test
+
+The test-only snapshot endpoint is available only with all safety conditions:
+
+```env
+APP_ENV=local
+TEST_MODE=true
+BOT_MODE=PAPER
+AUTO_PAPER_EXECUTION=false
+BYBIT_ENABLE_TRADING=false
+```
+
+It rechecks one candidate through the normal confirmation and risk-preview
+logic without writing into the global Bybit market cache:
+
+```powershell
+$candidateId = "replace-with-pending-candidate-id"
+$body = @{
+  price = 60300
+  bid = 60299
+  ask = 60301
+  price_change_1m_pct = 0.30
+  trend_direction = "BULLISH"
+  trend_score = 0.60
+  volatility_pct = 1.0
+  volume_24h = 25000
+  volume_change_pct = 25
+  volume_spike = $true
+  fresh = $true
+} | ConvertTo-Json
+
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/signals/$candidateId/test-market-snapshot" `
+  -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 12
+```
+
+The endpoint returns `404` outside local test mode. It always reports
+`execution_attempted=false`, `paper_position_opened=false`, and blocked exchange
+order placement.
 - real exchange execution remains blocked
 
 Sizing defaults in `.env`:

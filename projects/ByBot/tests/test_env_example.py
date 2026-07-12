@@ -13,6 +13,7 @@ def test_env_example_contains_required_phase_1_variables() -> None:
 
     required = {
         "BOT_NAME",
+        "APP_ENV",
         "BOT_MODE",
         "LOG_LEVEL",
         "DATABASE_URL",
@@ -36,10 +37,13 @@ def test_env_example_contains_required_phase_1_variables() -> None:
         "NEWS_RSS_URLS",
         "NEWS_ENABLE_MOCK_CLASSIFIER",
         "TEST_MODE",
+        "AUTO_PAPER_EXECUTION",
         "SIGNAL_MIN_CLASSIFICATION_CONFIDENCE",
         "SIGNAL_MIN_NEWS_IMPORTANCE",
         "SIGNAL_TTL_SECONDS",
         "SIGNAL_CONFIRMATION_WINDOW_SECONDS",
+        "SIGNAL_REEVALUATION_INTERVAL_SECONDS",
+        "SIGNAL_CONFLICT_THRESHOLD_PCT",
         "SIGNAL_MIN_EXPECTED_EDGE_BPS",
         "SIGNAL_DEFAULT_STOP_LOSS_PCT",
         "SIGNAL_DEFAULT_TAKE_PROFIT_PCT",

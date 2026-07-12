@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     )
 
     bot_name: str = "bybot"
+    app_env: str = "local"
     bot_mode: BotMode = BotMode.PAPER
     log_level: str = "INFO"
     database_url: str = "postgresql://bybot:bybot@localhost:5432/bybot"
@@ -57,11 +58,14 @@ class Settings(BaseSettings):
     news_rss_urls: tuple[str, ...] = ("https://cointelegraph.com/rss",)
     news_enable_mock_classifier: bool = True
     test_mode: bool = False
+    auto_paper_execution: bool = False
 
     signal_min_classification_confidence: float = Field(default=0.80, ge=0, le=1)
     signal_min_news_importance: float = Field(default=0.70, ge=0, le=1)
     signal_ttl_seconds: int = Field(default=300, ge=1, le=3600)
     signal_confirmation_window_seconds: int = Field(default=60, ge=1, le=600)
+    signal_reevaluation_interval_seconds: int = Field(default=5, ge=1, le=60)
+    signal_conflict_threshold_pct: float = Field(default=0.30, ge=0, le=10)
     signal_min_expected_edge_bps: float = Field(default=12.0, ge=0)
     signal_default_stop_loss_pct: float = Field(default=0.5, gt=0)
     signal_default_take_profit_pct: float = Field(default=1.0, gt=0)
@@ -113,6 +117,13 @@ class Settings(BaseSettings):
     def reject_bybit_trading_enabled(cls, value: bool) -> bool:
         if value:
             raise ValueError("Bybit order placement is blocked in Phase 3A")
+        return value
+
+    @field_validator("auto_paper_execution")
+    @classmethod
+    def reject_auto_paper_execution(cls, value: bool) -> bool:
+        if value:
+            raise ValueError("Automatic paper execution is blocked in Phase 4")
         return value
 
     @field_validator("allowed_symbols")

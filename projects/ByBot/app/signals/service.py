@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from threading import RLock
 from uuid import UUID
 
 from app.bybit.market_data import MarketDataService
@@ -8,6 +9,7 @@ from app.bybit.private import BybitAccountService
 from app.config import Settings
 from app.models import (
     Asset,
+    CandidateLifecycleState,
     MarketConfirmation,
     MarketSnapshot,
     NewsClassification,
@@ -15,12 +17,13 @@ from app.models import (
     NewsSignalAction,
     NewsSignalCandidate,
     RiskContext,
-    RiskDecision,
     Sentiment,
     Side,
-    SimpleTrend,
     SignalAction,
     SignalDryRunResult,
+    SignalEvaluation,
+    SignalRiskPreview,
+    SimpleTrend,
     Symbol,
     TradeSignal,
 )
@@ -30,7 +33,7 @@ from app.risk import RiskManager, RiskRules
 
 
 class SignalCandidateService:
-    """Build explainable signal and risk previews without executing anything."""
+    """Maintain dry-run candidates and re-evaluate them without execution."""
 
     def __init__(
         self,
@@ -49,20 +52,32 @@ class SignalCandidateService:
         self.results: list[SignalDryRunResult] = []
         self.risk_preview_approved_count = 0
         self.risk_preview_blocked_count = 0
+        self.last_signal_evaluation_at: datetime | None = None
+        self._registry_lock = RLock()
+        self._candidate_locks: dict[UUID, RLock] = {}
 
     @property
     def candidates(self) -> list[NewsSignalCandidate]:
-        self._expire_candidates()
-        return [result.candidate for result in self.results]
+        with self._registry_lock:
+            results = list(self.results)
+        return [self._candidate_snapshot(result) for result in results]
 
     @property
     def last_result(self) -> SignalDryRunResult | None:
-        self._expire_candidates()
-        return self.results[-1] if self.results else None
+        with self._registry_lock:
+            result = self.results[-1] if self.results else None
+        return self._result_snapshot(result) if result else None
 
     @property
     def no_trade_candidates_count(self) -> int:
-        return sum(candidate.action == NewsSignalAction.NO_TRADE for candidate in self.candidates)
+        return sum(
+            item.state in {CandidateLifecycleState.BLOCKED, CandidateLifecycleState.EXPIRED}
+            and item.final_action == NewsSignalAction.NO_TRADE
+            for item in self.candidates
+        )
+
+    def state_count(self, state: CandidateLifecycleState) -> int:
+        return sum(item.state == state for item in self.candidates)
 
     def process_pending(self) -> list[SignalDryRunResult]:
         created: list[SignalDryRunResult] = []
@@ -78,45 +93,148 @@ class SignalCandidateService:
         allow_reprocess: bool = False,
         now: datetime | None = None,
     ) -> list[SignalDryRunResult]:
-        if news_id in self.processed_news_ids:
-            if not allow_reprocess:
-                return [result for result in self.results if result.candidate.news_id == news_id]
-            if not self.settings.test_mode:
-                raise PermissionError("explicit signal reprocessing requires TEST_MODE=true")
+        with self._registry_lock:
+            if news_id in self.processed_news_ids:
+                if not allow_reprocess:
+                    return [
+                        result for result in self.results
+                        if result.candidate.news_id == news_id
+                    ]
+                if not self.settings.test_mode:
+                    raise PermissionError("explicit signal reprocessing requires TEST_MODE=true")
 
-        news = next((item for item in self.news_service.items if item.id == news_id), None)
-        classification = next(
-            (item for item in self.news_service.classifications if item.news_id == news_id), None
-        )
-        if news is None or classification is None:
-            raise ValueError("news item or classification not found")
-
-        symbols = _symbols_for_asset(classification.asset)
-        if not symbols:
-            result = self._build_result(news, classification, None, now=now)
-            new_results = [result]
-        else:
+            news, classification = self._find_news_and_classification(news_id)
+            symbols = _symbols_for_asset(classification.asset)
             new_results = [
-                self._build_result(news, classification, symbol, now=now) for symbol in symbols
-            ]
+                self._new_result(news, classification, symbol, now=now) for symbol in symbols
+            ] or [self._new_result(news, classification, None, now=now)]
+            for result in new_results:
+                self._candidate_locks[result.candidate.id] = RLock()
+            self.results.extend(new_results)
+            self.processed_news_ids.add(news_id)
+            return new_results
 
-        self.results.extend(new_results)
-        self.processed_news_ids.add(news_id)
-        for result in new_results:
-            if result.risk_preview and result.risk_preview.approved:
-                self.risk_preview_approved_count += 1
-            else:
-                self.risk_preview_blocked_count += 1
-        return new_results
+    def reevaluate_pending(self, *, now: datetime | None = None) -> list[SignalDryRunResult]:
+        now = now or datetime.now(timezone.utc)
+        updated: list[SignalDryRunResult] = []
+        with self._registry_lock:
+            results = list(self.results)
+        for result in results:
+            if self._try_evaluate_pending(result, now):
+                updated.append(result)
+        return updated
+
+    def recheck_candidate(
+        self, candidate_id: UUID, *, now: datetime | None = None
+    ) -> SignalDryRunResult:
+        result = self.get_result(candidate_id)
+        lock = self._lock_for(candidate_id)
+        with lock:
+            if result.candidate.state == CandidateLifecycleState.PENDING_CONFIRMATION:
+                news, classification = self._find_news_and_classification(
+                    result.candidate.news_id
+                )
+                self._evaluate(
+                    result, news, classification, now or datetime.now(timezone.utc)
+                )
+        return result
+
+    def recheck_candidate_with_snapshot(
+        self,
+        candidate_id: UUID,
+        snapshot: MarketSnapshot,
+        *,
+        volume_change_pct: float | None,
+        volume_spike: bool | None,
+        now: datetime | None = None,
+    ) -> SignalDryRunResult:
+        result = self.get_result(candidate_id)
+        lock = self._lock_for(candidate_id)
+        with lock:
+            if result.candidate.state == CandidateLifecycleState.PENDING_CONFIRMATION:
+                news, classification = self._find_news_and_classification(
+                    result.candidate.news_id
+                )
+                self._evaluate(
+                    result,
+                    news,
+                    classification,
+                    now or datetime.now(timezone.utc),
+                    snapshot_override=snapshot,
+                    volume_change_override=volume_change_pct,
+                    volume_spike_override=volume_spike,
+                )
+        return result
+
+    def get_result(self, candidate_id: UUID) -> SignalDryRunResult:
+        with self._registry_lock:
+            result = next(
+                (item for item in self.results if item.candidate.id == candidate_id), None
+            )
+        if result is None:
+            raise ValueError("signal candidate not found")
+        return result
+
+    def _try_evaluate_pending(
+        self, result: SignalDryRunResult, now: datetime
+    ) -> bool:
+        lock = self._lock_for(result.candidate.id)
+        with lock:
+            candidate = result.candidate
+            if candidate.state != CandidateLifecycleState.PENDING_CONFIRMATION:
+                return False
+            if candidate.evaluation_history:
+                last_evaluated_at = candidate.evaluation_history[-1].evaluated_at
+                interval = timedelta(
+                    seconds=self.settings.signal_reevaluation_interval_seconds
+                )
+                if now - last_evaluated_at < interval:
+                    return False
+            news, classification = self._find_news_and_classification(candidate.news_id)
+            self._evaluate(result, news, classification, now)
+            return True
+
+    def _lock_for(self, candidate_id: UUID) -> RLock:
+        with self._registry_lock:
+            return self._candidate_locks.setdefault(candidate_id, RLock())
+
+    def pending_payload(self) -> list[dict[str, object]]:
+        return [
+            item.model_dump(mode="json")
+            for item in self.candidates
+            if item.state == CandidateLifecycleState.PENDING_CONFIRMATION
+        ]
+
+    def history_payload(self) -> list[dict[str, object]]:
+        return [
+            {
+                "candidate_id": str(candidate.id),
+                "news_id": str(candidate.news_id),
+                "evaluations": [entry.model_dump(mode="json") for entry in candidate.evaluation_history],
+            }
+            for candidate in self.candidates
+        ]
 
     def as_candidates_payload(self) -> list[dict[str, object]]:
         return [candidate.model_dump(mode="json") for candidate in self.candidates]
 
     def as_dry_run_payload(self) -> list[dict[str, object]]:
-        self._expire_candidates()
-        return [result.model_dump(mode="json") for result in self.results]
+        with self._registry_lock:
+            results = list(self.results)
+        return [self._result_snapshot(result).model_dump(mode="json") for result in results]
 
-    def _build_result(
+    def result_payload(self, candidate_id: UUID) -> dict[str, object]:
+        return self._result_snapshot(self.get_result(candidate_id)).model_dump(mode="json")
+
+    def _candidate_snapshot(self, result: SignalDryRunResult) -> NewsSignalCandidate:
+        return self._result_snapshot(result).candidate
+
+    def _result_snapshot(self, result: SignalDryRunResult) -> SignalDryRunResult:
+        lock = self._lock_for(result.candidate.id)
+        with lock:
+            return result.model_copy(deep=True)
+
+    def _new_result(
         self,
         news: NewsItem,
         classification: NewsClassification,
@@ -125,53 +243,145 @@ class SignalCandidateService:
         now: datetime | None,
     ) -> SignalDryRunResult:
         now = now or datetime.now(timezone.utc)
-        snapshot = self.market_data.latest_snapshot(symbol) if symbol is not None else None
-        confirmation = self._confirm_market(classification.sentiment, symbol, snapshot, now)
-        reasons = list(confirmation.reasons)
+        proposed_action = _proposed_action(classification.sentiment)
+        candidate = NewsSignalCandidate(
+            news_id=news.id,
+            symbol=symbol,
+            state=CandidateLifecycleState.PENDING_CONFIRMATION,
+            proposed_action=proposed_action,
+            final_action=NewsSignalAction.NO_TRADE,
+            sentiment=classification.sentiment,
+            classification_confidence=classification.confidence,
+            news_importance=news.importance,
+            category=classification.category,
+            urgency=classification.urgency,
+            market_confirmation=MarketConfirmation(),
+            expected_edge_bps=0,
+            proposed_stop_loss_pct=self.settings.signal_default_stop_loss_pct,
+            proposed_take_profit_pct=self.settings.signal_default_take_profit_pct,
+            ttl_seconds=self.settings.signal_ttl_seconds,
+            reasons=[],
+            created_at=now,
+            expires_at=now + timedelta(seconds=self.settings.signal_ttl_seconds),
+        )
+        result = SignalDryRunResult(
+            candidate=candidate,
+            risk_preview=_preview_not_performed(),
+        )
+        self._evaluate(result, news, classification, now)
+        return result
 
+    def _evaluate(
+        self,
+        result: SignalDryRunResult,
+        news: NewsItem,
+        classification: NewsClassification,
+        now: datetime,
+        *,
+        snapshot_override: MarketSnapshot | None = None,
+        volume_change_override: float | None = None,
+        volume_spike_override: bool | None = None,
+    ) -> None:
+        candidate = result.candidate
+        snapshot = snapshot_override or (
+            self.market_data.latest_snapshot(candidate.symbol)
+            if candidate.symbol is not None
+            else None
+        )
+        confirmation = self._confirm_market(
+            classification.sentiment,
+            candidate.symbol,
+            snapshot,
+            now,
+            snapshot_is_override=snapshot_override is not None,
+            volume_change_override=volume_change_override,
+            volume_spike_override=volume_spike_override,
+        )
+        expected_edge_bps = self._expected_edge_bps(news, classification, confirmation)
+        structural_reasons = self._structural_block_reasons(news, classification, candidate)
+
+        if now >= candidate.expires_at:
+            state = CandidateLifecycleState.EXPIRED
+            reasons = ["market confirmation was not received before signal expiry"]
+        elif structural_reasons:
+            state = CandidateLifecycleState.BLOCKED
+            reasons = structural_reasons
+        elif self._strong_conflict(classification.sentiment, confirmation):
+            state = CandidateLifecycleState.BLOCKED
+            reasons = ["market moved against news beyond conflict threshold"]
+        else:
+            pending_reasons = list(confirmation.reasons)
+            if expected_edge_bps < self.settings.signal_min_expected_edge_bps:
+                pending_reasons.append("expected edge after costs is insufficient")
+            ready = (
+                confirmation.direction_confirmed
+                and confirmation.available
+                and confirmation.fresh
+                and not confirmation.reasons
+                and expected_edge_bps >= self.settings.signal_min_expected_edge_bps
+            )
+            if ready:
+                state = CandidateLifecycleState.READY
+                reasons = ["market confirmation and expected edge requirements passed"]
+            else:
+                state = CandidateLifecycleState.PENDING_CONFIRMATION
+                reasons = _deduplicate(pending_reasons or ["waiting for market confirmation"])
+
+        candidate.state = state
+        candidate.final_action = (
+            candidate.proposed_action
+            if state == CandidateLifecycleState.READY
+            else NewsSignalAction.NO_TRADE
+        )
+        candidate.market_confirmation = confirmation
+        candidate.expected_edge_bps = expected_edge_bps
+        candidate.reasons = reasons
+        evaluation = SignalEvaluation(
+            evaluated_at=now,
+            price=snapshot.last_price if snapshot else None,
+            price_change_1m_pct=confirmation.price_change_1m_pct,
+            trend_direction=confirmation.trend_direction,
+            volume_change_pct=confirmation.volume_change_pct,
+            spread_bps=confirmation.spread_bps,
+            volatility_pct=confirmation.volatility_pct,
+            market_confirmed=confirmation.direction_confirmed,
+            expected_edge_bps=expected_edge_bps,
+            state=state,
+            reasons=list(reasons),
+        )
+        candidate.evaluation_history.append(evaluation)
+        with self._registry_lock:
+            if self.last_signal_evaluation_at is None or now > self.last_signal_evaluation_at:
+                self.last_signal_evaluation_at = now
+
+        if state == CandidateLifecycleState.READY:
+            result.risk_preview = self._perform_risk_preview(candidate, snapshot)
+            with self._registry_lock:
+                if result.risk_preview.approved:
+                    self.risk_preview_approved_count += 1
+                else:
+                    self.risk_preview_blocked_count += 1
+        else:
+            result.risk_preview = _preview_not_performed()
+
+    def _structural_block_reasons(
+        self,
+        news: NewsItem,
+        classification: NewsClassification,
+        candidate: NewsSignalCandidate,
+    ) -> list[str]:
+        reasons: list[str] = []
         if classification.sentiment == Sentiment.NEUTRAL:
             reasons.append("neutral classification")
         if classification.confidence < self.settings.signal_min_classification_confidence:
             reasons.append("classification confidence below signal threshold")
         if news.importance < self.settings.signal_min_news_importance:
             reasons.append("news importance below signal threshold")
-        if symbol is None:
+        if candidate.symbol is None:
             reasons.append("news asset cannot be mapped to a supported symbol")
         if self.paper_trading.open_position is not None:
             reasons.append("an open paper position already exists")
-
-        expected_edge_bps = self._expected_edge_bps(news, classification, confirmation)
-        if expected_edge_bps < self.settings.signal_min_expected_edge_bps:
-            reasons.append("expected edge after costs is insufficient")
-
-        directional_action = (
-            NewsSignalAction.BUY
-            if classification.sentiment == Sentiment.BULLISH
-            else NewsSignalAction.SELL
-            if classification.sentiment == Sentiment.BEARISH
-            else NewsSignalAction.NO_TRADE
-        )
-        action = directional_action if not reasons else NewsSignalAction.NO_TRADE
-        candidate = NewsSignalCandidate(
-            news_id=news.id,
-            symbol=symbol,
-            action=action,
-            sentiment=classification.sentiment,
-            classification_confidence=classification.confidence,
-            news_importance=news.importance,
-            category=classification.category,
-            urgency=classification.urgency,
-            market_confirmation=confirmation,
-            expected_edge_bps=expected_edge_bps,
-            proposed_stop_loss_pct=self.settings.signal_default_stop_loss_pct,
-            proposed_take_profit_pct=self.settings.signal_default_take_profit_pct,
-            ttl_seconds=self.settings.signal_ttl_seconds,
-            reasons=reasons or ["news direction confirmed by deterministic market checks"],
-            created_at=now,
-            expires_at=now + timedelta(seconds=self.settings.signal_ttl_seconds),
-        )
-        risk_preview = self._preview_risk(candidate, snapshot)
-        return SignalDryRunResult(candidate=candidate, risk_preview=risk_preview)
+        return reasons
 
     def _confirm_market(
         self,
@@ -179,12 +389,21 @@ class SignalCandidateService:
         symbol: Symbol | None,
         snapshot: MarketSnapshot | None,
         now: datetime,
+        *,
+        snapshot_is_override: bool = False,
+        volume_change_override: float | None = None,
+        volume_spike_override: bool | None = None,
     ) -> MarketConfirmation:
-        if symbol is None or snapshot is None or self.market_data.status != "OK":
+        if (
+            symbol is None
+            or snapshot is None
+            or (not snapshot_is_override and self.market_data.status != "OK")
+        ):
             return MarketConfirmation(reasons=["market data is unavailable"])
 
-        age = now - snapshot.timestamp
-        fresh = age <= timedelta(seconds=self.settings.signal_confirmation_window_seconds)
+        fresh = now - snapshot.timestamp <= timedelta(
+            seconds=self.settings.signal_confirmation_window_seconds
+        )
         reasons: list[str] = []
         if not fresh:
             reasons.append("market data is stale")
@@ -207,10 +426,18 @@ class SignalCandidateService:
                 and snapshot.simple_trend == SimpleTrend.BEARISH
             )
         if sentiment != Sentiment.NEUTRAL and not direction_confirmed:
-            reasons.append("market direction conflicts with news")
+            reasons.append("market direction is not confirmed")
 
-        volume_change_pct = self._volume_change_pct(symbol)
-        volume_spike = volume_change_pct >= 20 if volume_change_pct is not None else None
+        volume_change_pct = (
+            volume_change_override
+            if snapshot_is_override
+            else self._volume_change_pct(symbol)
+        )
+        volume_spike = (
+            volume_spike_override
+            if snapshot_is_override
+            else (volume_change_pct >= 20 if volume_change_pct is not None else None)
+        )
         return MarketConfirmation(
             available=True,
             fresh=fresh,
@@ -224,6 +451,21 @@ class SignalCandidateService:
             volume_change_pct=volume_change_pct,
             volume_spike=volume_spike,
             reasons=reasons,
+        )
+
+    def _strong_conflict(
+        self, sentiment: Sentiment, confirmation: MarketConfirmation
+    ) -> bool:
+        if not confirmation.available or not confirmation.fresh:
+            return False
+        change = confirmation.price_change_1m_pct
+        if change is None:
+            return False
+        threshold = self.settings.signal_conflict_threshold_pct
+        return (
+            sentiment == Sentiment.BULLISH and change <= -threshold
+        ) or (
+            sentiment == Sentiment.BEARISH and change >= threshold
         )
 
     def _volume_change_pct(self, symbol: Symbol) -> float | None:
@@ -247,35 +489,40 @@ class SignalCandidateService:
         price_component = abs(confirmation.price_change_1m_pct or 0) * 100
         trend_component = abs(confirmation.trend_score or 0) * 20
         volume_component = 5.0 if confirmation.volume_spike else 0.0
+        urgency_component = 3.0 if classification.urgency.lower() == "high" else 1.0
+        category_component = (
+            2.0
+            if classification.category.lower()
+            in {"etf", "security", "regulation", "macro", "listing", "exchange"}
+            else 0.0
+        )
         gross_edge = (
             price_component * classification.confidence
             + trend_component
             + news.importance * 5
             + volume_component
+            + urgency_component
+            + category_component
         )
-        round_trip_cost = (self.settings.default_paper_fees_bps + self.settings.default_slippage_bps) * 2
-        max_target_edge = self.settings.signal_default_take_profit_pct * 100
-        return round(max(0.0, min(gross_edge - round_trip_cost, max_target_edge)), 4)
+        costs = (
+            self.settings.default_paper_fees_bps + self.settings.default_slippage_bps
+        ) * 2
+        target_cap = self.settings.signal_default_take_profit_pct * 100
+        return round(max(0.0, min(gross_edge - costs, target_cap)), 4)
 
-    def _preview_risk(
+    def _perform_risk_preview(
         self, candidate: NewsSignalCandidate, snapshot: MarketSnapshot | None
-    ) -> RiskDecision:
+    ) -> SignalRiskPreview:
         if snapshot is None:
-            return RiskDecision(approved=False, reasons=list(candidate.reasons))
-
-        is_trade = candidate.action in {NewsSignalAction.BUY, NewsSignalAction.SELL}
+            return _preview_not_performed()
         signal = TradeSignal(
-            action=SignalAction.TRADE if is_trade else SignalAction.NO_TRADE,
+            action=SignalAction.TRADE,
             symbol=snapshot.symbol,
-            side=(
-                Side.BUY if candidate.action == NewsSignalAction.BUY
-                else Side.SELL if candidate.action == NewsSignalAction.SELL
-                else None
-            ),
+            side=Side.BUY if candidate.final_action == NewsSignalAction.BUY else Side.SELL,
             confidence=candidate.classification_confidence,
             expected_edge_bps=candidate.expected_edge_bps,
-            stop_loss_pct=candidate.proposed_stop_loss_pct if is_trade else None,
-            take_profit_pct=candidate.proposed_take_profit_pct if is_trade else None,
+            stop_loss_pct=candidate.proposed_stop_loss_pct,
+            take_profit_pct=candidate.proposed_take_profit_pct,
             reasons=list(candidate.reasons),
         )
         account = self.account_service.status
@@ -291,22 +538,40 @@ class SignalCandidateService:
             api_stable=self.market_data.status == "OK",
         )
         decision = RiskManager(_risk_rules(self.settings)).assess(signal, snapshot, context)
-        if not is_trade:
-            for reason in candidate.reasons:
-                if reason not in decision.reasons:
-                    decision.reasons.append(reason)
-        return decision
+        return SignalRiskPreview(
+            preview_performed=True,
+            approved=decision.approved,
+            capped_size=decision.capped_size,
+            position_notional=decision.position_notional,
+            max_allowed_notional=decision.max_allowed_notional,
+            rejection_reasons=decision.reasons,
+        )
 
-    def _expire_candidates(self, now: datetime | None = None) -> None:
-        now = now or datetime.now(timezone.utc)
-        for result in self.results:
-            candidate = result.candidate
-            if candidate.expires_at <= now and candidate.action != NewsSignalAction.NO_TRADE:
-                candidate.action = NewsSignalAction.NO_TRADE
-                candidate.reasons.append("signal expired")
-                if result.risk_preview:
-                    result.risk_preview.approved = False
-                    result.risk_preview.reasons.append("signal expired")
+    def _find_news_and_classification(
+        self, news_id: UUID
+    ) -> tuple[NewsItem, NewsClassification]:
+        news = next((item for item in self.news_service.items if item.id == news_id), None)
+        classification = next(
+            (item for item in self.news_service.classifications if item.news_id == news_id), None
+        )
+        if news is None or classification is None:
+            raise ValueError("news item or classification not found")
+        return news, classification
+
+
+def _preview_not_performed() -> SignalRiskPreview:
+    return SignalRiskPreview(
+        preview_performed=False,
+        preview_reason="candidate is not tradeable yet",
+    )
+
+
+def _proposed_action(sentiment: Sentiment) -> NewsSignalAction:
+    if sentiment == Sentiment.BULLISH:
+        return NewsSignalAction.BUY
+    if sentiment == Sentiment.BEARISH:
+        return NewsSignalAction.SELL
+    return NewsSignalAction.NO_TRADE
 
 
 def _symbols_for_asset(asset: Asset) -> tuple[Symbol, ...]:
@@ -317,6 +582,10 @@ def _symbols_for_asset(asset: Asset) -> tuple[Symbol, ...]:
     if asset == Asset.MARKET:
         return (Symbol.BTCUSDT, Symbol.ETHUSDT)
     return ()
+
+
+def _deduplicate(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
 
 
 def _risk_rules(settings: Settings) -> RiskRules:

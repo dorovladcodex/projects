@@ -4,19 +4,22 @@ from collections.abc import AsyncIterator
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
 
 from app.bybit.market_data import build_market_data_service, snapshot_to_payload
 from app.bybit.private import build_account_service
-from app.config import get_settings
+from app.config import BotMode, get_settings
 from app.models import (
+    MarketSnapshot,
     NewsItem,
     PaperTestSignalRequest,
     RiskContext,
     SignalAction,
     SignalTestFromNewsRequest,
     Symbol,
+    TestMarketSnapshotRequest,
     TradeSignal,
 )
 from app.news import MockNewsClassifier, NewsService, RSSNewsSource
@@ -53,12 +56,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     market_data_service.refresh_all()
     signal_candidate_service.process_pending()
     task = asyncio.create_task(news_polling_loop())
+    signal_task = asyncio.create_task(signal_recheck_loop())
     try:
         yield
     finally:
         task.cancel()
+        signal_task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        with suppress(asyncio.CancelledError):
+            await signal_task
 
 
 app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
@@ -149,6 +156,16 @@ def signal_dry_run() -> dict[str, object]:
     }
 
 
+@app.get("/signals/pending")
+def pending_signal_candidates() -> dict[str, object]:
+    return {"candidates": signal_candidate_service.pending_payload()}
+
+
+@app.get("/signals/history")
+def signal_evaluation_history() -> dict[str, object]:
+    return {"history": signal_candidate_service.history_payload()}
+
+
 @app.post("/signals/test-from-news")
 def test_signal_from_news(request: SignalTestFromNewsRequest) -> dict[str, object]:
     market_data_service.refresh_all()
@@ -163,6 +180,91 @@ def test_signal_from_news(request: SignalTestFromNewsRequest) -> dict[str, objec
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {
         "results": [result.model_dump(mode="json") for result in results],
+        "execution_attempted": False,
+        "paper_position_opened": False,
+        "exchange_order_placement": "blocked",
+    }
+
+
+@app.get("/signals/{candidate_id}")
+def signal_candidate(candidate_id: str) -> dict[str, object]:
+    try:
+        parsed_id = UUID(candidate_id)
+        payload = signal_candidate_service.result_payload(parsed_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="signal candidate not found") from exc
+    return payload
+
+
+@app.post("/signals/{candidate_id}/recheck")
+def recheck_signal_candidate(candidate_id: str) -> dict[str, object]:
+    try:
+        parsed_id = UUID(candidate_id)
+        market_data_service.refresh_all()
+        signal_candidate_service.recheck_candidate(parsed_id)
+        payload = signal_candidate_service.result_payload(parsed_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="signal candidate not found") from exc
+    return {
+        "result": payload,
+        "execution_attempted": False,
+        "paper_position_opened": False,
+    }
+
+
+@app.post("/signals/{candidate_id}/test-market-snapshot")
+def test_market_snapshot_for_signal(
+    candidate_id: str,
+    request: TestMarketSnapshotRequest,
+) -> dict[str, object]:
+    if not (
+        settings.app_env.lower() == "local"
+        and settings.test_mode
+        and settings.bot_mode == BotMode.PAPER
+    ):
+        raise HTTPException(status_code=404, detail="test market snapshot endpoint is disabled")
+    try:
+        parsed_id = UUID(candidate_id)
+        existing = signal_candidate_service.get_result(parsed_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="signal candidate not found") from exc
+    symbol = existing.candidate.symbol
+    if symbol is None:
+        raise HTTPException(status_code=400, detail="candidate has no supported market symbol")
+
+    now = datetime.now(timezone.utc)
+    timestamp = request.timestamp or now
+    if not request.fresh:
+        timestamp = now - timedelta(
+            seconds=settings.signal_confirmation_window_seconds + 1
+        )
+    snapshot = MarketSnapshot(
+        symbol=symbol,
+        timestamp=timestamp,
+        last_price=request.price,
+        bid_price=request.bid,
+        ask_price=request.ask,
+        price_change_1m_pct=request.price_change_1m_pct,
+        simple_trend=request.trend_direction,
+        simple_volatility=request.volatility_pct,
+        volume_24h=request.volume_24h,
+        trend_score=request.trend_score,
+        volatility_pct=request.volatility_pct,
+        liquidity_ok=request.ask >= request.bid,
+        api_stable=True,
+    )
+    signal_candidate_service.recheck_candidate_with_snapshot(
+        parsed_id,
+        snapshot,
+        volume_change_pct=request.volume_change_pct,
+        volume_spike=request.volume_spike,
+        now=now,
+    )
+    payload = signal_candidate_service.result_payload(parsed_id)
+    return {
+        "candidate": payload["candidate"],
+        "risk_preview": payload["risk_preview"],
+        "test_snapshot_used": request.model_dump(mode="json"),
         "execution_attempted": False,
         "paper_position_opened": False,
         "exchange_order_placement": "blocked",
@@ -351,3 +453,10 @@ async def news_polling_loop() -> None:
         await asyncio.to_thread(news_service.poll)
         market_data_service.refresh_all()
         signal_candidate_service.process_pending()
+
+
+async def signal_recheck_loop() -> None:
+    while True:
+        await asyncio.sleep(settings.signal_reevaluation_interval_seconds)
+        await asyncio.to_thread(market_data_service.refresh_all)
+        signal_candidate_service.reevaluate_pending()

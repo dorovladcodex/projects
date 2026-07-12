@@ -34,6 +34,11 @@ def test_bybit_enable_trading_is_rejected() -> None:
         Settings(bybit_enable_trading=True)
 
 
+def test_auto_paper_execution_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="Automatic paper execution is blocked"):
+        Settings(auto_paper_execution=True)
+
+
 def test_health_and_status_report_live_disabled() -> None:
     assert main_module.health()["status"] == "ok"
     payload = main_module.status()
