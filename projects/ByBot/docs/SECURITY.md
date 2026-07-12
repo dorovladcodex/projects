@@ -64,6 +64,9 @@ deployment host.
 - Mock fallback is local-test-only, explicit, visibly marked, and non-tradeable.
 - Recalculate trade eligibility at classifier, ingestion, test-endpoint, and
   signal boundaries; never trust a provider-supplied eligibility flag.
+- Codex CLI classification must use `shell=False`, a unique temporary working
+  directory, ignored user config, read-only sandboxing, ephemeral sessions, and
+  stdin-only normalized news input. Never pass Bybit/account secrets.
 
 ## Host and network controls
 

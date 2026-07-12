@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+from pathlib import Path
+import shutil
+import subprocess
 from threading import BoundedSemaphore, RLock
+import tempfile
 import time
 from typing import Any, Callable, Protocol
 from urllib.request import Request, urlopen
@@ -45,6 +49,9 @@ class ProviderResponse:
     content: str
     input_tokens: int | None = None
     output_tokens: int | None = None
+    model_name: str | None = None
+    additional_estimated_input_tokens: int = 0
+    additional_estimated_output_tokens: int = 0
 
 
 class LLMProvider(Protocol):
@@ -123,7 +130,138 @@ class OpenAICompatibleProvider:
             content=content,
             input_tokens=_optional_int(usage, "prompt_tokens"),
             output_tokens=_optional_int(usage, "completion_tokens"),
+            model_name=self.model,
         )
+
+
+class CodexCLIProvider:
+    """Ephemeral read-only Codex CLI transport with isolated files per call."""
+
+    name = "codex-cli"
+
+    def __init__(
+        self,
+        *,
+        executable: str,
+        model: str,
+        fallback_model: str,
+        reasoning_effort: str,
+        fallback_min_confidence: float,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        self.executable = executable
+        self.model = model
+        self.fallback_model = fallback_model
+        self.reasoning_effort = reasoning_effort
+        self.fallback_min_confidence = fallback_min_confidence
+        self._runner = runner or subprocess.run
+
+    def request(
+        self,
+        system_prompt: str,
+        user_content: str,
+        *,
+        max_output_tokens: int,
+        timeout_seconds: float,
+    ) -> ProviderResponse:
+        return self.request_with_controls(
+            system_prompt,
+            user_content,
+            max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
+            reserve_additional_request=None,
+            allow_fallback=True,
+        )
+
+    def request_with_controls(
+        self,
+        system_prompt: str,
+        user_content: str,
+        *,
+        max_output_tokens: int,
+        timeout_seconds: float,
+        reserve_additional_request: Callable[[], str | None] | None,
+        allow_fallback: bool,
+    ) -> ProviderResponse:
+        prompt = f"{system_prompt}\n\nARTICLE JSON:\n{user_content}"
+        primary = self._run_model(self.model, prompt, timeout_seconds)
+        parsed = LLMClassificationPayload.model_validate(json.loads(primary))
+        if (
+            parsed.sentiment == Sentiment.NEUTRAL
+            and parsed.confidence < self.fallback_min_confidence
+            and self.fallback_model
+            and allow_fallback
+        ):
+            budget_error = (
+                reserve_additional_request() if reserve_additional_request else None
+            )
+            if budget_error is None:
+                fallback = self._run_model(
+                    self.fallback_model,
+                    prompt,
+                    timeout_seconds,
+                )
+                # Validate here so invalid fallback output fails closed in the outer classifier.
+                LLMClassificationPayload.model_validate(json.loads(fallback))
+                return ProviderResponse(
+                    content=fallback,
+                    model_name=self.fallback_model,
+                    additional_estimated_input_tokens=_estimate_tokens(
+                        system_prompt + user_content
+                    ),
+                    additional_estimated_output_tokens=_estimate_tokens(primary),
+                )
+        return ProviderResponse(content=primary, model_name=self.model)
+
+    def _run_model(self, model: str, prompt: str, timeout_seconds: float) -> str:
+        with tempfile.TemporaryDirectory(prefix="bybot-codex-") as temp_dir:
+            directory = Path(temp_dir)
+            schema_path = directory / "classification-schema.json"
+            result_path = directory / "classification-result.json"
+            schema_text = json.dumps(
+                LLMClassificationPayload.model_json_schema(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            schema_path.write_text(schema_text, encoding="utf-8", newline="")
+            command = [
+                self.executable,
+                "exec",
+                "-m",
+                model,
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--sandbox",
+                "read-only",
+                "--color",
+                "never",
+                "-c",
+                f'model_reasoning_effort="{self.reasoning_effort}"',
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(result_path),
+                "-",
+            ]
+            try:
+                completed = self._runner(
+                    command,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    cwd=temp_dir,
+                    timeout=timeout_seconds,
+                    shell=False,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError("Codex CLI classification timed out") from exc
+            if completed.returncode != 0:
+                raise OSError("Codex CLI classification failed")
+            if not result_path.is_file():
+                raise ValueError("Codex CLI did not write a classification result")
+            return result_path.read_text(encoding="utf-8").strip()
 
 
 class MockNewsClassifier:
@@ -267,6 +405,7 @@ class LLMNewsClassifier:
         failed_actual_output = 0
         failed_estimated_input = 0
         failed_estimated_output = 0
+        allow_provider_fallback = True
 
         if self.provider is None:
             return self._failure(item, "PROVIDER_UNAVAILABLE", started, estimated_input)
@@ -284,24 +423,51 @@ class LLMNewsClassifier:
                 self._record_request(now)
                 response = None
                 try:
-                    response = self.provider.request(
-                        system_prompt,
-                        user_content,
-                        max_output_tokens=self.settings.llm_max_output_tokens,
-                        timeout_seconds=self.settings.llm_timeout_seconds,
+                    controlled_request = getattr(
+                        self.provider, "request_with_controls", None
                     )
+                    if callable(controlled_request):
+                        def reserve_additional_request() -> str | None:
+                            reserve_now = self._clock()
+                            reserve_error = self._preflight(
+                                reserve_now, estimated_input
+                            )
+                            if reserve_error:
+                                return reserve_error
+                            self._record_request(reserve_now)
+                            return None
+
+                        response = controlled_request(
+                            system_prompt,
+                            user_content,
+                            max_output_tokens=self.settings.llm_max_output_tokens,
+                            timeout_seconds=self.settings.llm_timeout_seconds,
+                            reserve_additional_request=reserve_additional_request,
+                            allow_fallback=allow_provider_fallback,
+                        )
+                    else:
+                        response = self.provider.request(
+                            system_prompt,
+                            user_content,
+                            max_output_tokens=self.settings.llm_max_output_tokens,
+                            timeout_seconds=self.settings.llm_timeout_seconds,
+                        )
                     raw = json.loads(response.content)
                     payload = LLMClassificationPayload.model_validate(raw)
                     error_code = ""
                     break
                 except TimeoutError:
                     error_code = "TIMEOUT"
+                    allow_provider_fallback = False
                 except json.JSONDecodeError:
                     error_code = "INVALID_JSON"
+                    allow_provider_fallback = False
                 except ValidationError:
                     error_code = "SCHEMA_VALIDATION"
+                    allow_provider_fallback = False
                 except (OSError, ValueError):
                     error_code = "PROVIDER_UNAVAILABLE"
+                    allow_provider_fallback = False
                 failed_input = (
                     response.input_tokens
                     if response is not None and response.input_tokens is not None
@@ -341,10 +507,16 @@ class LLMNewsClassifier:
             )
 
         now = self._clock()
-        estimated_output = _estimate_tokens(response.content)
+        estimated_input_total = (
+            estimated_input + response.additional_estimated_input_tokens
+        )
+        estimated_output = (
+            _estimate_tokens(response.content)
+            + response.additional_estimated_output_tokens
+        )
         input_tokens = response.input_tokens
         output_tokens = response.output_tokens
-        charged_input = input_tokens if input_tokens is not None else estimated_input
+        charged_input = input_tokens if input_tokens is not None else estimated_input_total
         charged_output = output_tokens if output_tokens is not None else estimated_output
         with self._lock:
             self._successful_calls += 1
@@ -364,12 +536,12 @@ class LLMNewsClassifier:
             classification_status=ClassificationStatus.SUCCESS,
             trade_eligible=True,
             provider_name=self.provider.name,
-            model_name=self.settings.llm_model,
+            model_name=response.model_name or self.settings.llm_model,
             classifier_version=self.settings.llm_classifier_version,
             latency_ms=(time.perf_counter() - started) * 1000,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            estimated_input_tokens=0 if input_tokens is not None else estimated_input,
+            estimated_input_tokens=0 if input_tokens is not None else estimated_input_total,
             estimated_output_tokens=0 if output_tokens is not None else estimated_output,
             cache_hit=False,
             classified_at=now,
@@ -616,11 +788,64 @@ class LLMNewsClassifier:
             self._token_usage.popleft()
 
 
+class CodexCLINewsClassifier(LLMNewsClassifier):
+    mode = "codex_cli"
+
+    def status_payload(self) -> dict[str, object]:
+        now = self._clock()
+        provider_available = self.provider is not None
+        configured = self.settings.codex_cli_enabled and provider_available
+        circuit_state = self._circuit_state(now)
+        if not self.settings.codex_cli_enabled:
+            status, error_code = "UNAVAILABLE", "CODEX_CLI_DISABLED"
+        elif not provider_available:
+            status, error_code = "UNAVAILABLE", "CODEX_CLI_UNAVAILABLE"
+        elif circuit_state == "OPEN":
+            status, error_code = "UNAVAILABLE", "CIRCUIT_OPEN"
+        elif self._last_error:
+            status, error_code = "DEGRADED", self._last_error
+        else:
+            status, error_code = "OK", None
+        return {
+            "mode": self.mode,
+            "status": status,
+            "configured": configured,
+            "provider_available": provider_available,
+            "credentials_present": provider_available,
+            "error_code": error_code,
+            "provider_name": "codex-cli",
+            "model_name": self.settings.codex_cli_model,
+            "fallback_model_name": self.settings.codex_cli_fallback_model,
+            "classifier_version": self.settings.llm_classifier_version,
+            "circuit_breaker_state": circuit_state,
+            "last_error": self._last_error,
+            "last_call_at": self._last_call_at.isoformat() if self._last_call_at else None,
+        }
+
+
 def build_news_classifier(settings: Settings) -> BaseNewsClassifier:
     if settings.news_classifier_mode == NewsClassifierMode.MOCK:
         return MockNewsClassifier(
             minimum_confidence=settings.signal_min_classification_confidence
         )
+    if settings.news_classifier_mode == NewsClassifierMode.CODEX_CLI:
+        executable = (
+            _resolve_executable(settings.codex_cli_path)
+            if settings.codex_cli_enabled
+            else None
+        )
+        codex_provider = (
+            CodexCLIProvider(
+                executable=executable,
+                model=settings.codex_cli_model,
+                fallback_model=settings.codex_cli_fallback_model,
+                reasoning_effort=settings.codex_cli_reasoning_effort,
+                fallback_min_confidence=settings.codex_cli_fallback_min_confidence,
+            )
+            if executable
+            else None
+        )
+        return CodexCLINewsClassifier(settings, codex_provider)
     provider = (
         OpenAICompatibleProvider(
             api_url=settings.llm_api_url,
@@ -659,6 +884,13 @@ def _credentials_present(api_key: str | None) -> bool:
     normalized = api_key.strip().lower()
     placeholder_markers = ("fake_", "do_not_use", "replace-with", "your_api", "your_llm")
     return not any(marker in normalized for marker in placeholder_markers)
+
+
+def _resolve_executable(configured_path: str) -> str | None:
+    candidate = Path(configured_path).expanduser()
+    if candidate.is_absolute() or candidate.parent != Path("."):
+        return str(candidate.resolve()) if candidate.is_file() else None
+    return shutil.which(configured_path)
 
 
 def _empty_metrics() -> dict[str, object]:

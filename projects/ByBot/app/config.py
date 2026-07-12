@@ -26,6 +26,7 @@ class BybitEnvironment(str, Enum):
 class NewsClassifierMode(str, Enum):
     MOCK = "mock"
     LLM = "llm"
+    CODEX_CLI = "codex_cli"
 
 
 class Settings(BaseSettings):
@@ -74,6 +75,12 @@ class Settings(BaseSettings):
     llm_hourly_request_budget: int = Field(default=100, ge=1, le=100000)
     llm_daily_request_budget: int = Field(default=500, ge=1, le=1000000)
     llm_daily_token_budget: int = Field(default=100000, ge=100, le=100000000)
+    codex_cli_enabled: bool = False
+    codex_cli_path: str = "codex"
+    codex_cli_model: str = "gpt-5.4-mini"
+    codex_cli_fallback_model: str = "gpt-5.6-luna"
+    codex_cli_reasoning_effort: str = "low"
+    codex_cli_fallback_min_confidence: float = Field(default=0.75, ge=0, le=1)
 
     news_poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
     news_max_item_age_minutes: int = Field(default=60, ge=1, le=1440)

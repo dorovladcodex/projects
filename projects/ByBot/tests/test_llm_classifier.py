@@ -89,7 +89,7 @@ def llm_settings(**overrides: object) -> Settings:
         "bybit_api_secret": None,
     }
     values.update(overrides)
-    return Settings(**values)
+    return Settings(_env_file=None, **values)
 
 
 def news_item(

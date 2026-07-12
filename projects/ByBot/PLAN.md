@@ -111,6 +111,8 @@ Deferred from Phase 4A:
 - Explicit local-only non-tradeable mock fallback
 - Classifier status, metrics, and isolated local test endpoints
 - Failed/fallback classifications cannot enter the signal pipeline
+- Optional ephemeral read-only Codex CLI provider with controlled ambiguous-only
+  fallback and no execution side effects
 - No automatic paper execution and no Bybit order placement
 
 ## Phase 4B - Bybit demo only

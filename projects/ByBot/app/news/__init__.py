@@ -1,6 +1,7 @@
 """News ingestion and classification boundaries."""
 from app.news.classifier import (
     BaseNewsClassifier,
+    CodexCLINewsClassifier,
     LLMNewsClassifier,
     MockNewsClassifier,
     build_news_classifier,
@@ -17,7 +18,8 @@ from app.news.sources import (
 
 __all__ = [
     "BaseNewsSource", "BybitAnnouncementsNewsSource", "CryptoPanicNewsSource",
-    "GDELTNewsSource", "BaseNewsClassifier", "LLMNewsClassifier", "MockNewsClassifier",
+    "GDELTNewsSource", "BaseNewsClassifier", "CodexCLINewsClassifier",
+    "LLMNewsClassifier", "MockNewsClassifier",
     "NewsService", "RSSNewsSource", "build_news_classifier",
     "apply_trade_eligibility", "calculate_trade_eligibility",
 ]

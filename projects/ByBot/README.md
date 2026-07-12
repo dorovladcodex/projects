@@ -426,6 +426,30 @@ When `NEWS_CLASSIFIER_MODE=llm` has no usable credential (including the fake
 `.env.example` placeholder), `/news/classifier/status` reports `UNAVAILABLE`,
 `configured=false`, `provider_available=false`, and `PROVIDER_UNAVAILABLE`.
 No provider request or request/token budget is consumed.
+
+### Codex CLI classifier provider
+
+Codex CLI can be selected without placing an API credential in ByBot:
+
+```env
+NEWS_CLASSIFIER_MODE=codex_cli
+CODEX_CLI_ENABLED=true
+CODEX_CLI_PATH=codex
+CODEX_CLI_MODEL=gpt-5.4-mini
+CODEX_CLI_FALLBACK_MODEL=gpt-5.6-luna
+CODEX_CLI_REASONING_EFFORT=low
+CODEX_CLI_FALLBACK_MIN_CONFIDENCE=0.75
+AUTO_PAPER_EXECUTION=false
+BYBIT_ENABLE_TRADING=false
+```
+
+Each classification runs `codex exec` with `shell=False`, an isolated temporary
+directory, ephemeral/read-only mode, ignored user config, a UTF-8 schema file,
+and the news prompt over stdin. The fallback model is called only for a valid
+neutral primary result below the confidence threshold. Timeout, authentication,
+invalid JSON/executable, and budget failures never trigger fallback. Existing
+cache, eligibility, rate, budget, retry, and circuit-breaker controls remain in
+force.
 - real exchange execution remains blocked
 
 Sizing defaults in `.env`:
