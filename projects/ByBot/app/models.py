@@ -106,12 +106,14 @@ class TradeSignal(BaseModel):
     confidence: float = Field(ge=0, le=1)
     expected_edge_bps: float
     stop_loss_pct: float | None = Field(default=None, gt=0)
+    take_profit_pct: float | None = Field(default=None, gt=0)
     reasons: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class RiskContext(BaseModel):
     equity: float = Field(gt=0)
+    available_balance: float | None = Field(default=None, ge=0)
     requested_risk_pct: float = Field(gt=0)
     leverage: int = Field(ge=1)
     open_positions: int = Field(ge=0)
@@ -125,6 +127,19 @@ class RiskDecision(BaseModel):
     approved: bool
     reasons: list[str] = Field(default_factory=list)
     max_loss_amount: float = Field(default=0, ge=0)
+    risk_based_size: float = Field(default=0, ge=0)
+    capped_size: float = Field(default=0, ge=0)
+    position_notional: float = Field(default=0, ge=0)
+    max_allowed_notional: float = Field(default=0, ge=0)
+    estimated_fees: float = Field(default=0, ge=0)
+    estimated_slippage: float = Field(default=0, ge=0)
+    size_was_capped: bool = False
+    take_profit_bps: float = Field(default=0, ge=0)
+    stop_loss_bps: float = Field(default=0, ge=0)
+    round_trip_cost_bps: float = Field(default=0, ge=0)
+    min_net_edge_bps: float = Field(default=0, ge=0)
+    effective_expected_edge_bps: float = 0.0
+    expected_net_edge_bps: float = 0.0
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -171,6 +186,10 @@ class PaperPosition(BaseModel):
     take_profit: float = Field(gt=0)
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
+    estimated_entry_fee: float = Field(default=0, ge=0)
+    estimated_exit_fee: float = Field(default=0, ge=0)
+    estimated_entry_slippage: float = Field(default=0, ge=0)
+    estimated_exit_slippage: float = Field(default=0, ge=0)
     opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     closed_at: datetime | None = None
     status: PositionStatus = PositionStatus.OPEN

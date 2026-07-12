@@ -214,8 +214,30 @@ Safety rules enforced:
 - no martingale
 - market data must be available
 - RiskManager approval is required
+- position size is capped by equity, available balance, leverage, max notional,
+  and max percentage of equity
+- paper PnL subtracts estimated fees and slippage
 - automatic closes run for `stop_loss`, `take_profit`, and `timeout`
 - real exchange execution remains blocked
+
+Sizing defaults in `.env`:
+
+```env
+MAX_POSITION_NOTIONAL_USDT=5000
+MAX_POSITION_NOTIONAL_PCT_OF_EQUITY=5
+MIN_POSITION_NOTIONAL_USDT=10
+DEFAULT_PAPER_FEES_BPS=6
+DEFAULT_SLIPPAGE_BPS=2
+MIN_NET_EDGE_BPS=5
+```
+
+For example, a very tight `stop_loss_pct` may produce a large risk-based size,
+but the final paper size is reduced so notional stays within the configured
+caps.
+
+Paper trades are also rejected when the take-profit target is too small to cover
+round-trip fees, slippage, and `MIN_NET_EDGE_BPS`. Manual `expected_edge_bps`
+cannot exceed the configured take-profit target.
 
 ## Safety
 

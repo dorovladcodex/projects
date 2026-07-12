@@ -58,7 +58,7 @@ class PaperTradingService:
         if stop_distance <= 0:
             self.last_error = "stop loss distance must be positive"
             raise ValueError(self.last_error)
-        size = risk_decision.max_loss_amount / stop_distance
+        size = risk_decision.capped_size or (risk_decision.max_loss_amount / stop_distance)
         if size <= 0:
             self.last_error = "position size must be positive"
             raise ValueError(self.last_error)
@@ -82,7 +82,18 @@ class PaperTradingService:
             current_price=market.last_price,
             stop_loss=stop_loss,
             take_profit=take_profit,
-            unrealized_pnl=_calculate_pnl(signal.side, size, entry_price, market.last_price),
+            unrealized_pnl=_calculate_pnl(
+                signal.side,
+                size,
+                entry_price,
+                market.last_price,
+                estimated_fees=risk_decision.estimated_fees,
+                estimated_slippage=risk_decision.estimated_slippage,
+            ),
+            estimated_entry_fee=risk_decision.estimated_fees / 2,
+            estimated_exit_fee=risk_decision.estimated_fees / 2,
+            estimated_entry_slippage=risk_decision.estimated_slippage / 2,
+            estimated_exit_slippage=risk_decision.estimated_slippage / 2,
             reason="opened_by_test_signal",
         )
         self.positions.append(position)
@@ -106,6 +117,10 @@ class PaperTradingService:
             position.size,
             position.entry_price,
             market.last_price,
+            estimated_fees=position.estimated_entry_fee + position.estimated_exit_fee,
+            estimated_slippage=(
+                position.estimated_entry_slippage + position.estimated_exit_slippage
+            ),
         )
 
         if _stop_loss_hit(position):
@@ -138,6 +153,10 @@ class PaperTradingService:
             position.size,
             position.entry_price,
             exit_price,
+            estimated_fees=position.estimated_entry_fee + position.estimated_exit_fee,
+            estimated_slippage=(
+                position.estimated_entry_slippage + position.estimated_exit_slippage
+            ),
         )
         position.unrealized_pnl = 0.0
         position.status = PositionStatus.CLOSED
@@ -189,10 +208,20 @@ class PaperTradingService:
         }
 
 
-def _calculate_pnl(side: Side, size: float, entry_price: float, current_price: float) -> float:
+def _calculate_pnl(
+    side: Side,
+    size: float,
+    entry_price: float,
+    current_price: float,
+    *,
+    estimated_fees: float = 0.0,
+    estimated_slippage: float = 0.0,
+) -> float:
     if side == Side.BUY:
-        return (current_price - entry_price) * size
-    return (entry_price - current_price) * size
+        gross_pnl = (current_price - entry_price) * size
+    else:
+        gross_pnl = (entry_price - current_price) * size
+    return gross_pnl - estimated_fees - estimated_slippage
 
 
 def _stop_loss_hit(position: PaperPosition) -> bool:

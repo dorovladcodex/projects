@@ -46,6 +46,9 @@ Deferred from Phase 2:
 - Update unrealized PnL from latest market price
 - Stop-loss, take-profit, and timeout closes
 - Realized/unrealized/total PnL accounting
+- Position sizing caps by equity, available balance, leverage, max notional,
+  and max percent of equity
+- Estimated paper fees and slippage in PnL
 - `POST /paper/test-signal` manual test endpoint with RiskManager approval
 - `GET /paper/positions`, `GET /paper/trades`, and `GET /paper/pnl`
 - `/status` paper trading status, open paper position, last paper trade, and

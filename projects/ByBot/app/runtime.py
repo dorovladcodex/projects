@@ -40,6 +40,7 @@ def build_status(
 
     risk_context = RiskContext(
         equity=settings.paper_starting_equity,
+        available_balance=account_status.available_balance,
         requested_risk_pct=settings.max_risk_per_trade_pct,
         leverage=settings.max_leverage,
         open_positions=0,
@@ -56,6 +57,12 @@ def build_status(
         max_spread_bps=settings.max_spread_bps,
         min_confidence=settings.min_llm_confidence,
         min_expected_edge_bps=settings.min_expected_edge_bps,
+        max_position_notional_usdt=settings.max_position_notional_usdt,
+        max_position_notional_pct_of_equity=settings.max_position_notional_pct_of_equity,
+        min_position_notional_usdt=settings.min_position_notional_usdt,
+        default_paper_fees_bps=settings.default_paper_fees_bps,
+        default_slippage_bps=settings.default_slippage_bps,
+        min_net_edge_bps=settings.min_net_edge_bps,
     )
     if (
         signal is not None

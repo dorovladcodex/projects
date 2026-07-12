@@ -70,6 +70,11 @@ Set `BOT_MODE=PAPER`. Paper positions must remain local simulations. Confirm
 that no authenticated production Bybit client is configured or instantiated.
 Use `POST /paper/test-signal` only for local/manual paper testing. Confirm that
 `/status` still reports `order_placement_blocked=true`.
+Paper position size must respect account equity, available balance when known,
+requested leverage, max notional, and max percent of equity. Tight stop losses
+must not create oversized notional exposure.
+Paper trades must also pass net-edge validation: take profit must exceed
+round-trip fees, slippage, and the configured minimum net edge.
 
 Useful checks:
 

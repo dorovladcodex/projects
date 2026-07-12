@@ -109,11 +109,13 @@ def paper_test_signal(request: PaperTestSignalRequest) -> dict[str, object]:
         confidence=request.confidence,
         expected_edge_bps=request.expected_edge_bps,
         stop_loss_pct=request.stop_loss_pct,
+        take_profit_pct=request.take_profit_pct or settings.paper_take_profit_pct,
         reasons=["manual paper test signal"],
     )
     equity = account_service.status.equity or settings.paper_starting_equity
     risk_context = RiskContext(
         equity=equity,
+        available_balance=account_service.status.available_balance,
         requested_risk_pct=request.requested_risk_pct or settings.max_risk_per_trade_pct,
         leverage=request.leverage or settings.max_leverage,
         open_positions=1 if paper_trading_service.open_position else 0,
@@ -130,6 +132,12 @@ def paper_test_signal(request: PaperTestSignalRequest) -> dict[str, object]:
         max_spread_bps=settings.max_spread_bps,
         min_confidence=settings.min_llm_confidence,
         min_expected_edge_bps=settings.min_expected_edge_bps,
+        max_position_notional_usdt=settings.max_position_notional_usdt,
+        max_position_notional_pct_of_equity=settings.max_position_notional_pct_of_equity,
+        min_position_notional_usdt=settings.min_position_notional_usdt,
+        default_paper_fees_bps=settings.default_paper_fees_bps,
+        default_slippage_bps=settings.default_slippage_bps,
+        min_net_edge_bps=settings.min_net_edge_bps,
     )
     risk_decision = RiskManager(risk_rules).assess(signal, market_snapshot, risk_context)
     if not risk_decision.approved:

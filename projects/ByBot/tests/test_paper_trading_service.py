@@ -44,6 +44,19 @@ def approved_risk() -> RiskDecision:
     return RiskDecision(approved=True, max_loss_amount=50)
 
 
+def approved_sized_risk() -> RiskDecision:
+    return RiskDecision(
+        approved=True,
+        max_loss_amount=50,
+        risk_based_size=1.0,
+        capped_size=0.01,
+        position_notional=600,
+        max_allowed_notional=600,
+        estimated_fees=1.2,
+        estimated_slippage=0.4,
+    )
+
+
 def test_opens_paper_position() -> None:
     service = PaperTradingService()
 
@@ -155,3 +168,20 @@ def test_pnl_calculation_for_short_position() -> None:
     pnl = service.pnl()
     assert pnl.unrealized_pnl > 0
     assert pnl.total_pnl == pytest.approx(pnl.unrealized_pnl)
+
+
+def test_pnl_includes_estimated_fees_and_slippage() -> None:
+    service = PaperTradingService()
+    position = service.open_from_signal(
+        signal(),
+        approved_sized_risk(),
+        market(),
+        take_profit_pct=10.0,
+    )
+
+    closed = service.close_position(position.entry_price + 100, reason="manual_close")
+
+    gross_pnl = 100 * approved_sized_risk().capped_size
+    expected_net = gross_pnl - approved_sized_risk().estimated_fees - approved_sized_risk().estimated_slippage
+    assert closed.realized_pnl == pytest.approx(expected_net)
+    assert service.pnl().realized_pnl == pytest.approx(expected_net)
