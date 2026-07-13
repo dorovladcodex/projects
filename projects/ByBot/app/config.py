@@ -131,6 +131,9 @@ class Settings(BaseSettings):
     paper_position_timeout_minutes: int = Field(default=60, gt=0)
     default_paper_fees_bps: float = Field(default=6.0, ge=0)
     default_slippage_bps: float = Field(default=2.0, ge=0)
+    paper_maker_fee_bps: float = Field(default=2.0, ge=0)
+    paper_taker_fee_bps: float = Field(default=6.0, ge=0)
+    paper_slippage_bps: float = Field(default=2.0, ge=0)
     min_net_edge_bps: float = Field(default=5.0, ge=0)
     max_position_notional_usdt: float = Field(default=5_000.0, gt=0)
     max_position_notional_pct_of_equity: float = Field(default=5.0, gt=0, le=100)
@@ -175,13 +178,6 @@ class Settings(BaseSettings):
     def reject_bybit_trading_enabled(cls, value: bool) -> bool:
         if value:
             raise ValueError("Bybit order placement is blocked in Phase 3A")
-        return value
-
-    @field_validator("auto_paper_execution")
-    @classmethod
-    def reject_auto_paper_execution(cls, value: bool) -> bool:
-        if value:
-            raise ValueError("Automatic paper execution is blocked in Phase 4")
         return value
 
     @field_validator("allowed_symbols")

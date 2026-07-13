@@ -80,6 +80,10 @@ class CandidateLifecycleState(str, Enum):
     READY = "READY"
     BLOCKED = "BLOCKED"
     EXPIRED = "EXPIRED"
+    EXECUTING_PAPER = "EXECUTING_PAPER"
+    PAPER_OPENED = "PAPER_OPENED"
+    PAPER_CLOSED = "PAPER_CLOSED"
+    EXECUTION_BLOCKED = "EXECUTION_BLOCKED"
 
 
 class PositionStatus(str, Enum):
@@ -336,6 +340,9 @@ class SignalRiskPreview(BaseModel):
     position_notional: float = Field(default=0, ge=0)
     max_allowed_notional: float = Field(default=0, ge=0)
     rejection_reasons: list[str] = Field(default_factory=list)
+    risk_decision_id: int | None = None
+    estimated_fees: float = Field(default=0, ge=0)
+    estimated_slippage: float = Field(default=0, ge=0)
 
 
 class SignalDryRunResult(BaseModel):
@@ -343,6 +350,9 @@ class SignalDryRunResult(BaseModel):
     risk_preview: SignalRiskPreview
     execution_attempted: bool = False
     paper_position_opened: bool = False
+    execution_block_reason: str | None = None
+    execution_error_code: str | None = None
+    execution_retryable: bool = False
 
 
 class PaperOrder(BaseModel):
@@ -396,6 +406,30 @@ class PaperPosition(BaseModel):
     closed_at: datetime | None = None
     status: PositionStatus = PositionStatus.OPEN
     reason: str = "opened"
+    candidate_id: UUID | None = None
+    risk_decision_id: int | None = None
+    execution_key: str | None = None
+    position_notional: float = Field(default=0, ge=0)
+    gross_pnl: float = 0.0
+    fees_paid: float = Field(default=0, ge=0)
+    slippage_paid: float = Field(default=0, ge=0)
+    close_reason: str | None = None
+
+
+class PaperMarketSnapshotTestRequest(BaseModel):
+    symbol: Symbol
+    price: float = Field(gt=0)
+    bid: float = Field(gt=0)
+    ask: float = Field(gt=0)
+    timestamp: datetime | None = None
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> "PaperMarketSnapshotTestRequest":
+        if self.ask < self.bid:
+            raise ValueError("ask must be greater than or equal to bid")
+        if self.timestamp is not None and self.timestamp.tzinfo is None:
+            raise ValueError("timestamp must be timezone-aware")
+        return self
 
 
 class PaperPnl(BaseModel):

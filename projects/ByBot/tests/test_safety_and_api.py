@@ -34,9 +34,28 @@ def test_bybit_enable_trading_is_rejected() -> None:
         Settings(bybit_enable_trading=True)
 
 
-def test_auto_paper_execution_is_rejected() -> None:
-    with pytest.raises(ValidationError, match="Automatic paper execution is blocked"):
-        Settings(auto_paper_execution=True)
+def test_auto_paper_execution_is_disabled_by_default_but_can_be_enabled() -> None:
+    assert Settings(_env_file=None).auto_paper_execution is False
+    assert Settings(_env_file=None, auto_paper_execution=True).auto_paper_execution is True
+    with pytest.raises(ValidationError, match="Bybit order placement is blocked"):
+        Settings(_env_file=None, auto_paper_execution=True, bybit_enable_trading=True)
+
+
+def test_paper_test_execution_endpoints_are_hidden_outside_local_test_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        Settings(_env_file=None, app_env="production", test_mode=False),
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        main_module.paper_test_execute_candidate(
+            "00000000-0000-0000-0000-000000000000"
+        )
+
+    assert exc.value.status_code == 404
 
 
 def test_health_and_status_report_live_disabled() -> None:

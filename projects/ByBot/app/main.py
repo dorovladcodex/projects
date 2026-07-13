@@ -16,6 +16,7 @@ from app.models import (
     ClassifierTestRequest,
     NewsItem,
     PaperTestSignalRequest,
+    PaperMarketSnapshotTestRequest,
     RiskContext,
     SignalAction,
     SignalTestFromNewsRequest,
@@ -75,6 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await asyncio.to_thread(news_service.poll)
     market_data_service.refresh_all()
     signal_candidate_service.process_pending()
+    signal_candidate_service.execute_ready_candidates()
     task = asyncio.create_task(news_polling_loop())
     signal_task = asyncio.create_task(signal_recheck_loop())
     try:
@@ -501,8 +503,88 @@ def refresh_runtime_state(*, refresh_account: bool) -> None:
     market_data_service.refresh_all()
     if refresh_account:
         account_service.refresh_if_stale()
+    monitor_paper_positions()
+
+
+def monitor_paper_positions() -> None:
     for snapshot in market_data_service.latest_snapshots():
         paper_trading_service.update_from_market(snapshot)
+    signal_candidate_service.sync_paper_states()
+
+
+def _require_local_test_mode() -> None:
+    if not (settings.app_env.lower() == "local" and settings.test_mode):
+        raise HTTPException(status_code=404, detail="paper test endpoint is disabled")
+
+
+@app.post("/paper/test/execute-candidate/{candidate_id}")
+def paper_test_execute_candidate(candidate_id: str) -> dict[str, object]:
+    _require_local_test_mode()
+    try:
+        result = signal_candidate_service.execute_ready_candidate(
+            UUID(candidate_id), force=True
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="signal candidate not found") from exc
+    execution_record = (
+        persistence.paper_execution_details(candidate_id)
+        if persistence else None
+    )
+    return {
+        "result": result.model_dump(mode="json"),
+        "position": paper_trading_service.last_execution_details,
+        "execution_attempted": result.execution_attempted,
+        "paper_position_opened": result.paper_position_opened,
+        "duplicate": paper_trading_service.last_execution_duplicate,
+        "block_reason": result.execution_block_reason,
+        "error_code": result.execution_error_code,
+        "retryable": result.execution_retryable,
+        "risk_decision_id": result.risk_preview.risk_decision_id,
+        "execution_record": execution_record,
+        "paper_positions": paper_trading_service.positions_payload(),
+        "exchange_order_placement": "blocked",
+    }
+
+
+@app.post("/paper/test/market-snapshot")
+def paper_test_market_snapshot(
+    request: PaperMarketSnapshotTestRequest,
+) -> dict[str, object]:
+    _require_local_test_mode()
+    snapshot = MarketSnapshot(
+        symbol=request.symbol,
+        timestamp=request.timestamp or datetime.now(timezone.utc),
+        last_price=request.price,
+        bid_price=request.bid,
+        ask_price=request.ask,
+        trend_score=0,
+        volatility_pct=0,
+        liquidity_ok=True,
+    )
+    position = paper_trading_service.update_from_market(snapshot)
+    signal_candidate_service.sync_paper_states()
+    return {
+        "position": position.model_dump(mode="json") if position else None,
+        "pnl": paper_trading_service.pnl().model_dump(mode="json"),
+        "exchange_order_placement": "blocked",
+    }
+
+
+@app.post("/paper/test/close/{position_id}")
+def paper_test_close(position_id: str) -> dict[str, object]:
+    _require_local_test_mode()
+    position = paper_trading_service.open_position
+    if position is None or str(position.id) != position_id:
+        raise HTTPException(status_code=404, detail="open paper position not found")
+    closed = paper_trading_service.close_position(
+        position.current_price, reason="manual_close"
+    )
+    signal_candidate_service.sync_paper_states()
+    return {
+        "position": closed.model_dump(mode="json"),
+        "pnl": paper_trading_service.pnl().model_dump(mode="json"),
+        "exchange_order_placement": "blocked",
+    }
 
 
 async def news_polling_loop() -> None:
@@ -511,6 +593,8 @@ async def news_polling_loop() -> None:
         await asyncio.to_thread(news_service.poll)
         market_data_service.refresh_all()
         signal_candidate_service.process_pending()
+        signal_candidate_service.execute_ready_candidates()
+        monitor_paper_positions()
 
 
 async def signal_recheck_loop() -> None:
@@ -518,3 +602,5 @@ async def signal_recheck_loop() -> None:
         await asyncio.sleep(settings.signal_reevaluation_interval_seconds)
         await asyncio.to_thread(market_data_service.refresh_all)
         signal_candidate_service.reevaluate_pending()
+        signal_candidate_service.execute_ready_candidates()
+        monitor_paper_positions()

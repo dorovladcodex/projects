@@ -37,7 +37,15 @@ Deferred from Phase 2:
 - PostgreSQL repository and Alembic baseline migration
 - Restart recovery for pending and expired candidates
 - Paper equity isolated from read-only Bybit demo account equity
-- Automatic paper and exchange execution remain disabled
+- Automatic paper execution remains disabled by default; exchange execution remains blocked
+
+## Durable automatic PAPER execution (implemented, opt-in)
+
+- `AUTO_PAPER_EXECUTION=false` by default; explicit opt-in in PAPER mode only
+- Durable one-execution-per-candidate reservation and restart recovery
+- Deterministic fees, slippage, SL/TP/timeout monitoring, and net PnL
+- Local TEST_MODE execution, market-snapshot, and close endpoints
+- Bybit demo/live order placement remains permanently blocked
 
 ## Phase 3A - safe private account connection (implemented)
 

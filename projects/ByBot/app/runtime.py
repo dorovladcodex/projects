@@ -115,6 +115,7 @@ def build_status(
         "allowed_symbols": list(settings.allowed_symbols),
         "strategy": "NewsMomentumStrategy",
         "execution": "paper" if settings.bot_mode == BotMode.PAPER else "disabled",
+        "auto_paper_execution": settings.auto_paper_execution,
         "open_paper_position": paper_status["open_position"],
         "last_signal": signal.model_dump(mode="json") if signal else None,
         "last_signal_candidate": (
@@ -229,6 +230,15 @@ def build_status(
         "paper_account_equity": paper_trading.equity,
         "paper_realized_pnl": paper_status["realized_pnl"],
         "paper_unrealized_pnl": paper_status["unrealized_pnl"],
+        "paper_execution_attempts": paper_status["paper_execution_attempts"],
+        "paper_positions_opened": paper_status["paper_positions_opened"],
+        "paper_positions_closed": paper_status["paper_positions_closed"],
+        "paper_execution_duplicates_blocked": paper_status[
+            "paper_execution_duplicates_blocked"
+        ],
+        "paper_execution_risk_blocked": paper_status["paper_execution_risk_blocked"],
+        "paper_equity": paper_status["equity"],
+        "paper_fees_paid": paper_status["paper_fees_paid"],
         "last_paper_trade": paper_status["last_trade"],
         "last_risk_decision": paper_status["last_risk_decision"],
         "risk_status": {

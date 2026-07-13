@@ -6,7 +6,7 @@ from uuid import UUID
 
 from app.bybit.market_data import MarketDataService
 from app.bybit.private import BybitAccountService
-from app.config import Settings
+from app.config import BotMode, Settings
 from app.models import (
     Asset,
     CandidateLifecycleState,
@@ -60,6 +60,7 @@ class SignalCandidateService:
         self.last_signal_evaluation_at: datetime | None = None
         self._registry_lock = RLock()
         self._candidate_locks: dict[UUID, RLock] = {}
+        self._evaluation_snapshots: dict[UUID, MarketSnapshot] = {}
 
     def restore(self, *, now: datetime | None = None) -> None:
         if not self.repository or not self.repository.available:
@@ -397,6 +398,8 @@ class SignalCandidateService:
             reasons=list(reasons),
         )
         candidate.evaluation_history.append(evaluation)
+        if snapshot is not None:
+            self._evaluation_snapshots[candidate.id] = snapshot
         with self._registry_lock:
             if self.last_signal_evaluation_at is None or now > self.last_signal_evaluation_at:
                 self.last_signal_evaluation_at = now
@@ -408,6 +411,8 @@ class SignalCandidateService:
                     self.risk_preview_approved_count += 1
                 else:
                     self.risk_preview_blocked_count += 1
+            if self.settings.auto_paper_execution:
+                self._execute_paper_result(result, classification, snapshot)
         else:
             result.risk_preview = _preview_not_performed()
         if self.repository:
@@ -420,6 +425,8 @@ class SignalCandidateService:
         candidate: NewsSignalCandidate,
     ) -> list[str]:
         reasons: list[str] = []
+        if self.settings.bot_mode != BotMode.PAPER:
+            reasons.append("automatic paper execution requires PAPER mode")
         if classification.sentiment == Sentiment.NEUTRAL:
             reasons.append("neutral classification")
         if classification.confidence < self.settings.signal_min_classification_confidence:
@@ -587,8 +594,10 @@ class SignalCandidateService:
             api_stable=self.market_data.status == "OK",
         )
         decision = RiskManager(_risk_rules(self.settings)).assess(signal, snapshot, context)
-        if self.repository:
+        risk_decision_id = (
             self.repository.save_risk_decision(str(candidate.id), decision)
+            if self.repository else None
+        )
         return SignalRiskPreview(
             preview_performed=True,
             approved=decision.approved,
@@ -596,7 +605,170 @@ class SignalCandidateService:
             position_notional=decision.position_notional,
             max_allowed_notional=decision.max_allowed_notional,
             rejection_reasons=decision.reasons,
+            risk_decision_id=risk_decision_id,
+            estimated_fees=decision.estimated_fees,
+            estimated_slippage=decision.estimated_slippage,
         )
+
+    def execute_ready_candidate(
+        self, candidate_id: UUID, *, force: bool = False
+    ) -> SignalDryRunResult:
+        result = self.get_result(candidate_id)
+        news, classification = self._find_news_and_classification(
+            result.candidate.news_id
+        )
+        del news
+        snapshot = self._evaluation_snapshots.get(candidate_id) or (
+            self.market_data.latest_snapshot(result.candidate.symbol)
+            if result.candidate.symbol else None
+        )
+        if not force and not self.settings.auto_paper_execution:
+            return result
+        self._execute_paper_result(result, classification, snapshot)
+        return result
+
+    def execute_ready_candidates(self) -> None:
+        if not self.settings.auto_paper_execution:
+            return
+        for result in list(self.results):
+            if result.candidate.state == CandidateLifecycleState.READY:
+                self.execute_ready_candidate(result.candidate.id)
+
+    def _execute_paper_result(
+        self,
+        result: SignalDryRunResult,
+        classification: NewsClassification,
+        snapshot: MarketSnapshot | None,
+    ) -> None:
+        candidate = result.candidate
+        now = datetime.now(timezone.utc)
+        reasons: list[str] = []
+        if candidate.state != CandidateLifecycleState.READY:
+            reasons.append("candidate is not READY")
+        if candidate.final_action not in {NewsSignalAction.BUY, NewsSignalAction.SELL}:
+            reasons.append("candidate has no executable paper direction")
+        if not result.risk_preview.preview_performed or not result.risk_preview.approved:
+            reasons.append("risk preview is not approved")
+        if now >= candidate.expires_at:
+            reasons.append("candidate is expired")
+        if not classification.trade_eligible:
+            reasons.append("classification is not trade eligible")
+        snapshot_fresh = (
+            snapshot is not None
+            and now - snapshot.timestamp <= timedelta(
+                seconds=self.settings.signal_confirmation_window_seconds
+            )
+        )
+        if not snapshot_fresh or not candidate.market_confirmation.fresh:
+            reasons.append("market data is stale or unavailable")
+        if self.paper_trading.open_position is not None:
+            reasons.append("conflicting open paper position exists")
+        if str(candidate.id) in self.paper_trading.executed_candidate_ids:
+            self.paper_trading.paper_execution_duplicates_blocked += 1
+            self.paper_trading.last_execution_attempted = False
+            self.paper_trading.last_position_opened = False
+            self.paper_trading.last_execution_duplicate = True
+            existing = next(
+                (
+                    item for item in self.paper_trading.positions
+                    if item.candidate_id == candidate.id
+                ),
+                None,
+            )
+            self.paper_trading.last_execution_details = (
+                existing.model_dump(mode="json") if existing else None
+            )
+            self.paper_trading.last_existing_execution_state = (
+                CandidateLifecycleState.PAPER_CLOSED.value
+                if existing and existing.status.value == "CLOSED"
+                else CandidateLifecycleState.PAPER_OPENED.value
+                if existing else None
+            )
+            result.execution_attempted = False
+            result.paper_position_opened = False
+            result.execution_block_reason = None
+            return
+        if reasons:
+            candidate.state = CandidateLifecycleState.EXECUTION_BLOCKED
+            candidate.final_action = NewsSignalAction.NO_TRADE
+            candidate.reasons = reasons
+            result.execution_attempted = False
+            result.paper_position_opened = False
+            result.execution_block_reason = "; ".join(reasons)
+            result.execution_error_code = None
+            result.execution_retryable = False
+            if not result.risk_preview.approved:
+                self.paper_trading.paper_execution_risk_blocked += 1
+            if self.repository:
+                self.repository.save_signal_result(result)
+            return
+        original_state = candidate.state
+        original_action = candidate.final_action
+        candidate.state = CandidateLifecycleState.EXECUTING_PAPER
+        position = self.paper_trading.open_from_candidate(
+            candidate, result.risk_preview, snapshot,
+            taker_fee_bps=self.settings.paper_taker_fee_bps,
+            slippage_bps=self.settings.paper_slippage_bps,
+        )
+        result.execution_attempted = self.paper_trading.last_execution_attempted
+        result.paper_position_opened = self.paper_trading.last_position_opened
+        result.execution_block_reason = None
+        result.execution_error_code = self.paper_trading.last_execution_error_code
+        result.execution_retryable = self.paper_trading.last_execution_retryable
+        if self.paper_trading.last_execution_error_code:
+            candidate.state = original_state
+            candidate.final_action = original_action
+            candidate.reasons = ["paper execution persistence temporarily unavailable"]
+            result.execution_block_reason = None
+            if self.repository:
+                self.repository.save_signal_result(result)
+            return
+        if self.paper_trading.last_execution_duplicate:
+            candidate.final_action = original_action
+            if position is not None:
+                candidate.state = (
+                    CandidateLifecycleState.PAPER_CLOSED
+                    if position.status.value == "CLOSED"
+                    else CandidateLifecycleState.PAPER_OPENED
+                )
+            else:
+                existing_state = self.paper_trading.last_existing_execution_state
+                candidate.state = (
+                    CandidateLifecycleState(existing_state)
+                    if existing_state in {
+                        CandidateLifecycleState.PAPER_OPENED.value,
+                        CandidateLifecycleState.PAPER_CLOSED.value,
+                    }
+                    else original_state
+                )
+            if self.repository:
+                self.repository.save_signal_result(result)
+            return
+        candidate.state = (
+            CandidateLifecycleState.PAPER_OPENED
+            if position else CandidateLifecycleState.EXECUTION_BLOCKED
+        )
+        if position is None:
+            candidate.final_action = NewsSignalAction.NO_TRADE
+            candidate.reasons = [self.paper_trading.last_error or "paper execution blocked"]
+            result.execution_block_reason = candidate.reasons[0]
+        if self.repository:
+            self.repository.save_signal_result(result)
+
+    def sync_paper_states(self) -> None:
+        for result in self.results:
+            candidate = result.candidate
+            position = next(
+                (
+                    item for item in self.paper_trading.positions
+                    if item.candidate_id == candidate.id
+                ),
+                None,
+            )
+            if position and position.status.value == "CLOSED" and candidate.state != CandidateLifecycleState.PAPER_CLOSED:
+                candidate.state = CandidateLifecycleState.PAPER_CLOSED
+                if self.repository:
+                    self.repository.save_signal_result(result)
 
     def _find_news_and_classification(
         self, news_id: UUID
@@ -651,7 +823,7 @@ def _risk_rules(settings: Settings) -> RiskRules:
         max_position_notional_usdt=settings.max_position_notional_usdt,
         max_position_notional_pct_of_equity=settings.max_position_notional_pct_of_equity,
         min_position_notional_usdt=settings.min_position_notional_usdt,
-        default_paper_fees_bps=settings.default_paper_fees_bps,
-        default_slippage_bps=settings.default_slippage_bps,
+        default_paper_fees_bps=settings.paper_taker_fee_bps,
+        default_slippage_bps=settings.paper_slippage_bps,
         min_net_edge_bps=settings.min_net_edge_bps,
     )

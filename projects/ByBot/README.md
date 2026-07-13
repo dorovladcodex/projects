@@ -97,6 +97,51 @@ The script starts only PostgreSQL in Docker and runs FastAPI locally. It leaves
 PostgreSQL running, stops its local uvicorn process, and never enables paper or
 exchange execution.
 
+## Automatic paper execution
+
+Automatic paper execution is disabled by default. To enable it explicitly in
+PAPER mode, set `AUTO_PAPER_EXECUTION=true`. Exchange execution remains blocked
+by `BYBIT_ENABLE_TRADING=false`.
+
+Paper fills use configurable deterministic costs:
+
+```powershell
+PAPER_MAKER_FEE_BPS=2
+PAPER_TAKER_FEE_BPS=6
+PAPER_SLIPPAGE_BPS=2
+```
+
+Only a fresh, non-expired `READY` candidate with an approved risk preview can
+open a paper position. PostgreSQL enforces one paper execution per candidate,
+including across application restarts.
+
+With the local API running in `APP_ENV=local`, `TEST_MODE=true`, PAPER mode, and
+`AUTO_PAPER_EXECUTION=false`, run the deterministic execution lifecycle smoke test:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\paper_execution_smoke.ps1
+```
+
+It verifies `READY → PAPER_OPENED → idempotent duplicate → TAKE_PROFIT →
+PAPER_CLOSED` and finishes with `OVERALL: PASS`.
+
+To verify sanitized database diagnostics locally:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\test_auto_paper_execution.py -k persistence_failure -s
+```
+
+PostgreSQL-only transaction tests run when a dedicated test database is supplied:
+
+```powershell
+$env:BYBOT_TEST_POSTGRES_URL="postgresql+psycopg://bybot:bybot@localhost:5432/bybot_test"
+.\.venv\Scripts\python.exe -m pytest tests\test_postgres_paper_execution.py -q
+```
+
+Use only a disposable test database for that command. Error responses expose a
+sanitized code such as `DB_INTEGRITY_ERROR`; credentials and `DATABASE_URL` are
+never returned.
+
 ## Market data
 
 By default, local development uses mock market data so the app and tests run
