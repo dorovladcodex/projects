@@ -433,9 +433,12 @@ class PaperMarketSnapshotTestRequest(BaseModel):
 
 
 class PaperPnl(BaseModel):
+    starting_equity: float
+    equity: float
     realized_pnl: float = 0.0
     unrealized_pnl: float = 0.0
     total_pnl: float = 0.0
+    fees_paid: float = Field(default=0.0, ge=0)
     open_positions: int = 0
     closed_trades: int = 0
 

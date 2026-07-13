@@ -51,8 +51,26 @@ class PaperTradingService:
 
     @property
     def equity(self) -> float:
-        return self.starting_equity + sum(
-            position.realized_pnl for position in self.closed_trades
+        return self.starting_equity + self.realized_pnl + self.unrealized_pnl
+
+    @property
+    def realized_pnl(self) -> float:
+        return sum(position.realized_pnl for position in self.closed_trades)
+
+    @property
+    def unrealized_pnl(self) -> float:
+        return sum(
+            position.unrealized_pnl
+            for position in self.positions
+            if position.status == PositionStatus.OPEN
+        )
+
+    @property
+    def fees_paid(self) -> float:
+        return sum(item.fees_paid for item in self.closed_trades) + sum(
+            item.fees_paid
+            for item in self.positions
+            if item.status == PositionStatus.OPEN
         )
 
     def restore(self) -> None:
@@ -67,6 +85,11 @@ class PaperTradingService:
         self.closed_trades = [
             position for position in restored if position.status == PositionStatus.CLOSED
         ]
+        account_loader = getattr(self.repository, "load_or_create_paper_account", None)
+        if callable(account_loader):
+            account = account_loader(self.starting_equity)
+            if account is not None:
+                self.starting_equity = float(account["starting_equity"])
         self.paper_positions_opened = sum(
             position.candidate_id is not None for position in restored
         )
@@ -408,11 +431,12 @@ class PaperTradingService:
         if reason not in allowed_reasons:
             self.last_error = f"unsupported close reason: {reason}"
             raise ValueError(self.last_error)
-        position = self.open_position
-        if position is None:
+        open_position = self.open_position
+        if open_position is None:
             self.last_error = "no open paper position"
             raise RuntimeError(self.last_error)
         now = now or datetime.now(timezone.utc)
+        position = open_position.model_copy(deep=True)
         position.current_price = exit_price
         if position.candidate_id:
             gross = (
@@ -432,33 +456,63 @@ class PaperTradingService:
             )
             position.realized_pnl = gross - position.fees_paid - position.slippage_paid
         else:
-            position.realized_pnl = _calculate_pnl(
-                position.side, position.size, position.entry_price, exit_price,
-                estimated_fees=position.estimated_entry_fee + position.estimated_exit_fee,
-                estimated_slippage=position.estimated_entry_slippage + position.estimated_exit_slippage,
+            gross = (
+                (exit_price - position.entry_price) * position.size
+                if position.side == Side.BUY
+                else (position.entry_price - exit_price) * position.size
+            )
+            position.gross_pnl = gross
+            position.fees_paid = (
+                position.estimated_entry_fee + position.estimated_exit_fee
+            )
+            position.slippage_paid = (
+                position.estimated_entry_slippage + position.estimated_exit_slippage
+            )
+            position.realized_pnl = (
+                gross - position.fees_paid - position.slippage_paid
             )
         position.unrealized_pnl = 0.0
         position.status = PositionStatus.CLOSED
         position.closed_at = now
         position.reason = reason
         position.close_reason = reason
-        self.closed_trades.append(position)
-        self.paper_positions_closed += 1
-        self._persist(position)
-        if position.candidate_id:
-            self._update_execution(str(position.candidate_id), "PAPER_CLOSED", position)
+
+        atomic_close = getattr(self.repository, "persist_paper_close_transaction", None)
+        if callable(atomic_close):
+            transaction = atomic_close(position, self.starting_equity)
+            if transaction.get("status") == "ERROR":
+                self.last_error = "paper close persistence transaction failed"
+                raise RuntimeError(self.last_error)
+            if transaction.get("status") == "EXISTING":
+                position = PaperPosition.model_validate(transaction["position"])
+
+        for index, item in enumerate(self.positions):
+            if item.id == position.id:
+                self.positions[index] = position
+                break
+        if not any(item.id == position.id for item in self.closed_trades):
+            self.closed_trades.append(position)
+            self.paper_positions_closed += 1
+        if not callable(atomic_close):
+            self._persist(position)
+            if position.candidate_id:
+                self._update_execution(
+                    str(position.candidate_id), "PAPER_CLOSED", position
+                )
         self.last_error = None
         return position
 
     def pnl(self) -> PaperPnl:
-        open_position = self.open_position
-        unrealized = open_position.unrealized_pnl if open_position else 0.0
-        realized = sum(position.realized_pnl for position in self.closed_trades)
         return PaperPnl(
-            realized_pnl=realized,
-            unrealized_pnl=unrealized,
-            total_pnl=realized + unrealized,
-            open_positions=1 if open_position else 0,
+            starting_equity=self.starting_equity,
+            equity=self.equity,
+            realized_pnl=self.realized_pnl,
+            unrealized_pnl=self.unrealized_pnl,
+            total_pnl=self.realized_pnl + self.unrealized_pnl,
+            fees_paid=self.fees_paid,
+            open_positions=sum(
+                item.status == PositionStatus.OPEN for item in self.positions
+            ),
             closed_trades=len(self.closed_trades),
         )
 
@@ -496,9 +550,7 @@ class PaperTradingService:
             "paper_positions_closed": self.paper_positions_closed,
             "paper_execution_duplicates_blocked": self.paper_execution_duplicates_blocked,
             "paper_execution_risk_blocked": self.paper_execution_risk_blocked,
-            "paper_fees_paid": sum(item.fees_paid for item in self.closed_trades) + sum(
-                item.fees_paid for item in self.positions if item.status == PositionStatus.OPEN
-            ),
+            "paper_fees_paid": self.fees_paid,
         }
 
 

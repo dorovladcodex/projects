@@ -111,6 +111,12 @@ PAPER_TAKER_FEE_BPS=6
 PAPER_SLIPPAGE_BPS=2
 ```
 
+Paper account reporting uses one formula: `equity = starting_equity +
+cumulative net realized PnL + current unrealized PnL`. `GET /paper/pnl`
+returns `starting_equity`, `equity`, realized and unrealized PnL, total PnL,
+fees paid, and open/closed position counts. Closed account totals are persisted
+in PostgreSQL and reconciled from durable trades during startup recovery.
+
 Only a fresh, non-expired `READY` candidate with an approved risk preview can
 open a paper position. PostgreSQL enforces one paper execution per candidate,
 including across application restarts.
@@ -124,6 +130,18 @@ powershell -ExecutionPolicy Bypass -File .\scripts\paper_execution_smoke.ps1
 
 It verifies `READY → PAPER_OPENED → idempotent duplicate → TAKE_PROFIT →
 PAPER_CLOSED` and finishes with `OVERALL: PASS`.
+
+To verify the complete automatic path without calling the manual candidate
+execution endpoint, keep Docker Desktop running and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\auto_paper_execution_smoke.ps1
+```
+
+The script creates an isolated temporary PostgreSQL database, starts FastAPI
+locally with `AUTO_PAPER_EXECUTION=true` and `BYBIT_ENABLE_TRADING=false`, tests
+automatic open, duplicate protection, take-profit close, and restart recovery,
+then removes the temporary database. The PostgreSQL container remains running.
 
 To verify sanitized database diagnostics locally:
 

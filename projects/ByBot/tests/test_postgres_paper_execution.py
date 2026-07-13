@@ -12,16 +12,28 @@ from sqlalchemy.sql.sqltypes import Integer
 from sqlalchemy.orm import Session
 
 from app.db.persistence import (
+    Base,
     NewsItemRow,
+    PaperAccountRow,
     PaperExecutionRow,
     PaperPositionRow,
+    PaperTradeRow,
     PersistenceRepository,
     RiskDecisionRow,
     SignalCandidateRow,
 )
-from app.models import PaperPosition, PositionStatus, Side, SignalRiskPreview, Symbol
+from app.models import (
+    MarketSnapshot,
+    PaperPosition,
+    PositionStatus,
+    Side,
+    SignalRiskPreview,
+    SimpleTrend,
+    Symbol,
+)
 from app.db.url import normalize_database_url
 from app.config import get_settings
+from app.portfolio.paper_trading import PaperTradingService
 
 
 POSTGRES_TEST_URL = os.getenv("BYBOT_TEST_POSTGRES_URL")
@@ -49,12 +61,20 @@ def _seed_candidate(repository: PersistenceRepository) -> tuple[str, str]:
     return news_id, candidate_id
 
 
-def _position(candidate_id: str, *, position_id: str | None = None) -> PaperPosition:
+def _position(
+    candidate_id: str,
+    *,
+    position_id: str | None = None,
+    side: Side = Side.BUY,
+) -> PaperPosition:
     return PaperPosition(
-        id=position_id or uuid4(), symbol=Symbol.BTCUSDT, side=Side.BUY,
+        id=position_id or uuid4(), symbol=Symbol.BTCUSDT, side=side,
         size=0.1, entry_price=100, current_price=100, stop_loss=99,
         take_profit=102, status=PositionStatus.OPEN,
         candidate_id=candidate_id, position_notional=10,
+        estimated_entry_fee=0.006, estimated_exit_fee=0.006,
+        estimated_entry_slippage=0.002, estimated_exit_slippage=0.002,
+        fees_paid=0.006, slippage_paid=0.002,
     )
 
 
@@ -65,6 +85,30 @@ def _preview() -> SignalRiskPreview:
         estimated_fees=0.012, estimated_slippage=0.004,
         rejection_reasons=[], risk_decision_id=None,
     )
+
+
+def _fresh_repository() -> PersistenceRepository:
+    repository = PersistenceRepository(str(POSTGRES_TEST_URL), create_schema=True)
+    assert repository.available
+    Base.metadata.drop_all(repository.engine)
+    Base.metadata.create_all(repository.engine)
+    return repository
+
+
+def _open_accounting_position(
+    side: Side,
+) -> tuple[PersistenceRepository, PaperTradingService, PaperPosition]:
+    repository = _fresh_repository()
+    _, candidate_id = _seed_candidate(repository)
+    position = _position(candidate_id, side=side)
+    opened = repository.persist_paper_open_transaction(
+        candidate_id, _preview(), position
+    )
+    assert opened["status"] == "OPENED"
+    service = PaperTradingService(starting_equity=10_000, repository=repository)
+    service.restore()
+    assert service.open_position is not None
+    return repository, service, service.open_position
 
 
 def test_postgres_alembic_upgrade_from_0001_uses_integer_risk_fk() -> None:
@@ -86,6 +130,7 @@ def test_postgres_alembic_upgrade_from_0001_uses_integer_risk_fk() -> None:
         command.upgrade(config, "head")
         command.upgrade(config, "head")  # rerun is a safe no-op
         inspector = inspect(engine)
+        assert "paper_accounts" in inspector.get_table_names()
         columns = {column["name"]: column for column in inspector.get_columns("paper_executions")}
         assert isinstance(columns["risk_decision_id"]["type"], Integer)
         risk_id = {column["name"]: column for column in inspector.get_columns("risk_decisions")}["id"]
@@ -153,3 +198,124 @@ def test_postgres_atomic_failure_rolls_back_risk_and_execution() -> None:
         assert session.scalar(select(PaperExecutionRow).where(
             PaperExecutionRow.candidate_id == candidate_id
         )) is None
+
+
+@pytest.mark.parametrize(
+    "side,exit_price,expected_sign",
+    [
+        (Side.BUY, 110.0, 1),
+        (Side.BUY, 90.0, -1),
+        (Side.SELL, 90.0, 1),
+    ],
+)
+def test_postgres_close_updates_authoritative_paper_equity(
+    side: Side, exit_price: float, expected_sign: int
+) -> None:
+    repository, service, _ = _open_accounting_position(side)
+
+    closed = service.close_position(exit_price, reason="manual_close")
+    pnl = service.pnl()
+
+    assert closed.realized_pnl * expected_sign > 0
+    assert pnl.equity == pytest.approx(10_000 + closed.realized_pnl)
+    assert pnl.equity == pytest.approx(
+        pnl.starting_equity + pnl.realized_pnl + pnl.unrealized_pnl
+    )
+    with Session(repository.engine) as session:
+        account = session.get(PaperAccountRow, 1)
+        stored_position = session.get(PaperPositionRow, str(closed.id))
+        trade = session.get(PaperTradeRow, str(closed.id))
+        candidate = session.get(SignalCandidateRow, str(closed.candidate_id))
+        execution = session.scalar(select(PaperExecutionRow).where(
+            PaperExecutionRow.candidate_id == str(closed.candidate_id)
+        ))
+        assert account is not None
+        assert account.realized_pnl == pytest.approx(closed.realized_pnl)
+        assert account.fees_paid == pytest.approx(closed.fees_paid)
+        assert account.equity == pytest.approx(10_000 + closed.realized_pnl)
+        assert stored_position is not None and stored_position.status == "CLOSED"
+        assert stored_position.payload["close_reason"] == "manual_close"
+        assert trade is not None
+        assert candidate is not None and candidate.state == "PAPER_CLOSED"
+        assert execution is not None and execution.state == "PAPER_CLOSED"
+
+
+def test_postgres_duplicate_close_does_not_double_credit_or_charge() -> None:
+    repository, service, _ = _open_accounting_position(Side.BUY)
+    closed = service.close_position(110.0, reason="manual_close")
+    account_before = repository.load_or_create_paper_account(10_000)
+    assert account_before is not None
+
+    duplicate = repository.persist_paper_close_transaction(closed, 10_000)
+    with pytest.raises(RuntimeError, match="no open paper position"):
+        service.close_position(110.0, reason="manual_close")
+    account_after = repository.load_or_create_paper_account(10_000)
+
+    assert duplicate["status"] == "EXISTING"
+    assert account_after == pytest.approx(account_before)
+    with Session(repository.engine) as session:
+        assert len(session.scalars(select(PaperTradeRow)).all()) == 1
+        account = session.get(PaperAccountRow, 1)
+        assert account is not None
+        assert account.realized_pnl == pytest.approx(closed.realized_pnl)
+        assert account.fees_paid == pytest.approx(closed.fees_paid)
+
+
+def test_postgres_restart_restores_equity_realized_pnl_and_fees() -> None:
+    repository, service, _ = _open_accounting_position(Side.SELL)
+    closed = service.close_position(90.0, reason="take_profit")
+    expected = service.pnl()
+
+    restarted_repository = PersistenceRepository(
+        str(POSTGRES_TEST_URL), create_schema=True
+    )
+    restarted = PaperTradingService(
+        starting_equity=123.0, repository=restarted_repository
+    )
+    restarted.restore()
+    actual = restarted.pnl()
+
+    assert actual.starting_equity == pytest.approx(10_000)
+    assert actual.realized_pnl == pytest.approx(closed.realized_pnl)
+    assert actual.fees_paid == pytest.approx(closed.fees_paid)
+    assert actual.equity == pytest.approx(expected.equity)
+    assert actual.open_positions == 0
+    assert actual.closed_trades == 1
+
+
+def test_postgres_restart_restores_open_unrealized_equity_formula() -> None:
+    repository, service, _ = _open_accounting_position(Side.BUY)
+    market = MarketSnapshot(
+        symbol=Symbol.BTCUSDT,
+        timestamp=datetime.now(timezone.utc),
+        last_price=101.0,
+        bid_price=100.99,
+        ask_price=101.01,
+        price_change_1m_pct=0.1,
+        simple_trend=SimpleTrend.BULLISH,
+        trend_score=1,
+        volatility_pct=0.1,
+        liquidity_ok=True,
+    )
+    service.update_from_market(market)
+    expected = service.pnl()
+    assert expected.open_positions == 1
+    assert expected.equity == pytest.approx(
+        expected.starting_equity + expected.realized_pnl + expected.unrealized_pnl
+    )
+
+    restarted = PaperTradingService(
+        starting_equity=1.0,
+        repository=PersistenceRepository(str(POSTGRES_TEST_URL), create_schema=True),
+    )
+    restarted.restore()
+    actual = restarted.pnl()
+
+    assert actual.starting_equity == pytest.approx(10_000)
+    assert actual.realized_pnl == pytest.approx(0)
+    assert actual.unrealized_pnl == pytest.approx(expected.unrealized_pnl)
+    assert actual.equity == pytest.approx(
+        actual.starting_equity + actual.realized_pnl + actual.unrealized_pnl
+    )
+    assert actual.fees_paid == pytest.approx(expected.fees_paid)
+    assert actual.open_positions == 1

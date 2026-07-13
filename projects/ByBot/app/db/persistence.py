@@ -17,6 +17,7 @@ from app.models import (
     NewsClassification,
     NewsItem,
     PaperPosition,
+    PositionStatus,
     RiskDecision,
     SignalRiskPreview,
     SignalDryRunResult,
@@ -107,6 +108,18 @@ class PaperTradeRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     realized_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class PaperAccountRow(Base):
+    __tablename__ = "paper_accounts"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    starting_equity: Mapped[float] = mapped_column(Float, nullable=False)
+    realized_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    fees_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    equity: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
 
 
 class PaperExecutionRow(Base):
@@ -605,6 +618,154 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
+    def load_or_create_paper_account(
+        self, starting_equity: float
+    ) -> dict[str, float] | None:
+        """Restore and reconcile the singleton paper account from closed trades."""
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session, session.begin():
+                account = self._paper_account_for_update(session, starting_equity)
+                trades = session.scalars(select(PaperTradeRow)).all()
+                realized_pnl = 0.0
+                fees_paid = 0.0
+                for row in trades:
+                    trade = PaperPosition.model_validate(row.payload)
+                    realized_pnl += float(trade.realized_pnl)
+                    fees_paid += float(trade.fees_paid)
+                account.realized_pnl = realized_pnl
+                account.fees_paid = fees_paid
+                account.equity = account.starting_equity + realized_pnl
+                account.updated_at = datetime.now(timezone.utc)
+                session.flush()
+                return _paper_account_payload(account)
+        except (SQLAlchemyError, ValueError) as exc:
+            self._failed(exc) if isinstance(exc, SQLAlchemyError) else self._transaction_error(
+                _database_error_code(exc), exc
+            )
+            return None
+
+    def persist_paper_close_transaction(
+        self,
+        position: PaperPosition,
+        starting_equity: float,
+    ) -> dict[str, Any]:
+        """Atomically close a position and credit its net PnL exactly once."""
+        if not self.available:
+            return {"status": "ERROR", "error_code": "DB_UNAVAILABLE", "retryable": True}
+        session = Session(self.engine)
+        try:
+            with session.begin():
+                position_id = str(position.id)
+                row = session.scalar(
+                    select(PaperPositionRow)
+                    .where(PaperPositionRow.id == position_id)
+                    .with_for_update()
+                )
+                if row is None:
+                    raise ValueError("paper position row is missing")
+
+                account = self._paper_account_for_update(session, starting_equity)
+                existing_trade = session.get(PaperTradeRow, position_id)
+                if row.status == PositionStatus.CLOSED.value or existing_trade is not None:
+                    stored_payload = (
+                        existing_trade.payload if existing_trade is not None else row.payload
+                    )
+                    return {
+                        "status": "EXISTING",
+                        "position": stored_payload,
+                        "account": _paper_account_payload(account),
+                    }
+
+                if position.status != PositionStatus.CLOSED:
+                    raise ValueError("paper position must be CLOSED before persistence")
+
+                payload = position.model_dump(mode="json")
+                row.status = PositionStatus.CLOSED.value
+                row.payload = payload
+                session.add(PaperTradeRow(
+                    id=position_id,
+                    realized_pnl=float(position.realized_pnl),
+                    payload=payload,
+                ))
+
+                candidate_id = str(position.candidate_id) if position.candidate_id else None
+                if candidate_id:
+                    candidate = session.scalar(
+                        select(SignalCandidateRow)
+                        .where(SignalCandidateRow.id == candidate_id)
+                        .with_for_update()
+                    )
+                    if candidate is None:
+                        raise ValueError("signal candidate row is missing")
+                    candidate_payload = dict(candidate.payload)
+                    candidate_payload["state"] = CandidateLifecycleState.PAPER_CLOSED.value
+                    candidate.state = CandidateLifecycleState.PAPER_CLOSED.value
+                    candidate.active = False
+                    candidate.payload = candidate_payload
+
+                    execution = session.scalar(
+                        select(PaperExecutionRow)
+                        .where(PaperExecutionRow.candidate_id == candidate_id)
+                        .with_for_update()
+                    )
+                    if execution is None:
+                        raise ValueError("paper execution row is missing")
+                    execution.state = CandidateLifecycleState.PAPER_CLOSED.value
+                    execution.position_id = position_id
+                    execution.payload = _paper_execution_payload(position)
+                    execution.updated_at = datetime.now(timezone.utc)
+
+                account.realized_pnl += float(position.realized_pnl)
+                account.fees_paid += float(position.fees_paid)
+                account.equity = account.starting_equity + account.realized_pnl
+                account.updated_at = datetime.now(timezone.utc)
+                session.flush()
+                return {
+                    "status": "CLOSED",
+                    "position": payload,
+                    "account": _paper_account_payload(account),
+                }
+        except IntegrityError as exc:
+            session.rollback()
+            return self._transaction_error("DB_INTEGRITY_ERROR", exc)
+        except (SQLAlchemyError, ValueError) as exc:
+            session.rollback()
+            return self._transaction_error(_database_error_code(exc), exc)
+        finally:
+            session.close()
+
+    def _paper_account_for_update(
+        self, session: Session, starting_equity: float
+    ) -> PaperAccountRow:
+        account = session.scalar(
+            select(PaperAccountRow)
+            .where(PaperAccountRow.id == 1)
+            .with_for_update()
+        )
+        if account is not None:
+            return account
+
+        trades = session.scalars(select(PaperTradeRow)).all()
+        realized_pnl = 0.0
+        fees_paid = 0.0
+        for row in trades:
+            trade = PaperPosition.model_validate(row.payload)
+            realized_pnl += float(trade.realized_pnl)
+            fees_paid += float(trade.fees_paid)
+        account = PaperAccountRow(
+            id=1,
+            starting_equity=float(starting_equity),
+            realized_pnl=realized_pnl,
+            fees_paid=fees_paid,
+            equity=float(starting_equity) + realized_pnl,
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add(account)
+        session.flush()
+        return account
+
     def save_paper_position(self, position: PaperPosition) -> None:
         if not self.available:
             return
@@ -662,6 +823,15 @@ def _paper_execution_payload(position: PaperPosition) -> dict[str, Any]:
         "entry_slippage": float(position.estimated_entry_slippage),
         "exit_slippage": float(position.estimated_exit_slippage),
         "close_reason": position.close_reason,
+    }
+
+
+def _paper_account_payload(account: PaperAccountRow) -> dict[str, float]:
+    return {
+        "starting_equity": float(account.starting_equity),
+        "realized_pnl": float(account.realized_pnl),
+        "fees_paid": float(account.fees_paid),
+        "equity": float(account.equity),
     }
 
 

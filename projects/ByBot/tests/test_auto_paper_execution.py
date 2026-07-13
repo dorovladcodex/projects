@@ -143,6 +143,45 @@ def test_buy_sell_net_pnl_costs_and_equity(
     assert service.as_status()["paper_fees_paid"] == pytest.approx(expected_fees)
 
 
+def test_losing_buy_updates_equity_and_duplicate_close_does_not_credit_twice() -> None:
+    service = PaperTradingService(starting_equity=10_000)
+    position = service.open_from_candidate(
+        candidate(Side.BUY), preview(), snapshot(), taker_fee_bps=6, slippage_bps=2
+    )
+    assert position is not None
+
+    closed = service.close_position(90.0, reason="manual_close")
+    equity_after_first_close = service.equity
+    fees_after_first_close = service.fees_paid
+
+    assert closed.realized_pnl < 0
+    assert equity_after_first_close == pytest.approx(10_000 + closed.realized_pnl)
+    with pytest.raises(RuntimeError, match="no open paper position"):
+        service.close_position(90.0, reason="manual_close")
+    assert service.equity == pytest.approx(equity_after_first_close)
+    assert service.fees_paid == pytest.approx(fees_after_first_close)
+    assert len(service.closed_trades) == 1
+
+
+def test_equity_is_starting_plus_realized_and_current_unrealized_pnl() -> None:
+    service = PaperTradingService(starting_equity=10_000)
+    position = service.open_from_candidate(
+        candidate(Side.BUY), preview(), snapshot(), taker_fee_bps=6, slippage_bps=2
+    )
+    assert position is not None
+
+    service.update_from_market(snapshot(101.0))
+    pnl = service.pnl()
+
+    assert pnl.starting_equity == pytest.approx(10_000)
+    assert pnl.realized_pnl == 0
+    assert pnl.unrealized_pnl == pytest.approx(service.open_position.unrealized_pnl)
+    assert pnl.equity == pytest.approx(
+        pnl.starting_equity + pnl.realized_pnl + pnl.unrealized_pnl
+    )
+    assert pnl.total_pnl == pytest.approx(pnl.realized_pnl + pnl.unrealized_pnl)
+
+
 def test_stop_loss_take_profit_and_timeout_monitoring() -> None:
     stop_service = PaperTradingService()
     stopped = stop_service.open_from_candidate(
@@ -253,6 +292,42 @@ def test_automatic_execution_and_restart_are_idempotent(tmp_path) -> None:
     assert len(restarted_paper.positions) == 1
     assert restarted_paper.open_position is not None
     assert restarted_signals.candidates[0].state == CandidateLifecycleState.PAPER_OPENED
+
+    closed = restarted_paper.close_position(
+        restarted_paper.open_position.take_profit + 0.01,
+        reason="take_profit",
+    )
+    restarted_signals.sync_paper_states()
+    expected_equity = 10_000 + closed.realized_pnl
+    assert restarted_paper.equity == pytest.approx(expected_equity)
+
+    duplicate = restarted_repository.persist_paper_close_transaction(closed, 10_000)
+    assert duplicate["status"] == "EXISTING"
+    assert restarted_paper.equity == pytest.approx(expected_equity)
+
+    closed_repository = PersistenceRepository(database_url)
+    closed_paper = PaperTradingService(
+        starting_equity=1.0, repository=closed_repository
+    )
+    closed_paper.restore()
+    closed_news = NewsService(
+        [], classifier(config, FakeRunner([])), max_item_age=timedelta(hours=1),
+        repository=closed_repository,
+    )
+    closed_news.restore()
+    closed_signals = SignalCandidateService(
+        config, closed_news, market, build_account_service(config),
+        closed_paper, closed_repository,
+    )
+    closed_signals.restore()
+
+    assert closed_paper.starting_equity == pytest.approx(10_000)
+    assert closed_paper.realized_pnl == pytest.approx(closed.realized_pnl)
+    assert closed_paper.fees_paid == pytest.approx(closed.fees_paid)
+    assert closed_paper.equity == pytest.approx(expected_equity)
+    assert closed_paper.open_position is None
+    assert len(closed_paper.closed_trades) == 1
+    assert closed_signals.candidates[0].state == CandidateLifecycleState.PAPER_CLOSED
 
 
 def test_auto_disabled_creates_no_reservation_then_first_manual_execution_opens(

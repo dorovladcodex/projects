@@ -195,6 +195,28 @@ def test_paper_close_position_endpoint_moves_open_position_to_trades() -> None:
     pnl = main_module.paper_pnl()
     assert pnl["closed_trades"] == 1
     assert pnl["unrealized_pnl"] == 0
+    assert set(pnl) == {
+        "starting_equity",
+        "equity",
+        "realized_pnl",
+        "unrealized_pnl",
+        "total_pnl",
+        "fees_paid",
+        "open_positions",
+        "closed_trades",
+    }
+    assert pnl["equity"] == pytest.approx(
+        pnl["starting_equity"] + pnl["realized_pnl"] + pnl["unrealized_pnl"]
+    )
+    status = main_module.status()
+    for field in (
+        "paper_starting_equity_usdt",
+        "paper_equity",
+        "paper_realized_pnl",
+        "paper_unrealized_pnl",
+        "paper_fees_paid",
+    ):
+        assert field in status
 
 
 def test_paper_test_signal_blocks_second_position() -> None:
