@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+import json
 from uuid import uuid4
 
 import pytest
@@ -132,24 +133,35 @@ class FakeDemoClient:
     def __init__(self) -> None:
         self.orders = []
         self.cancelled = []
-        self.positions = []
+        self.positions = [
+            {"symbol": symbol, "size": "0", "leverage": "1.00", "positionIdx": 0}
+            for symbol in ("BTCUSDT", "ETHUSDT")
+        ]
         self.open_orders = []
         self.history = []
         self.executions = []
         self.closed_pnl = []
         self.protection_ok = True
+        self.leverage_calls = []
 
     def verify_credentials(self):
         return True
+
+    def get_account_info(self):
+        return {"marginMode": "REGULAR_MARGIN"}
 
     def get_instrument(self, symbol):
         return instrument()
 
     def get_positions(self, symbol=None):
-        return list(self.positions)
+        if symbol is None:
+            return list(self.positions)
+        return [item for item in self.positions if item.get("symbol") == symbol.value]
 
     def get_open_orders(self, symbol=None):
-        return list(self.open_orders)
+        if symbol is None:
+            return list(self.open_orders)
+        return [item for item in self.open_orders if item.get("symbol") == symbol.value]
 
     def get_order_history(self, symbol=None):
         return list(self.history)
@@ -162,6 +174,12 @@ class FakeDemoClient:
 
     def set_leverage(self, symbol, leverage):
         assert leverage == Decimal("1")
+        self.leverage_calls.append((symbol, leverage))
+        for item in self.positions:
+            if item.get("symbol") == symbol.value:
+                item["leverage"] = "1"
+                item["buyLeverage"] = "1"
+                item["sellLeverage"] = "1"
         return {"retCode": 0}
 
     def create_order(self, payload):
@@ -180,6 +198,60 @@ class FakeDemoClient:
             "positionIdx": 0, "takeProfit": str(take_profit),
             "stopLoss": str(stop_loss),
         }]
+        return {"retCode": 0}
+
+
+class LeveragePreparationClient(FakeDemoClient):
+    """Stateful, network-free client for startup leverage preparation tests."""
+
+    def __init__(
+        self,
+        *,
+        leverage: str | dict[Symbol, str] = "1",
+        position_size: str = "0",
+        confirm_change: bool = True,
+    ) -> None:
+        super().__init__()
+        self.current_leverage = (
+            dict(leverage)
+            if isinstance(leverage, dict)
+            else {Symbol.BTCUSDT: leverage, Symbol.ETHUSDT: leverage}
+        )
+        self.position_size = position_size
+        self.confirm_change = confirm_change
+        self.set_leverage_calls: list[tuple[Symbol, Decimal]] = []
+        self.position_queries: list[Symbol | None] = []
+
+    def get_positions(self, symbol=None):
+        self.position_queries.append(symbol)
+        if symbol is None:
+            symbols = [Symbol.BTCUSDT, Symbol.ETHUSDT]
+        else:
+            symbols = [symbol]
+        return [
+            {
+                "symbol": item.value,
+                "side": "",
+                "size": self.position_size,
+                "leverage": self.current_leverage[item],
+                "positionIdx": 0,
+                "tradeMode": 0,
+            }
+            for item in symbols
+        ]
+
+    def get_open_orders(self, symbol=None):
+        if symbol is None:
+            return list(self.open_orders)
+        return [
+            item for item in self.open_orders
+            if item.get("symbol") in {None, symbol.value}
+        ]
+
+    def set_leverage(self, symbol, leverage):
+        self.set_leverage_calls.append((symbol, leverage))
+        if self.confirm_change:
+            self.current_leverage[symbol] = str(leverage)
         return {"retCode": 0}
 
 
@@ -243,11 +315,145 @@ def test_exact_demo_domains_only() -> None:
         )
 
 
+def test_demo_startup_leverage_already_one_is_idempotent() -> None:
+    client = LeveragePreparationClient(leverage="1.00")
+    demo = service(client)
+
+    assert demo.verify_account_and_environment() is True
+
+    assert client.set_leverage_calls == []
+    assert client.orders == []
+    assert demo.symbol_leverage == {
+        "BTCUSDT": {"buy": "1", "sell": "1"},
+        "ETHUSDT": {"buy": "1", "sell": "1"},
+    }
+    assert demo.leverage_normalized is True
+    assert demo.verify_account_and_environment() is True
+    assert client.set_leverage_calls == []
+
+
+def test_demo_startup_normalizes_flat_symbols_to_one() -> None:
+    client = LeveragePreparationClient(
+        leverage={Symbol.BTCUSDT: "10", Symbol.ETHUSDT: "2.00"}
+    )
+
+    assert service(client).verify_account_and_environment() is True
+
+    assert client.set_leverage_calls == [
+        (Symbol.BTCUSDT, Decimal("1")),
+        (Symbol.ETHUSDT, Decimal("1")),
+    ]
+    assert client.current_leverage == {
+        Symbol.BTCUSDT: "1",
+        Symbol.ETHUSDT: "1",
+    }
+    # Successful preflight re-queries both symbols after normalization and
+    # never submits an entry/close order.
+    assert client.position_queries.count(Symbol.BTCUSDT) >= 2
+    assert client.position_queries.count(Symbol.ETHUSDT) >= 2
+    assert client.orders == []
+
+
+def test_demo_set_leverage_sends_both_buy_and_sell_values() -> None:
+    requests: list[tuple[str, str, dict[str, str]]] = []
+
+    def fake_http(method, url, headers, body, timeout):
+        del headers, timeout
+        requests.append((method, url, json.loads(body.decode("utf-8"))))
+        return {"retCode": 0, "result": {}}
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+    client.set_leverage(Symbol.BTCUSDT, Decimal("1.00"))
+
+    method, url, payload = requests[0]
+    assert method == "POST"
+    assert url == f"{DEMO_REST_URL}/v5/position/set-leverage"
+    assert payload["buyLeverage"] == "1"
+    assert payload["sellLeverage"] == "1"
+    assert payload["symbol"] == "BTCUSDT"
+
+
+def test_demo_startup_does_not_change_leverage_with_open_position() -> None:
+    client = LeveragePreparationClient(leverage="10", position_size="0.01")
+
+    with pytest.raises(DemoSafetyError, match="position"):
+        service(client).verify_account_and_environment()
+
+    assert client.set_leverage_calls == []
+    assert client.orders == []
+
+
+def test_demo_startup_does_not_change_leverage_with_open_order() -> None:
+    client = LeveragePreparationClient(leverage="10")
+    client.open_orders = [{
+        "symbol": "BTCUSDT", "orderId": "existing", "orderStatus": "New"
+    }]
+
+    with pytest.raises(DemoSafetyError, match="order"):
+        service(client).verify_account_and_environment()
+
+    assert client.set_leverage_calls == []
+    assert client.orders == []
+
+
+def test_demo_startup_fails_when_one_leverage_cannot_be_confirmed() -> None:
+    client = LeveragePreparationClient(leverage="10", confirm_change=False)
+
+    with pytest.raises(DemoSafetyError, match="leverage"):
+        service(client).verify_account_and_environment()
+
+    assert client.set_leverage_calls == [(Symbol.BTCUSDT, Decimal("1"))]
+    assert client.orders == []
+
+
+@pytest.mark.parametrize(
+    ("base_url", "private_ws_url"),
+    [
+        ("https://api.bybit.com", "wss://stream.bybit.com"),
+        ("https://api-testnet.bybit.com", "wss://stream-testnet.bybit.com"),
+    ],
+)
+def test_demo_startup_rejects_non_demo_client_domains(
+    base_url: str, private_ws_url: str
+) -> None:
+    client = LeveragePreparationClient(leverage="10")
+    client.base_url = base_url
+    client.private_ws_url = private_ws_url
+
+    with pytest.raises(DemoSafetyError, match="domain"):
+        service(client).verify_account_and_environment()
+
+    assert client.set_leverage_calls == []
+    assert client.orders == []
+
+
 def test_test_mode_and_live_configuration_are_rejected() -> None:
     with pytest.raises(ValidationError):
         demo_settings(test_mode=True)
     with pytest.raises(ValidationError):
         demo_settings(bybit_live_trading_enabled=True)
+
+
+def test_demo_preflight_requires_both_leverage_sides_confirmed() -> None:
+    class OneSidedClient(FakeDemoClient):
+        def set_leverage(self, symbol, leverage):
+            self.leverage_calls.append((symbol, leverage))
+            for item in self.positions:
+                if item.get("symbol") == symbol.value:
+                    item["buyLeverage"] = "1"
+                    item["sellLeverage"] = "10"
+            return {"retCode": 0}
+
+    client = OneSidedClient()
+    client.positions[0].update({
+        "leverage": "10", "buyLeverage": "10", "sellLeverage": "10"
+    })
+    demo = service(client)
+    with pytest.raises(DemoSafetyError, match="could not be confirmed as 1x"):
+        demo.verify_account_and_environment()
+    assert client.orders == []
 
 
 def test_decimal_instrument_normalization() -> None:

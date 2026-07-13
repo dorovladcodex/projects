@@ -16,6 +16,19 @@ function Assert-Condition {
     if (-not $Condition) { throw $Message }
 }
 
+function Test-LeverageIsOne {
+    param($Value)
+    if ($null -eq $Value) { return $false }
+    [decimal]$parsed = 0
+    $ok = [decimal]::TryParse(
+        [string]$Value,
+        [Globalization.NumberStyles]::Number,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$parsed
+    )
+    return $ok -and $parsed -eq [decimal]1
+}
+
 function Protect-Text {
     param([string]$Text)
     if (-not $Text) { return $Text }
@@ -101,6 +114,53 @@ function Stop-Uvicorn {
     }
 }
 
+function Safe-ReadTextFile {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return "" }
+    try {
+        $stream = New-Object IO.FileStream(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite
+        )
+        try {
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true)
+            try { return $reader.ReadToEnd() }
+            finally { $reader.Dispose() }
+        }
+        finally { $stream.Dispose() }
+    }
+    catch {
+        return ""
+    }
+}
+
+function Get-SanitizedStderrTail {
+    param([string]$Path, [int]$LineCount = 25)
+    $text = Safe-ReadTextFile -Path $Path
+    if (-not $text) { return "(no stderr output captured)" }
+    $lines = @($text -split "`r?`n" | Where-Object { $_.Trim() })
+    if ($lines.Count -gt $LineCount) {
+        $lines = @($lines[($lines.Count - $LineCount)..($lines.Count - 1)])
+    }
+    return Protect-Text ($lines -join [Environment]::NewLine)
+}
+
+function New-UvicornStartupFailure {
+    param([string]$Reason, [Nullable[int]]$ExitCode)
+    $exitText = if ($null -eq $ExitCode) { "not available" } else { [string]$ExitCode }
+    $reportText = if ($script:ReportPath) { $script:ReportPath } else { "not created" }
+    $stderrTail = Get-SanitizedStderrTail -Path $script:StderrPath
+    return @(
+        $Reason,
+        "FastAPI exit code: $exitText",
+        "Last relevant sanitized stderr lines:",
+        $stderrTail,
+        "Report path: $reportText"
+    ) -join [Environment]::NewLine
+}
+
 function Start-Uvicorn {
     param([string]$Python, [int]$Port, [string]$Stdout, [string]$Stderr)
     $script:Child = Start-Process -FilePath $Python -ArgumentList @(
@@ -128,7 +188,10 @@ function Wait-ForApi {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($script:Child -and $script:Child.HasExited) {
-            throw "FastAPI exited during startup with code $($script:Child.ExitCode)"
+            $script:Child.WaitForExit()
+            $exitCode = [int]$script:Child.ExitCode
+            throw (New-UvicornStartupFailure `
+                -Reason "FastAPI exited during startup" -ExitCode $exitCode)
         }
         try {
             $health = Invoke-Api -Path "/health" -TimeoutSec 3
@@ -136,7 +199,9 @@ function Wait-ForApi {
         }
         catch { Start-Sleep -Seconds 1 }
     }
-    throw "FastAPI did not become healthy"
+    throw (New-UvicornStartupFailure `
+        -Reason "FastAPI did not become healthy before the startup timeout" `
+        -ExitCode $null)
 }
 
 function Assert-DemoPreflight {
@@ -147,6 +212,25 @@ function Assert-DemoPreflight {
     Assert-Condition ($demo.private_ws_domain -eq "wss://stream-demo.bybit.com") "Unexpected private WebSocket domain"
     Assert-Condition ($demo.account_verified -eq $true) "Demo account is not verified"
     Assert-Condition ($demo.leverage -eq 1) "Demo leverage is not exactly 1"
+    Assert-Condition ($null -ne $demo.PSObject.Properties["symbol_leverage"]) `
+        "Demo per-symbol leverage status is missing"
+    Assert-Condition ($null -ne $demo.symbol_leverage.PSObject.Properties["BTCUSDT"]) `
+        "BTCUSDT leverage status is missing"
+    Assert-Condition ($null -ne $demo.symbol_leverage.PSObject.Properties["ETHUSDT"]) `
+        "ETHUSDT leverage status is missing"
+    Assert-Condition (Test-LeverageIsOne $demo.symbol_leverage.BTCUSDT.buy) `
+        "BTCUSDT buy leverage is not exactly 1"
+    Assert-Condition (Test-LeverageIsOne $demo.symbol_leverage.BTCUSDT.sell) `
+        "BTCUSDT sell leverage is not exactly 1"
+    Assert-Condition (Test-LeverageIsOne $demo.symbol_leverage.ETHUSDT.buy) `
+        "ETHUSDT buy leverage is not exactly 1"
+    Assert-Condition (Test-LeverageIsOne $demo.symbol_leverage.ETHUSDT.sell) `
+        "ETHUSDT sell leverage is not exactly 1"
+    Assert-Condition ($demo.leverage_normalized -eq $true) `
+        "Demo leverage normalization was not confirmed"
+    Write-Host "DEMO LEVERAGE BTCUSDT: 1x PASS"
+    Write-Host "DEMO LEVERAGE ETHUSDT: 1x PASS"
+    Write-Host "DEMO LEVERAGE NORMALIZATION: PASS"
     $status = Invoke-Api -Path "/status"
     Assert-Condition ($status.execution_mode -eq "BYBIT_DEMO") "Wrong execution mode"
     Assert-Condition ($status.live_order_placement_blocked -eq $true) "Live execution is not blocked"
@@ -209,6 +293,8 @@ try {
     $reportPath = Join-Path $artifactDir "report.md"
     $stdoutPath = Join-Path $artifactDir "uvicorn.stdout.log"
     $stderrPath = Join-Path $artifactDir "uvicorn.stderr.log"
+    $script:ReportPath = $reportPath
+    $script:StderrPath = $stderrPath
 
     Set-IsolatedEnvironment "APP_ENV" "demo"
     Set-IsolatedEnvironment "TEST_MODE" "false"

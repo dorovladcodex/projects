@@ -62,6 +62,7 @@ class DemoExchangeClient(Protocol):
     private_ws_url: str
 
     def verify_credentials(self) -> bool: ...
+    def get_account_info(self) -> dict[str, Any]: ...
     def get_instrument(self, symbol: Symbol) -> InstrumentRules: ...
     def get_positions(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
     def get_open_orders(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
@@ -150,6 +151,28 @@ def parse_instrument(payload: dict[str, Any], symbol: Symbol) -> InstrumentRules
     )
 
 
+def _position_leverages(
+    positions: list[dict[str, Any]], symbol: Symbol
+) -> tuple[Decimal, Decimal]:
+    rows = [
+        item for item in positions
+        if not item.get("symbol") or str(item.get("symbol")) == symbol.value
+    ]
+    if not rows:
+        raise DemoSafetyError(f"{symbol.value} leverage data is unavailable")
+    for item in rows:
+        if int(item.get("positionIdx") or 0) != 0:
+            raise DemoSafetyError("hedge position mode is not supported")
+    # Unified one-way mode normally returns one leverage value applying to both
+    # sides. Explicit side-specific values are supported for deterministic tests
+    # and future API response variants.
+    row = rows[0]
+    common = row.get("leverage")
+    buy = _decimal(row.get("buyLeverage", common), default="0")
+    sell = _decimal(row.get("sellLeverage", common), default="0")
+    return buy, sell
+
+
 class BybitDemoRestClient:
     """A Demo-only V5 adapter. Construction fails for every non-Demo domain."""
 
@@ -183,6 +206,11 @@ class BybitDemoRestClient:
             {"accountType": "UNIFIED", "coin": "USDT"},
         )
         return True
+
+    def get_account_info(self) -> dict[str, Any]:
+        data = self._request("GET", "/v5/account/info", {})
+        result = data.get("result")
+        return result if isinstance(result, dict) else {}
 
     def get_instrument(self, symbol: Symbol) -> InstrumentRules:
         data = self._request(
@@ -366,6 +394,9 @@ class DemoExecutionService:
         self.bot_owned_open_orders = 0
         self.bot_owned_open_positions = 0
         self.account_verified = False
+        self.symbol_leverage: dict[str, dict[str, str]] = {}
+        self.leverage_normalized = False
+        self.account_margin_mode: str | None = None
         self.last_reconciliation_at: datetime | None = None
         if self.enabled:
             require_demo_execution(settings)
@@ -384,11 +415,21 @@ class DemoExecutionService:
     def verify_account_and_environment(self) -> bool:
         if not self.enabled or self.client is None:
             return False
+        self.leverage_normalized = False
+        self.symbol_leverage = {}
         require_demo_execution(self.settings)
         validate_demo_domains(self.client.base_url, self.client.private_ws_url)
         self.account_verified = self.client.verify_credentials()
         if not self.account_verified:
             raise DemoSafetyError("Demo API credentials could not be verified")
+        account_info_loader = getattr(self.client, "get_account_info", None)
+        if callable(account_info_loader):
+            account_info = account_info_loader()
+            self.account_margin_mode = _sanitized_margin_mode(
+                account_info.get("marginMode")
+                or account_info.get("unifiedMarginStatus")
+                or "unknown"
+            )
         local = self.repository.load_demo_executions()
         active_local_symbols = {
             item.symbol.value for item in local
@@ -400,18 +441,72 @@ class DemoExecutionService:
         for symbol_value in self.settings.allowed_symbols:
             symbol = Symbol(symbol_value)
             self.client.get_instrument(symbol)
-            for position in self.client.get_positions(symbol):
-                if _decimal(position.get("leverage"), default="1") != Decimal("1"):
-                    raise DemoSafetyError(f"{symbol.value} leverage is not exactly 1")
+            positions = self.client.get_positions(symbol)
+            for position in positions:
                 if int(position.get("positionIdx") or 0) != 0:
                     raise DemoSafetyError("hedge position mode is not supported")
+            self._ensure_symbol_leverage(symbol, positions=positions)
+            for position in positions:
                 if (
                     _decimal(position.get("size"), default="0") > 0
                     and symbol.value not in active_local_symbols
                 ):
                     self._activate_kill_switch("unattributed remote Demo position")
                     raise DemoSafetyError("unrelated open Demo position conflicts with preflight")
+        self.leverage_normalized = True
         return self.account_verified
+
+    def _ensure_symbol_leverage(
+        self,
+        symbol: Symbol,
+        *,
+        positions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Confirm 1x on both sides, normalizing only a completely flat Demo symbol."""
+        if self.client is None:
+            raise DemoSafetyError("Demo client unavailable")
+        require_demo_execution(self.settings)
+        validate_demo_domains(self.client.base_url, self.client.private_ws_url)
+        current_positions = (
+            positions if positions is not None else self.client.get_positions(symbol)
+        )
+        buy_leverage, sell_leverage = _position_leverages(current_positions, symbol)
+        self.symbol_leverage[symbol.value] = {
+            "buy": _format_decimal(buy_leverage),
+            "sell": _format_decimal(sell_leverage),
+        }
+        if buy_leverage == Decimal("1") and sell_leverage == Decimal("1"):
+            return
+        if any(_decimal(item.get("size"), default="0") > 0 for item in current_positions):
+            raise DemoSafetyError(
+                f"{symbol.value} leverage is not 1x and an open position prevents normalization"
+            )
+        if self.client.get_open_orders(symbol):
+            raise DemoSafetyError(
+                f"{symbol.value} leverage is not 1x and active orders prevent normalization"
+            )
+        try:
+            self.client.set_leverage(symbol, Decimal("1"))
+            confirmed_positions = self.client.get_positions(symbol)
+            confirmed_buy, confirmed_sell = _position_leverages(confirmed_positions, symbol)
+        except Exception as exc:
+            mode = self.account_margin_mode or "unknown"
+            raise DemoSafetyError(
+                f"{symbol.value} leverage normalization failed "
+                f"(buy={_format_decimal(buy_leverage)}, "
+                f"sell={_format_decimal(sell_leverage)}, margin_mode={mode})"
+            ) from exc
+        self.symbol_leverage[symbol.value] = {
+            "buy": _format_decimal(confirmed_buy),
+            "sell": _format_decimal(confirmed_sell),
+        }
+        if confirmed_buy != Decimal("1") or confirmed_sell != Decimal("1"):
+            mode = self.account_margin_mode or "unknown"
+            raise DemoSafetyError(
+                f"{symbol.value} leverage could not be confirmed as 1x "
+                f"(buy={_format_decimal(confirmed_buy)}, "
+                f"sell={_format_decimal(confirmed_sell)}, margin_mode={mode})"
+            )
 
     def submit_candidate(
         self,
@@ -451,7 +546,7 @@ class DemoExecutionService:
         ))
         validate_order_notional(quantity, entry_reference, rules)
         self._validate_remote_entry_state(candidate.symbol)
-        self.client.set_leverage(candidate.symbol, Decimal("1"))
+        self._ensure_symbol_leverage(candidate.symbol)
         self._verify_leverage_and_mode(candidate.symbol)
         side = Side.BUY if candidate.final_action == NewsSignalAction.BUY else Side.SELL
         order_link_id = deterministic_order_link_id(
@@ -735,6 +830,9 @@ class DemoExecutionService:
             "account_verified": self.account_verified,
             "risk_capital_usdt": str(self.settings.demo_risk_capital_usdt),
             "leverage": self.settings.demo_leverage,
+            "symbol_leverage": dict(self.symbol_leverage),
+            "leverage_normalized": self.leverage_normalized,
+            "account_margin_mode": self.account_margin_mode,
             "run_id": self.run_id,
             "order_link_prefix": self.order_prefix,
             "last_reconciliation_at": (
@@ -1113,6 +1211,15 @@ def _decimal(value: object, *, default: str | None = None) -> Decimal:
 
 def _format_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _sanitized_margin_mode(value: object) -> str:
+    text = str(value or "unknown")[:64]
+    sanitized = "".join(
+        character if character.isalnum() or character in {"_", "-"} else "_"
+        for character in text
+    )
+    return sanitized or "unknown"
 
 
 def _timestamp(value: object) -> datetime:
