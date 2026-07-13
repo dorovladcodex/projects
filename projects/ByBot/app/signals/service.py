@@ -32,6 +32,7 @@ from app.news.service import NewsService
 from app.news.eligibility import calculate_trade_eligibility
 from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
+from app.db.persistence import PersistenceRepository
 
 
 class SignalCandidateService:
@@ -44,12 +45,14 @@ class SignalCandidateService:
         market_data: MarketDataService,
         account_service: BybitAccountService,
         paper_trading: PaperTradingService,
+        repository: PersistenceRepository | None = None,
     ) -> None:
         self.settings = settings
         self.news_service = news_service
         self.market_data = market_data
         self.account_service = account_service
         self.paper_trading = paper_trading
+        self.repository = repository
         self.processed_news_ids: set[UUID] = set()
         self.results: list[SignalDryRunResult] = []
         self.risk_preview_approved_count = 0
@@ -57,6 +60,25 @@ class SignalCandidateService:
         self.last_signal_evaluation_at: datetime | None = None
         self._registry_lock = RLock()
         self._candidate_locks: dict[UUID, RLock] = {}
+
+    def restore(self, *, now: datetime | None = None) -> None:
+        if not self.repository or not self.repository.available:
+            return
+        now = now or datetime.now(timezone.utc)
+        self.results = self.repository.load_signal_results()
+        self.processed_news_ids = {result.candidate.news_id for result in self.results}
+        for result in self.results:
+            self._candidate_locks[result.candidate.id] = RLock()
+            if (
+                result.candidate.state == CandidateLifecycleState.PENDING_CONFIRMATION
+                and now >= result.candidate.expires_at
+            ):
+                result.candidate.state = CandidateLifecycleState.EXPIRED
+                result.candidate.final_action = NewsSignalAction.NO_TRADE
+                result.candidate.reasons = [
+                    "market confirmation was not received before signal expiry"
+                ]
+                self.repository.save_signal_result(result)
 
     @property
     def candidates(self) -> list[NewsSignalCandidate]:
@@ -132,6 +154,9 @@ class SignalCandidateService:
                 self._candidate_locks[result.candidate.id] = RLock()
             self.results.extend(new_results)
             self.processed_news_ids.add(news_id)
+            if self.repository:
+                for result in new_results:
+                    self.repository.save_signal_result(result)
             return new_results
 
     def reevaluate_pending(self, *, now: datetime | None = None) -> list[SignalDryRunResult]:
@@ -288,6 +313,8 @@ class SignalCandidateService:
             candidate=candidate,
             risk_preview=_preview_not_performed(),
         )
+        if self.repository:
+            self.repository.save_signal_result(result)
         self._evaluate(result, news, classification, now)
         return result
 
@@ -383,6 +410,8 @@ class SignalCandidateService:
                     self.risk_preview_blocked_count += 1
         else:
             result.risk_preview = _preview_not_performed()
+        if self.repository:
+            self.repository.save_signal_result(result)
 
     def _structural_block_reasons(
         self,
@@ -545,10 +574,10 @@ class SignalCandidateService:
             take_profit_pct=candidate.proposed_take_profit_pct,
             reasons=list(candidate.reasons),
         )
-        account = self.account_service.status
+        paper_equity = self.paper_trading.equity
         context = RiskContext(
-            equity=account.equity or self.settings.paper_starting_equity,
-            available_balance=account.available_balance,
+            equity=paper_equity,
+            available_balance=paper_equity,
             requested_risk_pct=self.settings.max_risk_per_trade_pct,
             leverage=self.settings.max_leverage,
             open_positions=1 if self.paper_trading.open_position else 0,
@@ -558,6 +587,8 @@ class SignalCandidateService:
             api_stable=self.market_data.status == "OK",
         )
         decision = RiskManager(_risk_rules(self.settings)).assess(signal, snapshot, context)
+        if self.repository:
+            self.repository.save_risk_decision(str(candidate.id), decision)
         return SignalRiskPreview(
             preview_performed=True,
             approved=decision.approved,

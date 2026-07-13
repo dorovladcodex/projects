@@ -3,8 +3,10 @@ from __future__ import annotations
 from enum import Enum
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.db.url import normalize_database_url
 
 
 class BotMode(str, Enum):
@@ -41,7 +43,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     bot_mode: BotMode = BotMode.PAPER
     log_level: str = "INFO"
-    database_url: str = "postgresql://bybot:bybot@localhost:5432/bybot"
+    database_url: str = "postgresql+psycopg://bybot:bybot@localhost:5432/bybot"
 
     bybit_api_key: str | None = None
     bybit_api_secret: str | None = None
@@ -81,6 +83,7 @@ class Settings(BaseSettings):
     codex_cli_fallback_model: str = "gpt-5.6-luna"
     codex_cli_reasoning_effort: str = "low"
     codex_cli_fallback_min_confidence: float = Field(default=0.75, ge=0, le=1)
+    codex_cli_min_news_importance: float = Field(default=0.7, ge=0, le=1)
 
     news_poll_interval_seconds: int = Field(default=60, ge=10, le=3600)
     news_max_item_age_minutes: int = Field(default=60, ge=1, le=1440)
@@ -106,7 +109,21 @@ class Settings(BaseSettings):
     market_data_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     market_data_history_limit: int = Field(default=120, ge=2, le=2000)
     trading_paused: bool = False
-    paper_starting_equity: float = Field(default=10_000.0, gt=0)
+    paper_starting_equity_usdt: float = Field(
+        default=10_000.0,
+        gt=0,
+        validation_alias=AliasChoices(
+            "PAPER_STARTING_EQUITY_USDT",
+            "PAPER_STARTING_EQUITY",
+            "paper_starting_equity_usdt",
+            "paper_starting_equity",
+        ),
+    )
+
+    @property
+    def paper_starting_equity(self) -> float:
+        """Backward-compatible alias; paper equity never comes from Bybit."""
+        return self.paper_starting_equity_usdt
     paper_daily_pnl_pct: float = 0.0
     paper_weekly_pnl_pct: float = 0.0
     paper_consecutive_losses: int = Field(default=0, ge=0)
@@ -132,6 +149,11 @@ class Settings(BaseSettings):
         if isinstance(value, str) and value.upper() == "LIVE":
             raise ValueError("Live trading is blocked in v1")
         return value.upper() if isinstance(value, str) else value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def select_psycopg_v3_driver(cls, value: object) -> object:
+        return normalize_database_url(value) if isinstance(value, str) else value
 
     @field_validator("market_data_provider", mode="before")
     @classmethod

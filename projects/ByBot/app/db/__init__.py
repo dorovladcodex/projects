@@ -1,1 +1,5 @@
-"""Database record contracts; persistence adapters arrive in Phase 2."""
+"""Durable pipeline persistence."""
+
+from app.db.persistence import PersistenceRepository
+
+__all__ = ["PersistenceRepository"]

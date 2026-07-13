@@ -6,6 +6,8 @@ import re
 
 from app.models import Asset, NewsClassification, NewsFilterDebug, NewsItem
 from app.news.classifier import BaseNewsClassifier
+from app.news.classifier import MockNewsClassifier
+from app.db.persistence import PersistenceRepository
 from app.news.keywords import KeywordMatcher
 from app.news.eligibility import apply_trade_eligibility
 from app.news.sources import BaseNewsSource
@@ -37,12 +39,20 @@ class NewsService:
         max_item_age: timedelta,
         min_importance_to_classify: float = 0.3,
         min_classification_confidence: float = 0.8,
+        codex_min_news_importance: float = 0.7,
+        classifier_version: str = "news-v1",
+        classifier_cache_ttl: timedelta = timedelta(hours=1),
+        repository: PersistenceRepository | None = None,
     ) -> None:
         self.sources = sources
         self.classifier = classifier
         self.max_item_age = max_item_age
         self.min_importance_to_classify = min_importance_to_classify
         self.min_classification_confidence = min_classification_confidence
+        self.codex_min_news_importance = codex_min_news_importance
+        self.classifier_version = classifier_version
+        self.classifier_cache_ttl = classifier_cache_ttl
+        self.repository = repository
         self.items: list[NewsItem] = []
         self.filtered_items: list[NewsItem] = []
         self.classifications: list[NewsClassification] = []
@@ -63,6 +73,33 @@ class NewsService:
         self.estimated_output_tokens = 0
         self.last_error: str | None = None
         self.last_polled_at: datetime | None = None
+        self.news_duplicates_skipped = 0
+        self.news_skipped_before_codex_count = 0
+        self.classifications_trade_eligible = 0
+        self._deterministic_classifier = MockNewsClassifier(
+            minimum_confidence=min_classification_confidence
+        )
+
+    def restore(self) -> None:
+        if not self.repository or not self.repository.available:
+            return
+        items, classifications = self.repository.load_news()
+        self.items = items
+        self.filtered_items = list(items)
+        self.classifications = classifications
+        self._title_hashes = {normalized_title_hash(item.title) for item in items}
+        self._source_title_hashes = {
+            source_title_hash_for(item.source, item.title) for item in items
+        }
+        self.last_news_item = items[-1] if items else None
+        self.last_filtered_news_item = items[-1] if items else None
+        self.last_news_classification = classifications[-1] if classifications else None
+        self.items_seen_count = len(items)
+        self.items_filtered_count = len(items)
+        self.items_classified_count = len(classifications)
+        self.classifications_trade_eligible = sum(
+            item.trade_eligible for item in classifications
+        )
 
     @property
     def status(self) -> str:
@@ -107,6 +144,10 @@ class NewsService:
             return accepted, code, classification
 
         if title_hash in self._title_hashes or source_title_hash in self._source_title_hashes:
+            self.news_duplicates_skipped += 1
+            return finish(False, "duplicate")
+        if self.repository and self.repository.available and not self.repository.save_news(normalized):
+            self.news_duplicates_skipped += 1
             return finish(False, "duplicate")
         self._title_hashes.add(title_hash)
         self._source_title_hashes.add(source_title_hash)
@@ -125,9 +166,28 @@ class NewsService:
         self.items_filtered_count += 1
         if self.classifier is None:
             return finish(True, "accepted")
+        classifier_mode = getattr(self.classifier, "mode", "mock")
+        classification: NewsClassification | None = None
+        if classifier_mode == "codex_cli":
+            if normalized.importance < self.codex_min_news_importance:
+                self.news_skipped_before_codex_count += 1
+                return finish(True, "accepted")
+            if self.repository:
+                classification = self.repository.cached_classification(
+                    normalized, self.classifier_version, now
+                )
+                if classification is not None:
+                    record_hit = getattr(self.classifier, "record_external_cache_hit", None)
+                    if callable(record_hit):
+                        record_hit()
+            if classification is None:
+                deterministic = self._deterministic_classifier.classify(normalized)
+                if deterministic.trade_eligible and deterministic.confidence >= 0.85:
+                    classification = deterministic
+                    self.news_skipped_before_codex_count += 1
+        classification = classification or self.classifier.classify(normalized)
         classification = apply_trade_eligibility(
-            self.classifier.classify(normalized),
-            minimum_confidence=self.min_classification_confidence,
+            classification, minimum_confidence=self.min_classification_confidence,
         )
         self.classifications.append(classification)
         self.last_news_classification = classification
@@ -142,6 +202,13 @@ class NewsService:
         )
         self.estimated_input_tokens += classification.estimated_input_tokens
         self.estimated_output_tokens += classification.estimated_output_tokens
+        if classification.trade_eligible:
+            self.classifications_trade_eligible += 1
+        if self.repository:
+            self.repository.save_classification(
+                normalized, classification, self.classifier_version,
+                now + self.classifier_cache_ttl,
+            )
         return finish(True, "accepted", classification)
 
     def as_payload(self) -> dict[str, object]:
@@ -151,6 +218,11 @@ class NewsService:
             "last_polled_at": self.last_polled_at.isoformat() if self.last_polled_at else None,
             "items": [item.model_dump(mode="json") for item in self.items],
             "items_seen_count": self.items_seen_count,
+            "rss_items_seen": self.items_seen_count,
+            "rss_items_accepted": self.items_filtered_count,
+            "news_duplicates_skipped": self.news_duplicates_skipped,
+            "news_skipped_before_codex_count": self.news_skipped_before_codex_count,
+            "classifications_trade_eligible": self.classifications_trade_eligible,
         }
 
     def filter_debug_payload(self) -> list[dict[str, object]]:

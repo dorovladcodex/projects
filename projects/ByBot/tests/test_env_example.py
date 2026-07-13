@@ -55,6 +55,7 @@ def test_env_example_contains_required_phase_1_variables() -> None:
         "CODEX_CLI_FALLBACK_MODEL",
         "CODEX_CLI_REASONING_EFFORT",
         "CODEX_CLI_FALLBACK_MIN_CONFIDENCE",
+        "CODEX_CLI_MIN_NEWS_IMPORTANCE",
         "NEWS_POLL_INTERVAL_SECONDS",
         "NEWS_MAX_ITEM_AGE_MINUTES",
         "NEWS_MIN_IMPORTANCE_TO_CLASSIFY",
@@ -77,7 +78,7 @@ def test_env_example_contains_required_phase_1_variables() -> None:
         "MARKET_DATA_TIMEOUT_SECONDS",
         "MARKET_DATA_HISTORY_LIMIT",
         "TRADING_PAUSED",
-        "PAPER_STARTING_EQUITY",
+        "PAPER_STARTING_EQUITY_USDT",
         "PAPER_DAILY_PNL_PCT",
         "PAPER_WEEKLY_PNL_PCT",
         "PAPER_CONSECUTIVE_LOSSES",
@@ -100,4 +101,5 @@ def test_env_example_contains_required_phase_1_variables() -> None:
 
     assert required <= set(keys)
     assert keys["BOT_MODE"] != "LIVE"
+    assert keys["DATABASE_URL"].startswith("postgresql+psycopg://")
     assert all(keys[key] for key in required)

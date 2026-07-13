@@ -32,7 +32,7 @@ orders. Adding credentials or deploying to GCP must never change this boundary.
 | `app/strategy/` | Deterministic `NewsMomentumStrategy` and market filters |
 | `app/risk/` | Position, loss, leverage, spread, confidence, and stability limits |
 | `app/portfolio/` | Paper execution and later position lifecycle management |
-| `app/db/` | Persistence contracts and, later, PostgreSQL repositories |
+| `app/db/` | SQLAlchemy PostgreSQL repository, idempotency, and restart recovery |
 | `app/dashboard/` | Read-only operational visibility |
 | `app/alerts/` | Telegram notifications, never trade authorization |
 | `app/analytics/` | PnL, skipped-trade, and decision-quality analysis |
@@ -51,7 +51,8 @@ orders. Adding credentials or deploying to GCP must never change this boundary.
 8. Record the input, decision, execution result, and errors.
 
 No component may skip steps 4-6. In v1, the only implemented execution engine
-is in-memory paper execution.
+is paper-only execution. Pipeline state and paper state are durable in PostgreSQL;
+the execution safety boundary remains unchanged.
 
 ## Planned phases
 

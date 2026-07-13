@@ -62,8 +62,40 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The API is exposed on port 8000 and PostgreSQL on port 5432. Current code does not
-yet persist data; the database service is prepared for the next phase.
+The API is exposed on port 8000 and PostgreSQL on port 5432. Pipeline state is
+persisted in PostgreSQL. Apply migrations before starting the API outside Compose:
+
+```powershell
+$env:DATABASE_URL="postgresql+psycopg://bybot:bybot@localhost:5432/bybot"
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+For normal RSS-to-Codex dry-run processing, keep these safety settings in `.env`:
+
+```powershell
+NEWS_CLASSIFIER_MODE=codex_cli
+CODEX_CLI_ENABLED=true
+CODEX_CLI_MIN_NEWS_IMPORTANCE=0.70
+PAPER_STARTING_EQUITY_USDT=10000
+AUTO_PAPER_EXECUTION=false
+BYBIT_ENABLE_TRADING=false
+```
+
+Paper sizing and PnL use `PAPER_STARTING_EQUITY_USDT`; Bybit demo equity is
+read-only context and never funds the paper account.
+
+### PostgreSQL end-to-end smoke test
+
+With Docker Desktop running, the local virtual environment prepared, and Codex
+CLI authenticated, run this single command from the project root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\postgres_e2e_smoke.ps1
+```
+
+The script starts only PostgreSQL in Docker and runs FastAPI locally. It leaves
+PostgreSQL running, stops its local uvicorn process, and never enables paper or
+exchange execution.
 
 ## Market data
 

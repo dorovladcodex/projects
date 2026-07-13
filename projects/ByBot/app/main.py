@@ -34,12 +34,16 @@ from app.portfolio.paper_trading import PaperTradingService
 from app.risk import RiskManager, RiskRules
 from app.runtime import build_status
 from app.signals import SignalCandidateService
+from app.db import PersistenceRepository
 
 settings = get_settings()
+persistence = PersistenceRepository(settings.database_url, create_schema=False)
 market_data_service = build_market_data_service(settings)
 account_service = build_account_service(settings)
 paper_trading_service = PaperTradingService(
-    timeout=timedelta(minutes=settings.paper_position_timeout_minutes)
+    timeout=timedelta(minutes=settings.paper_position_timeout_minutes),
+    starting_equity=settings.paper_starting_equity_usdt,
+    repository=persistence,
 )
 news_service = NewsService(
     [RSSNewsSource(url) for url in settings.news_rss_urls] if settings.news_enable_rss else [],
@@ -47,6 +51,10 @@ news_service = NewsService(
     max_item_age=timedelta(minutes=settings.news_max_item_age_minutes),
     min_importance_to_classify=settings.news_min_importance_to_classify,
     min_classification_confidence=settings.signal_min_classification_confidence,
+    codex_min_news_importance=settings.codex_cli_min_news_importance,
+    classifier_version=settings.llm_classifier_version,
+    classifier_cache_ttl=timedelta(seconds=settings.llm_cache_ttl_seconds),
+    repository=persistence,
 )
 signal_candidate_service = SignalCandidateService(
     settings,
@@ -54,7 +62,11 @@ signal_candidate_service = SignalCandidateService(
     market_data_service,
     account_service,
     paper_trading_service,
+    persistence,
 )
+news_service.restore()
+paper_trading_service.restore()
+signal_candidate_service.restore()
 
 
 @asynccontextmanager
@@ -381,10 +393,10 @@ def paper_test_signal(request: PaperTestSignalRequest) -> dict[str, object]:
         take_profit_pct=request.take_profit_pct or settings.paper_take_profit_pct,
         reasons=["manual paper test signal"],
     )
-    equity = account_service.status.equity or settings.paper_starting_equity
+    equity = paper_trading_service.equity
     risk_context = RiskContext(
         equity=equity,
-        available_balance=account_service.status.available_balance,
+        available_balance=paper_trading_service.equity,
         requested_risk_pct=request.requested_risk_pct or settings.max_risk_per_trade_pct,
         leverage=request.leverage or settings.max_leverage,
         open_positions=1 if paper_trading_service.open_position else 0,

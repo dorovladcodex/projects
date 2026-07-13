@@ -11,6 +11,7 @@ from app.models import ClassificationStatus, ClassifierTestRequest, Sentiment
 from app.news.classifier import (
     CodexCLINewsClassifier,
     CodexCLIProvider,
+    parse_codex_cli_total_tokens,
 )
 from app.news.service import NewsService
 from tests.test_llm_classifier import VALID_RESPONSE, news_item
@@ -24,7 +25,10 @@ NEUTRAL_RESPONSE = (
 
 
 class FakeRunner:
-    def __init__(self, outputs: list[str | BaseException | tuple[int, str]]) -> None:
+    def __init__(
+        self,
+        outputs: list[str | BaseException | tuple[int, str] | tuple[str, str, str]],
+    ) -> None:
         self.outputs = list(outputs)
         self.calls: list[tuple[list[str], dict[str, object]]] = []
         self.schema_bytes: list[bytes] = []
@@ -38,6 +42,10 @@ class FakeRunner:
         if isinstance(output, BaseException):
             raise output
         if isinstance(output, tuple):
+            if len(output) == 3:
+                content, stdout, stderr = output
+                result_path.write_text(content, encoding="utf-8", newline="")
+                return subprocess.CompletedProcess(command, 0, stdout, stderr)
             return subprocess.CompletedProcess(command, output[0], "", output[1])
         result_path.write_text(output, encoding="utf-8", newline="")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -110,7 +118,7 @@ def test_codex_cli_success_uses_safe_exact_process_controls() -> None:
 
 
 def test_codex_cli_cache_hit_avoids_subprocess() -> None:
-    runner = FakeRunner([VALID_RESPONSE])
+    runner = FakeRunner([(VALID_RESPONSE, "tokens used\r\n9,108\r\n", "")])
     classifier = codex_classifier(runner)
 
     first = classifier.classify(news_item())
@@ -119,6 +127,48 @@ def test_codex_cli_cache_hit_avoids_subprocess() -> None:
     assert first.classification_status == ClassificationStatus.SUCCESS
     assert second.classification_status == ClassificationStatus.CACHE_HIT
     assert len(runner.calls) == 1
+    metrics = classifier.metrics_payload()
+    assert metrics["codex_cli_cache_hits"] == 1
+    assert metrics["codex_cli_calls_count"] == 1
+    assert metrics["codex_cli_total_tokens_today"] == 9108
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("tokens used\n9,108\n", 9108),
+        ("tokens used\r\n9108\r\n", 9108),
+        ("tokens used\n9 108\n", 9108),
+    ],
+)
+def test_parse_codex_cli_total_tokens(output: str, expected: int) -> None:
+    assert parse_codex_cli_total_tokens(output) == expected
+
+
+def test_codex_cli_succeeds_when_token_summary_is_missing() -> None:
+    classifier = codex_classifier(FakeRunner([VALID_RESPONSE]))
+
+    result = classifier.classify(news_item())
+    metrics = classifier.metrics_payload()
+
+    assert result.classification_status == ClassificationStatus.SUCCESS
+    assert result.codex_cli_total_tokens is None
+    assert result.codex_cli_token_count_available is False
+    assert metrics["codex_cli_token_count_available"] is False
+    assert metrics["codex_cli_total_tokens_today"] == 0
+
+
+def test_failed_codex_cli_process_does_not_invent_token_usage() -> None:
+    classifier = codex_classifier(FakeRunner([(1, "tokens used\n9,108")]))
+
+    result = classifier.classify(news_item())
+    metrics = classifier.metrics_payload()
+
+    assert result.classification_status == ClassificationStatus.FAILED
+    assert metrics["failed_codex_cli_calls_count"] == 1
+    assert metrics["codex_cli_total_tokens_last_call"] is None
+    assert metrics["codex_cli_total_tokens_today"] == 0
+    assert metrics["codex_cli_token_count_available"] is False
 
 
 def test_codex_cli_uses_fallback_only_for_valid_ambiguous_result() -> None:

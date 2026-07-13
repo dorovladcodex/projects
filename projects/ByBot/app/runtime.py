@@ -39,8 +39,8 @@ def build_status(
     market = None
 
     risk_context = RiskContext(
-        equity=settings.paper_starting_equity,
-        available_balance=account_status.available_balance,
+        equity=paper_trading.equity,
+        available_balance=paper_trading.equity,
         requested_risk_pct=settings.max_risk_per_trade_pct,
         leverage=settings.max_leverage,
         open_positions=0,
@@ -161,6 +161,12 @@ def build_status(
         ),
         "news_items_seen_count": news_service.items_seen_count,
         "news_items_filtered_count": news_service.items_filtered_count,
+        "rss_items_seen": news_service.items_seen_count,
+        "rss_items_accepted": news_service.items_filtered_count,
+        "news_duplicates_skipped": news_service.news_duplicates_skipped,
+        "news_skipped_before_codex_count": news_service.news_skipped_before_codex_count,
+        "classifications_trade_eligible": news_service.classifications_trade_eligible,
+        "signal_candidates_created": len(signal_candidates.candidates) if signal_candidates else 0,
         "items_classified_count": news_service.items_classified_count,
         "mock_classifier_calls_count": news_service.mock_classifier_calls_count,
         "news_classifier_mode": classifier_status.get("mode", "disabled"),
@@ -178,9 +184,40 @@ def build_status(
         "llm_output_tokens_today": classifier_metrics.get("llm_output_tokens_today", 0),
         "last_llm_error": classifier_metrics.get("last_llm_error"),
         "last_llm_call_at": classifier_metrics.get("last_llm_call_at"),
+        "codex_cli_calls_count": classifier_metrics.get("codex_cli_calls_count", 0),
+        "successful_codex_cli_calls_count": classifier_metrics.get(
+            "successful_codex_cli_calls_count", 0
+        ),
+        "failed_codex_cli_calls_count": classifier_metrics.get(
+            "failed_codex_cli_calls_count", 0
+        ),
+        "codex_cli_cache_hits": classifier_metrics.get("codex_cli_cache_hits", 0),
+        "codex_cli_total_tokens_last_call": classifier_metrics.get(
+            "codex_cli_total_tokens_last_call"
+        ),
+        "codex_cli_token_count_available": classifier_metrics.get(
+            "codex_cli_token_count_available", False
+        ),
+        "codex_cli_total_tokens_today": classifier_metrics.get(
+            "codex_cli_total_tokens_today", 0
+        ),
+        "codex_cli_requests_this_hour": classifier_metrics.get(
+            "codex_cli_requests_this_hour", 0
+        ),
+        "codex_cli_requests_today": classifier_metrics.get("codex_cli_requests_today", 0),
+        "last_codex_cli_duration_ms": classifier_metrics.get("last_codex_cli_duration_ms"),
+        "last_codex_cli_error": classifier_metrics.get("last_codex_cli_error"),
+        "last_codex_cli_call_at": classifier_metrics.get("last_codex_cli_call_at"),
         "estimated_input_tokens": news_service.estimated_input_tokens,
         "estimated_output_tokens": news_service.estimated_output_tokens,
         "news_last_error": news_service.last_error,
+        "persistence_status": (
+            "OK" if news_service.repository and news_service.repository.available
+            else "UNAVAILABLE"
+        ),
+        "persistence_last_error": (
+            news_service.repository.last_error if news_service.repository else "not configured"
+        ),
         "market_data_status": market_data.status,
         "latest_btcusdt_snapshot": snapshot_to_payload(btc_snapshot) if btc_snapshot else None,
         "latest_ethusdt_snapshot": snapshot_to_payload(eth_snapshot) if eth_snapshot else None,
@@ -188,6 +225,8 @@ def build_status(
         "account": account_status.model_dump(mode="json"),
         "paper_trading": paper_status,
         "paper_trading_status": paper_status["status"],
+        "paper_starting_equity_usdt": paper_trading.starting_equity,
+        "paper_account_equity": paper_trading.equity,
         "paper_realized_pnl": paper_status["realized_pnl"],
         "paper_unrealized_pnl": paper_status["unrealized_pnl"],
         "last_paper_trade": paper_status["last_trade"],

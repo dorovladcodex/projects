@@ -16,12 +16,41 @@ from app.models import (
 class PaperTradingService:
     """In-memory paper trading loop. It never calls Bybit order endpoints."""
 
-    def __init__(self, *, timeout: timedelta = timedelta(minutes=60)) -> None:
+    def __init__(
+        self,
+        *,
+        timeout: timedelta = timedelta(minutes=60),
+        starting_equity: float = 10_000.0,
+        repository: object | None = None,
+    ) -> None:
         self.timeout = timeout
+        self.starting_equity = starting_equity
+        self.repository = repository
         self.positions: list[PaperPosition] = []
         self.closed_trades: list[PaperPosition] = []
         self.last_risk_decision: RiskDecision | None = None
         self.last_error: str | None = None
+
+    @property
+    def equity(self) -> float:
+        return self.starting_equity + sum(
+            position.realized_pnl for position in self.closed_trades
+        )
+
+    def restore(self) -> None:
+        loader = getattr(self.repository, "load_paper_positions", None)
+        if not callable(loader):
+            return
+        restored = loader()
+        self.positions = list(restored)
+        self.closed_trades = [
+            position for position in restored if position.status == PositionStatus.CLOSED
+        ]
+
+    def _persist(self, position: PaperPosition) -> None:
+        saver = getattr(self.repository, "save_paper_position", None)
+        if callable(saver):
+            saver(position)
 
     @property
     def open_position(self) -> PaperPosition | None:
@@ -97,6 +126,7 @@ class PaperTradingService:
             reason="opened_by_test_signal",
         )
         self.positions.append(position)
+        self._persist(position)
         self.last_error = None
         return position
 
@@ -129,6 +159,7 @@ class PaperTradingService:
             return self.close_position(market.last_price, reason="take_profit", now=now)
         if now - position.opened_at >= self.timeout:
             return self.close_position(market.last_price, reason="timeout", now=now)
+        self._persist(position)
         return position
 
     def close_position(
@@ -163,6 +194,7 @@ class PaperTradingService:
         position.closed_at = now
         position.reason = reason
         self.closed_trades.append(position)
+        self._persist(position)
         self.last_error = None
         return position
 
@@ -191,6 +223,8 @@ class PaperTradingService:
     def as_status(self) -> dict[str, object]:
         return {
             "status": self.status,
+            "starting_equity": self.starting_equity,
+            "equity": self.equity,
             "open_position": (
                 self.open_position.model_dump(mode="json") if self.open_position else None
             ),

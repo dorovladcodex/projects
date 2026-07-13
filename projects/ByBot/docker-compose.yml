@@ -3,7 +3,7 @@ services:
     build: .
     env_file: .env
     environment:
-      DATABASE_URL: postgresql://bybot:bybot@db:5432/bybot
+      DATABASE_URL: postgresql+psycopg://bybot:bybot@db:5432/bybot
     ports:
       - "8000:8000"
     depends_on:

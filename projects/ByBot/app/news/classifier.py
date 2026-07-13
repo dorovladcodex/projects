@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 from threading import BoundedSemaphore, RLock
@@ -52,6 +53,13 @@ class ProviderResponse:
     model_name: str | None = None
     additional_estimated_input_tokens: int = 0
     additional_estimated_output_tokens: int = 0
+    codex_cli_total_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class CodexCLIResult:
+    content: str
+    total_tokens: int | None
 
 
 class LLMProvider(Protocol):
@@ -155,6 +163,17 @@ class CodexCLIProvider:
         self.reasoning_effort = reasoning_effort
         self.fallback_min_confidence = fallback_min_confidence
         self._runner = runner or subprocess.run
+        self._lock = RLock()
+        self._calls: deque[datetime] = deque()
+        self._token_usage: deque[tuple[datetime, int]] = deque()
+        self._calls_count = 0
+        self._successful_calls = 0
+        self._failed_calls = 0
+        self._cache_hits = 0
+        self._last_total_tokens: int | None = None
+        self._last_duration_ms: float | None = None
+        self._last_error: str | None = None
+        self._last_call_at: datetime | None = None
 
     def request(
         self,
@@ -185,7 +204,7 @@ class CodexCLIProvider:
     ) -> ProviderResponse:
         prompt = f"{system_prompt}\n\nARTICLE JSON:\n{user_content}"
         primary = self._run_model(self.model, prompt, timeout_seconds)
-        parsed = LLMClassificationPayload.model_validate(json.loads(primary))
+        parsed = LLMClassificationPayload.model_validate(json.loads(primary.content))
         if (
             parsed.sentiment == Sentiment.NEUTRAL
             and parsed.confidence < self.fallback_min_confidence
@@ -202,18 +221,27 @@ class CodexCLIProvider:
                     timeout_seconds,
                 )
                 # Validate here so invalid fallback output fails closed in the outer classifier.
-                LLMClassificationPayload.model_validate(json.loads(fallback))
+                LLMClassificationPayload.model_validate(json.loads(fallback.content))
                 return ProviderResponse(
-                    content=fallback,
+                    content=fallback.content,
                     model_name=self.fallback_model,
                     additional_estimated_input_tokens=_estimate_tokens(
                         system_prompt + user_content
                     ),
-                    additional_estimated_output_tokens=_estimate_tokens(primary),
+                    additional_estimated_output_tokens=_estimate_tokens(primary.content),
+                    codex_cli_total_tokens=_sum_optional_tokens(
+                        primary.total_tokens, fallback.total_tokens
+                    ),
                 )
-        return ProviderResponse(content=primary, model_name=self.model)
+        return ProviderResponse(
+            content=primary.content,
+            model_name=self.model,
+            codex_cli_total_tokens=primary.total_tokens,
+        )
 
-    def _run_model(self, model: str, prompt: str, timeout_seconds: float) -> str:
+    def _run_model(self, model: str, prompt: str, timeout_seconds: float) -> CodexCLIResult:
+        started = time.perf_counter()
+        called_at = datetime.now(timezone.utc)
         with tempfile.TemporaryDirectory(prefix="bybot-codex-") as temp_dir:
             directory = Path(temp_dir)
             schema_path = directory / "classification-schema.json"
@@ -256,12 +284,98 @@ class CodexCLIProvider:
                     check=False,
                 )
             except subprocess.TimeoutExpired as exc:
+                self._record_call(
+                    called_at, False, None, (time.perf_counter() - started) * 1000,
+                    "TIMEOUT",
+                )
                 raise TimeoutError("Codex CLI classification timed out") from exc
+            except OSError:
+                self._record_call(
+                    called_at, False, None, (time.perf_counter() - started) * 1000,
+                    "CODEX_CLI_UNAVAILABLE",
+                )
+                raise
             if completed.returncode != 0:
+                self._record_call(
+                    called_at, False, None, (time.perf_counter() - started) * 1000,
+                    "CODEX_CLI_PROCESS_FAILED",
+                )
                 raise OSError("Codex CLI classification failed")
             if not result_path.is_file():
+                self._record_call(
+                    called_at, False, None, (time.perf_counter() - started) * 1000,
+                    "CODEX_CLI_RESULT_MISSING",
+                )
                 raise ValueError("Codex CLI did not write a classification result")
-            return result_path.read_text(encoding="utf-8").strip()
+            content = result_path.read_text(encoding="utf-8").strip()
+            try:
+                LLMClassificationPayload.model_validate(json.loads(content))
+            except (json.JSONDecodeError, ValidationError):
+                self._record_call(
+                    called_at, False, None, (time.perf_counter() - started) * 1000,
+                    "CODEX_CLI_INVALID_OUTPUT",
+                )
+                raise
+            total_tokens = parse_codex_cli_total_tokens(
+                f"{completed.stdout or ''}\n{completed.stderr or ''}"
+            )
+            self._record_call(
+                called_at, True, total_tokens, (time.perf_counter() - started) * 1000, None
+            )
+            return CodexCLIResult(
+                content=content,
+                total_tokens=total_tokens,
+            )
+
+    def record_cache_hit(self) -> None:
+        with self._lock:
+            self._cache_hits += 1
+
+    def metrics_payload(self, now: datetime | None = None) -> dict[str, object]:
+        now = now or datetime.now(timezone.utc)
+        day_ago = now - timedelta(days=1)
+        hour_ago = now - timedelta(hours=1)
+        with self._lock:
+            while self._calls and self._calls[0] < day_ago:
+                self._calls.popleft()
+            while self._token_usage and self._token_usage[0][0] < day_ago:
+                self._token_usage.popleft()
+            return {
+                "codex_cli_calls_count": self._calls_count,
+                "successful_codex_cli_calls_count": self._successful_calls,
+                "failed_codex_cli_calls_count": self._failed_calls,
+                "codex_cli_cache_hits": self._cache_hits,
+                "codex_cli_total_tokens_last_call": self._last_total_tokens,
+                "codex_cli_token_count_available": self._last_total_tokens is not None,
+                "codex_cli_total_tokens_today": sum(value for _, value in self._token_usage),
+                "codex_cli_requests_this_hour": sum(ts >= hour_ago for ts in self._calls),
+                "codex_cli_requests_today": len(self._calls),
+                "last_codex_cli_duration_ms": self._last_duration_ms,
+                "last_codex_cli_error": self._last_error,
+                "last_codex_cli_call_at": (
+                    self._last_call_at.isoformat() if self._last_call_at else None
+                ),
+            }
+
+    def _record_call(
+        self,
+        called_at: datetime,
+        succeeded: bool,
+        total_tokens: int | None,
+        duration_ms: float,
+        error: str | None,
+    ) -> None:
+        with self._lock:
+            self._calls_count += 1
+            self._successful_calls += int(succeeded)
+            self._failed_calls += int(not succeeded)
+            self._calls.append(called_at)
+            if succeeded and total_tokens is not None:
+                self._token_usage.append((called_at, total_tokens))
+            self._last_total_tokens = total_tokens if succeeded else None
+            self._last_duration_ms = duration_ms
+            self._last_error = error
+            self._last_call_at = called_at
 
 
 class MockNewsClassifier:
@@ -387,6 +501,8 @@ class LLMNewsClassifier:
                     "output_tokens": 0,
                     "estimated_input_tokens": 0,
                     "estimated_output_tokens": 0,
+                    "codex_cli_total_tokens": None,
+                    "codex_cli_token_count_available": False,
                     "latency_ms": (time.perf_counter() - started) * 1000,
                     "classified_at": now,
                 }
@@ -543,6 +659,8 @@ class LLMNewsClassifier:
             output_tokens=output_tokens,
             estimated_input_tokens=0 if input_tokens is not None else estimated_input_total,
             estimated_output_tokens=0 if output_tokens is not None else estimated_output,
+            codex_cli_total_tokens=response.codex_cli_total_tokens,
+            codex_cli_token_count_available=response.codex_cli_total_tokens is not None,
             cache_hit=False,
             classified_at=now,
         )
@@ -791,6 +909,31 @@ class LLMNewsClassifier:
 class CodexCLINewsClassifier(LLMNewsClassifier):
     mode = "codex_cli"
 
+    def record_external_cache_hit(self) -> None:
+        with self._lock:
+            self._cache_hits += 1
+        provider = self.provider
+        if isinstance(provider, CodexCLIProvider):
+            provider.record_cache_hit()
+
+    def classify(self, item: NewsItem) -> NewsClassification:
+        result = super().classify(item)
+        if result.classification_status == ClassificationStatus.CACHE_HIT:
+            provider = self.provider
+            if isinstance(provider, CodexCLIProvider):
+                provider.record_cache_hit()
+        return result
+
+    def metrics_payload(self) -> dict[str, object]:
+        metrics = super().metrics_payload()
+        provider = self.provider
+        metrics.update(
+            provider.metrics_payload(self._clock())
+            if isinstance(provider, CodexCLIProvider)
+            else _empty_codex_cli_metrics()
+        )
+        return metrics
+
     def status_payload(self) -> dict[str, object]:
         now = self._clock()
         provider_available = self.provider is not None
@@ -806,7 +949,7 @@ class CodexCLINewsClassifier(LLMNewsClassifier):
             status, error_code = "DEGRADED", self._last_error
         else:
             status, error_code = "OK", None
-        return {
+        payload = {
             "mode": self.mode,
             "status": status,
             "configured": configured,
@@ -821,6 +964,8 @@ class CodexCLINewsClassifier(LLMNewsClassifier):
             "last_error": self._last_error,
             "last_call_at": self._last_call_at.isoformat() if self._last_call_at else None,
         }
+        payload.update(self.metrics_payload())
+        return payload
 
 
 def build_news_classifier(settings: Settings) -> BaseNewsClassifier:
@@ -878,6 +1023,24 @@ def _estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def parse_codex_cli_total_tokens(output: str) -> int | None:
+    """Return the last Codex CLI total-token summary, if present."""
+    matches = re.findall(
+        r"tokens\s+used\s*(?:\r?\n|:)\s*([0-9][0-9, ]*)",
+        output,
+        flags=re.IGNORECASE,
+    )
+    if not matches:
+        return None
+    digits = re.sub(r"[,\s]", "", matches[-1])
+    return int(digits) if digits else None
+
+
+def _sum_optional_tokens(*values: int | None) -> int | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
+
+
 def _credentials_present(api_key: str | None) -> bool:
     if not api_key or not api_key.strip():
         return False
@@ -894,7 +1057,7 @@ def _resolve_executable(configured_path: str) -> str | None:
 
 
 def _empty_metrics() -> dict[str, object]:
-    return {
+    metrics: dict[str, object] = {
         "real_llm_calls_count": 0,
         "successful_llm_calls_count": 0,
         "failed_llm_calls_count": 0,
@@ -906,6 +1069,25 @@ def _empty_metrics() -> dict[str, object]:
         "llm_output_tokens_today": 0,
         "last_llm_error": None,
         "last_llm_call_at": None,
+    }
+    metrics.update(_empty_codex_cli_metrics())
+    return metrics
+
+
+def _empty_codex_cli_metrics() -> dict[str, object]:
+    return {
+        "codex_cli_calls_count": 0,
+        "successful_codex_cli_calls_count": 0,
+        "failed_codex_cli_calls_count": 0,
+        "codex_cli_cache_hits": 0,
+        "codex_cli_total_tokens_last_call": None,
+        "codex_cli_token_count_available": False,
+        "codex_cli_total_tokens_today": 0,
+        "codex_cli_requests_this_hour": 0,
+        "codex_cli_requests_today": 0,
+        "last_codex_cli_duration_ms": None,
+        "last_codex_cli_error": None,
+        "last_codex_cli_call_at": None,
     }
 
 

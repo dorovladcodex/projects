@@ -23,10 +23,21 @@
 Deferred from Phase 2:
 
 - WebSocket market-data provider
-- PostgreSQL persistence and migrations
+- Advanced PostgreSQL retention and archival policy
 - News provider adapters, filters, deduplication, and classifier cache
 - Dashboard views and Telegram notifications
 - Structured logs, metrics, and bot-event audit trail
+
+## Production-like dry-run pipeline and persistence (implemented)
+
+- RSS filtering and idempotent news storage
+- Deterministic shortcut before optional Codex CLI classification
+- Durable classifier cache, classifications, signal candidates, evaluations,
+  risk previews, paper positions, and paper trades
+- PostgreSQL repository and Alembic baseline migration
+- Restart recovery for pending and expired candidates
+- Paper equity isolated from read-only Bybit demo account equity
+- Automatic paper and exchange execution remain disabled
 
 ## Phase 3A - safe private account connection (implemented)
 

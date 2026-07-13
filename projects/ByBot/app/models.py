@@ -133,6 +133,8 @@ class NewsClassification(BaseModel):
     output_tokens: int | None = Field(default=None, ge=0)
     estimated_input_tokens: int = Field(default=0, ge=0)
     estimated_output_tokens: int = Field(default=0, ge=0)
+    codex_cli_total_tokens: int | None = Field(default=None, ge=0)
+    codex_cli_token_count_available: bool = False
     cache_hit: bool = False
     error_code: str | None = None
     classified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
