@@ -17,6 +17,7 @@ from app.db.persistence import (
     PaperAccountRow,
     PaperExecutionRow,
     PaperPositionRow,
+    PaperRiskStateRow,
     PaperTradeRow,
     PersistenceRepository,
     RiskDecisionRow,
@@ -43,7 +44,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _seed_candidate(repository: PersistenceRepository) -> tuple[str, str]:
+def _seed_candidate(
+    repository: PersistenceRepository, symbol: Symbol = Symbol.BTCUSDT
+) -> tuple[str, str]:
     news_id, candidate_id = str(uuid4()), str(uuid4())
     now = datetime.now(timezone.utc)
     with Session(repository.engine) as session:
@@ -53,7 +56,7 @@ def _seed_candidate(repository: PersistenceRepository) -> tuple[str, str]:
             payload={"id": news_id}, received_at=now,
         ))
         session.add(SignalCandidateRow(
-            id=candidate_id, news_id=news_id, symbol="BTCUSDT", state="READY",
+            id=candidate_id, news_id=news_id, symbol=symbol.value, state="READY",
             active=False, expires_at=now + timedelta(minutes=5), payload={},
             risk_preview={}, risk_decision_id=None,
         ))
@@ -66,9 +69,10 @@ def _position(
     *,
     position_id: str | None = None,
     side: Side = Side.BUY,
+    symbol: Symbol = Symbol.BTCUSDT,
 ) -> PaperPosition:
     return PaperPosition(
-        id=position_id or uuid4(), symbol=Symbol.BTCUSDT, side=side,
+        id=position_id or uuid4(), symbol=symbol, side=side,
         size=0.1, entry_price=100, current_price=100, stop_loss=99,
         take_profit=102, status=PositionStatus.OPEN,
         candidate_id=candidate_id, position_notional=10,
@@ -175,13 +179,12 @@ def test_postgres_atomic_open_returns_integer_id_and_is_idempotent() -> None:
 
 
 def test_postgres_atomic_failure_rolls_back_risk_and_execution() -> None:
-    repository = PersistenceRepository(str(POSTGRES_TEST_URL), create_schema=True)
-    assert repository.available
+    repository = _fresh_repository()
     _, candidate_id = _seed_candidate(repository)
     duplicate_position_id = str(uuid4())
     with Session(repository.engine) as session:
         session.add(PaperPositionRow(
-            id=duplicate_position_id, status="OPEN", payload={"preexisting": True}
+            id=duplicate_position_id, status="CLOSED", payload={"preexisting": True}
         ))
         session.commit()
 
@@ -319,3 +322,117 @@ def test_postgres_restart_restores_open_unrealized_equity_formula() -> None:
     )
     assert actual.fees_paid == pytest.approx(expected.fees_paid)
     assert actual.open_positions == 1
+
+
+def test_postgres_open_slot_enforces_symbol_and_total_position_limits() -> None:
+    repository = _fresh_repository()
+    _, btc_one = _seed_candidate(repository, Symbol.BTCUSDT)
+    _, btc_two = _seed_candidate(repository, Symbol.BTCUSDT)
+    _, eth_one = _seed_candidate(repository, Symbol.ETHUSDT)
+
+    first = repository.persist_paper_open_transaction(
+        btc_one, _preview(), _position(btc_one), max_total_open_positions=2
+    )
+    duplicate_symbol = repository.persist_paper_open_transaction(
+        btc_two, _preview(), _position(btc_two), max_total_open_positions=2
+    )
+    second_symbol = repository.persist_paper_open_transaction(
+        eth_one,
+        _preview(),
+        _position(eth_one, symbol=Symbol.ETHUSDT),
+        max_total_open_positions=2,
+    )
+
+    assert first["status"] == "OPENED"
+    assert duplicate_symbol == {
+        "status": "BLOCKED",
+        "reason": "maximum one open paper position per symbol reached",
+    }
+    assert second_symbol["status"] == "OPENED"
+
+    repository = _fresh_repository()
+    _, btc = _seed_candidate(repository, Symbol.BTCUSDT)
+    _, eth = _seed_candidate(repository, Symbol.ETHUSDT)
+    assert repository.persist_paper_open_transaction(
+        btc, _preview(), _position(btc), max_total_open_positions=1
+    )["status"] == "OPENED"
+    limited = repository.persist_paper_open_transaction(
+        eth,
+        _preview(),
+        _position(eth, symbol=Symbol.ETHUSDT),
+        max_total_open_positions=1,
+    )
+    assert limited["status"] == "BLOCKED"
+    assert "maximum total" in limited["reason"]
+
+
+def test_postgres_cooldowns_and_kill_switch_survive_restart() -> None:
+    repository = _fresh_repository()
+    service = PaperTradingService(
+        repository=repository,
+        symbol_cooldown=timedelta(minutes=5),
+        global_entry_cooldown=timedelta(minutes=5),
+    )
+    service.restore()
+    now = datetime.now(timezone.utc)
+    service.kill_switch_active = True
+    service.kill_switch_reasons = ["persisted loss kill switch"]
+    service.last_entry_at = now
+    service.symbol_cooldown_until[Symbol.BTCUSDT] = now + timedelta(minutes=5)
+    service.symbol_cooldown_until[Symbol.ETHUSDT] = now - timedelta(seconds=1)
+    service._persist_risk_state(now)
+
+    restarted = PaperTradingService(
+        repository=PersistenceRepository(str(POSTGRES_TEST_URL), create_schema=True),
+        symbol_cooldown=timedelta(minutes=5),
+        global_entry_cooldown=timedelta(minutes=5),
+    )
+    restarted.restore()
+
+    assert restarted.kill_switch_active is True
+    assert restarted.kill_switch_reasons == ["persisted loss kill switch"]
+    assert Symbol.BTCUSDT in restarted.symbol_cooldown_until
+    assert Symbol.ETHUSDT not in restarted.symbol_cooldown_until
+    assert restarted.risk_status()["cooldown_state"]["global_remaining_seconds"] > 0
+    with Session(restarted.repository.engine) as session:
+        assert session.get(PaperRiskStateRow, 1) is not None
+
+
+def test_postgres_loss_kill_switch_allows_close_and_restores_totals() -> None:
+    repository, service, opened = _open_accounting_position(Side.BUY)
+    service.max_daily_net_loss_pct = 0.001
+    service.max_weekly_net_loss_pct = 0.001
+    service.max_account_drawdown_pct = 0.001
+    service.kill_switch_active = True
+    service.kill_switch_reasons = ["manual pre-close safety block"]
+    service._persist_risk_state(datetime.now(timezone.utc))
+
+    closed = service.close_position(
+        90.0, reason="stop_loss", position_id=opened.id
+    )
+    equity = service.equity
+    fees = service.fees_paid
+
+    assert closed.realized_pnl < 0
+    assert service.kill_switch_active is True
+    assert "maximum daily net loss reached" in service.kill_switch_reasons
+    assert "maximum weekly net loss reached" in service.kill_switch_reasons
+    assert "maximum paper account drawdown reached" in service.kill_switch_reasons
+    assert service.entry_block_reasons(Symbol.ETHUSDT)
+
+    restarted = PaperTradingService(
+        repository=PersistenceRepository(str(POSTGRES_TEST_URL), create_schema=True),
+        max_daily_net_loss_pct=0.001,
+        max_weekly_net_loss_pct=0.001,
+        max_account_drawdown_pct=0.001,
+    )
+    restarted.restore()
+    assert restarted.kill_switch_active is True
+    assert restarted.open_positions == []
+    assert restarted.equity == pytest.approx(equity)
+    assert restarted.fees_paid == pytest.approx(fees)
+    assert len(restarted.closed_trades) == 1
+    duplicate = restarted.repository.persist_paper_close_transaction(closed, 10_000)
+    assert duplicate["status"] == "EXISTING"
+    assert restarted.equity == pytest.approx(equity)
+    assert not hasattr(restarted, "bybit_order_adapter")

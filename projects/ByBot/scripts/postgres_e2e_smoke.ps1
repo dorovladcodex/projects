@@ -13,6 +13,10 @@ $StartedAt = Get-Date
 $LogDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("bybot-smoke-" + [guid]::NewGuid().ToString("N"))
 $StdoutLog = Join-Path $LogDirectory "uvicorn.stdout.log"
 $StderrLog = Join-Path $LogDirectory "uvicorn.stderr.log"
+$PostgresService = $null
+$DbUser = $null
+$SmokeDatabase = $null
+$DatabaseCreated = $false
 
 $SafetyEnvironment = @{
     APP_ENV = "local"
@@ -35,6 +39,12 @@ function Assert-True {
     if (-not $Condition) { throw "Assertion failed: $Message" }
 }
 
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()][string]$Argument)
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+    return '"' + $Argument.Replace('\\', '\\').Replace('"', '\"') + '"'
+}
+
 function Invoke-NativeCommand {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -44,28 +54,29 @@ function Invoke-NativeCommand {
         [string[]]$RedactValues = @()
     )
 
-    $stdoutPath = [System.IO.Path]::GetTempFileName()
-    $stderrPath = [System.IO.Path]::GetTempFileName()
-    $previousErrorActionPreference = $ErrorActionPreference
-    $exitCode = $null
+    $process = New-Object System.Diagnostics.Process
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = (($Arguments | ForEach-Object {
+        ConvertTo-NativeArgument ([string]$_)
+    }) -join " ")
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process.StartInfo = $startInfo
     try {
-        # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects when
-        # redirected into the success stream. Separate files avoid that behavior.
-        $ErrorActionPreference = "Continue"
-        & $FilePath @Arguments 1> $stdoutPath 2> $stderrPath
-        $exitCode = $LASTEXITCODE
+        if (-not $process.Start()) { throw "Native command '$FilePath' could not be started." }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $stdout = $stdoutTask.Result
+        $stderr = $stderrTask.Result
+        $exitCode = $process.ExitCode
     }
     finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+        $process.Dispose()
     }
-
-    $stdout = if (Test-Path -LiteralPath $stdoutPath) {
-        [System.IO.File]::ReadAllText($stdoutPath)
-    } else { "" }
-    $stderr = if (Test-Path -LiteralPath $stderrPath) {
-        [System.IO.File]::ReadAllText($stderrPath)
-    } else { "" }
-    Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 
     $safeStdout = $stdout
     $safeStderr = $stderr
@@ -233,8 +244,14 @@ try {
     Invoke-Docker @("compose", "version") | Out-Null
     Assert-True (Test-Path -LiteralPath $Python) "run local setup before the smoke test"
     Invoke-NativeCommand -FilePath $Python -Arguments @("-m", "alembic", "--help") -Quiet | Out-Null
-    Assert-True ($null -ne (Get-Command codex -ErrorAction SilentlyContinue)) "authenticated Codex CLI is unavailable"
-    Invoke-NativeCommand -FilePath "codex" -Arguments @("--version") | Out-Null
+    $codexCli = if ([string]::IsNullOrWhiteSpace($env:CODEX_CLI_PATH)) {
+        "codex"
+    } else {
+        $env:CODEX_CLI_PATH
+    }
+    Assert-True ($null -ne (Get-Command $codexCli -ErrorAction SilentlyContinue)) `
+        "authenticated Codex CLI is unavailable"
+    Invoke-NativeCommand -FilePath $codexCli -Arguments @("--version") | Out-Null
 
     $PostgresService = Get-PostgresService
     Invoke-Docker @("compose", "up", "-d", "--no-deps", $PostgresService) | Out-Null
@@ -248,6 +265,13 @@ try {
     $PortLine = (Invoke-Docker @("compose", "port", $PostgresService, "5432") -Quiet).StdOut.Trim()
     Assert-True ($PortLine -match ":(?<port>\d+)$") "could not detect the published PostgreSQL port"
     $DbPort = $Matches.port
+    $SmokeDatabase = "bybot_postgres_smoke_" + [guid]::NewGuid().ToString("N")
+    Invoke-Docker @(
+        "compose", "exec", "-T", $PostgresService,
+        "createdb", "-U", $DbUser, $SmokeDatabase
+    ) -Quiet | Out-Null
+    $DatabaseCreated = $true
+    $DbName = $SmokeDatabase
     $EncodedUser = [uri]::EscapeDataString($DbUser)
     $EncodedPassword = [uri]::EscapeDataString($DbPassword)
     $DatabaseUrl = "postgresql+psycopg://$EncodedUser`:$EncodedPassword@127.0.0.1:$DbPort/$DbName"
@@ -355,6 +379,17 @@ catch {
 }
 finally {
     Stop-LocalUvicorn -Process $UvicornProcess
+    if ($DatabaseCreated -and $PostgresService -and $DbUser -and $SmokeDatabase) {
+        try {
+            Invoke-Docker @(
+                "compose", "exec", "-T", $PostgresService,
+                "dropdb", "-U", $DbUser, "--if-exists", $SmokeDatabase
+            ) -Quiet -Sensitive | Out-Null
+        }
+        catch {
+            Write-Warning "Could not remove the isolated smoke-test database."
+        }
+    }
     foreach ($name in $SavedEnvironment.Keys) {
         [Environment]::SetEnvironmentVariable($name, $SavedEnvironment[$name], "Process")
     }

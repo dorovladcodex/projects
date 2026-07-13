@@ -45,6 +45,14 @@ paper_trading_service = PaperTradingService(
     timeout=timedelta(minutes=settings.paper_position_timeout_minutes),
     starting_equity=settings.paper_starting_equity_usdt,
     repository=persistence,
+    max_total_open_positions=settings.paper_max_total_open_positions,
+    symbol_cooldown=timedelta(seconds=settings.paper_symbol_cooldown_seconds),
+    global_entry_cooldown=timedelta(
+        seconds=settings.paper_global_entry_cooldown_seconds
+    ),
+    max_daily_net_loss_pct=settings.paper_max_daily_net_loss_pct,
+    max_weekly_net_loss_pct=settings.paper_max_weekly_net_loss_pct,
+    max_account_drawdown_pct=settings.paper_max_account_drawdown_pct,
 )
 news_service = NewsService(
     [RSSNewsSource(url) for url in settings.news_rss_urls] if settings.news_enable_rss else [],
@@ -401,13 +409,14 @@ def paper_test_signal(request: PaperTestSignalRequest) -> dict[str, object]:
         available_balance=paper_trading_service.equity,
         requested_risk_pct=request.requested_risk_pct or settings.max_risk_per_trade_pct,
         leverage=request.leverage or settings.max_leverage,
-        open_positions=1 if paper_trading_service.open_position else 0,
+        open_positions=len(paper_trading_service.open_positions),
         daily_pnl_pct=settings.paper_daily_pnl_pct,
         weekly_pnl_pct=settings.paper_weekly_pnl_pct,
         consecutive_losses=settings.paper_consecutive_losses,
         api_stable=market_data_service.status == "OK",
     )
     risk_rules = RiskRules(
+        max_open_positions=settings.paper_max_total_open_positions,
         max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
         max_daily_loss_pct=settings.max_daily_loss_pct,
         max_weekly_loss_pct=settings.max_weekly_loss_pct,
@@ -573,16 +582,31 @@ def paper_test_market_snapshot(
 @app.post("/paper/test/close/{position_id}")
 def paper_test_close(position_id: str) -> dict[str, object]:
     _require_local_test_mode()
-    position = paper_trading_service.open_position
-    if position is None or str(position.id) != position_id:
+    position = next(
+        (
+            item for item in paper_trading_service.open_positions
+            if str(item.id) == position_id
+        ),
+        None,
+    )
+    if position is None:
         raise HTTPException(status_code=404, detail="open paper position not found")
     closed = paper_trading_service.close_position(
-        position.current_price, reason="manual_close"
+        position.current_price, reason="manual_close", position_id=position.id
     )
     signal_candidate_service.sync_paper_states()
     return {
         "position": closed.model_dump(mode="json"),
         "pnl": paper_trading_service.pnl().model_dump(mode="json"),
+        "exchange_order_placement": "blocked",
+    }
+
+
+@app.post("/paper/test/reset-kill-switch")
+def paper_test_reset_kill_switch() -> dict[str, object]:
+    _require_local_test_mode()
+    return {
+        "risk_control": paper_trading_service.reset_kill_switch(),
         "exchange_order_placement": "blocked",
     }
 

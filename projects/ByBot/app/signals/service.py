@@ -435,8 +435,8 @@ class SignalCandidateService:
             reasons.append("news importance below signal threshold")
         if candidate.symbol is None:
             reasons.append("news asset cannot be mapped to a supported symbol")
-        if self.paper_trading.open_position is not None:
-            reasons.append("an open paper position already exists")
+        if candidate.symbol is not None:
+            reasons.extend(self.paper_trading.entry_block_reasons(candidate.symbol))
         return reasons
 
     def _confirm_market(
@@ -587,7 +587,7 @@ class SignalCandidateService:
             available_balance=paper_equity,
             requested_risk_pct=self.settings.max_risk_per_trade_pct,
             leverage=self.settings.max_leverage,
-            open_positions=1 if self.paper_trading.open_position else 0,
+            open_positions=len(self.paper_trading.open_positions),
             daily_pnl_pct=self.settings.paper_daily_pnl_pct,
             weekly_pnl_pct=self.settings.paper_weekly_pnl_pct,
             consecutive_losses=self.settings.paper_consecutive_losses,
@@ -661,8 +661,8 @@ class SignalCandidateService:
         )
         if not snapshot_fresh or not candidate.market_confirmation.fresh:
             reasons.append("market data is stale or unavailable")
-        if self.paper_trading.open_position is not None:
-            reasons.append("conflicting open paper position exists")
+        if candidate.symbol is not None:
+            reasons.extend(self.paper_trading.entry_block_reasons(candidate.symbol))
         if str(candidate.id) in self.paper_trading.executed_candidate_ids:
             self.paper_trading.paper_execution_duplicates_blocked += 1
             self.paper_trading.last_execution_attempted = False
@@ -813,6 +813,7 @@ def _deduplicate(items: list[str]) -> list[str]:
 
 def _risk_rules(settings: Settings) -> RiskRules:
     return RiskRules(
+        max_open_positions=settings.paper_max_total_open_positions,
         max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
         max_daily_loss_pct=settings.max_daily_loss_pct,
         max_weekly_loss_pct=settings.max_weekly_loss_pct,

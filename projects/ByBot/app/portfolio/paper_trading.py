@@ -13,6 +13,7 @@ from app.models import (
     NewsSignalCandidate,
     SignalRiskPreview,
     Side,
+    Symbol,
     TradeSignal,
 )
 
@@ -26,10 +27,22 @@ class PaperTradingService:
         timeout: timedelta = timedelta(minutes=60),
         starting_equity: float = 10_000.0,
         repository: object | None = None,
+        max_total_open_positions: int = 1,
+        symbol_cooldown: timedelta = timedelta(0),
+        global_entry_cooldown: timedelta = timedelta(0),
+        max_daily_net_loss_pct: float = 2.0,
+        max_weekly_net_loss_pct: float = 5.0,
+        max_account_drawdown_pct: float = 10.0,
     ) -> None:
         self.timeout = timeout
         self.starting_equity = starting_equity
         self.repository = repository
+        self.max_total_open_positions = max_total_open_positions
+        self.symbol_cooldown = symbol_cooldown
+        self.global_entry_cooldown = global_entry_cooldown
+        self.max_daily_net_loss_pct = max_daily_net_loss_pct
+        self.max_weekly_net_loss_pct = max_weekly_net_loss_pct
+        self.max_account_drawdown_pct = max_account_drawdown_pct
         self.positions: list[PaperPosition] = []
         self.closed_trades: list[PaperPosition] = []
         self.last_risk_decision: RiskDecision | None = None
@@ -48,6 +61,14 @@ class PaperTradingService:
         self.last_existing_execution_state: str | None = None
         self.last_execution_error_code: str | None = None
         self.last_execution_retryable = False
+        self.kill_switch_active = False
+        self.kill_switch_reasons: list[str] = []
+        self.peak_equity = starting_equity
+        self.daily_pnl = 0.0
+        self.weekly_pnl = 0.0
+        self.current_drawdown_pct = 0.0
+        self.last_entry_at: datetime | None = None
+        self.symbol_cooldown_until: dict[Symbol, datetime] = {}
 
     @property
     def equity(self) -> float:
@@ -73,6 +94,14 @@ class PaperTradingService:
             if item.status == PositionStatus.OPEN
         )
 
+    @property
+    def open_positions(self) -> list[PaperPosition]:
+        return [
+            position
+            for position in self.positions
+            if position.status == PositionStatus.OPEN
+        ]
+
     def restore(self) -> None:
         recover = getattr(self.repository, "recover_orphaned_paper_executions", None)
         if callable(recover):
@@ -90,6 +119,22 @@ class PaperTradingService:
             account = account_loader(self.starting_equity)
             if account is not None:
                 self.starting_equity = float(account["starting_equity"])
+        risk_loader = getattr(self.repository, "load_or_create_paper_risk_state", None)
+        if callable(risk_loader):
+            state = risk_loader(self.starting_equity)
+            if state is not None:
+                self.kill_switch_active = bool(state["kill_switch_active"])
+                self.kill_switch_reasons = list(state["kill_switch_reasons"])
+                self.peak_equity = float(state["peak_equity"])
+                self.daily_pnl = float(state["daily_pnl"])
+                self.weekly_pnl = float(state["weekly_pnl"])
+                self.current_drawdown_pct = float(state["current_drawdown_pct"])
+                self.last_entry_at = _parse_datetime(state.get("last_entry_at"))
+                self.symbol_cooldown_until = {
+                    Symbol(symbol): parsed
+                    for symbol, value in dict(state["symbol_cooldowns"]).items()
+                    if (parsed := _parse_datetime(value)) is not None
+                }
         self.paper_positions_opened = sum(
             position.candidate_id is not None for position in restored
         )
@@ -101,6 +146,154 @@ class PaperTradingService:
         executed_loader = getattr(self.repository, "executed_candidate_ids", None)
         if callable(executed_loader):
             self.executed_candidate_ids = executed_loader()
+        self.refresh_risk_controls()
+
+    def refresh_risk_controls(
+        self, *, now: datetime | None = None, persist: bool = True
+    ) -> None:
+        now = _as_utc(now or datetime.now(timezone.utc))
+        self._expire_cooldowns(now)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = day_start - timedelta(days=day_start.weekday())
+        self.daily_pnl = sum(
+            item.realized_pnl
+            for item in self.closed_trades
+            if item.closed_at is not None and _as_utc(item.closed_at) >= day_start
+        )
+        self.weekly_pnl = sum(
+            item.realized_pnl
+            for item in self.closed_trades
+            if item.closed_at is not None and _as_utc(item.closed_at) >= week_start
+        )
+        self.peak_equity = max(self.peak_equity, self.equity, self.starting_equity)
+        self.current_drawdown_pct = (
+            max(0.0, (self.peak_equity - self.equity) / self.peak_equity * 100)
+            if self.peak_equity > 0
+            else 0.0
+        )
+
+        triggered: list[str] = []
+        if self.daily_pnl <= -(
+            self.starting_equity * self.max_daily_net_loss_pct / 100
+        ):
+            triggered.append("maximum daily net loss reached")
+        if self.weekly_pnl <= -(
+            self.starting_equity * self.max_weekly_net_loss_pct / 100
+        ):
+            triggered.append("maximum weekly net loss reached")
+        if self.current_drawdown_pct >= self.max_account_drawdown_pct:
+            triggered.append("maximum paper account drawdown reached")
+        if triggered:
+            self.kill_switch_active = True
+            self.kill_switch_reasons = list(
+                dict.fromkeys(self.kill_switch_reasons + triggered)
+            )
+        if persist:
+            self._persist_risk_state(now)
+
+    def reset_kill_switch(self, *, now: datetime | None = None) -> dict[str, object]:
+        now = _as_utc(now or datetime.now(timezone.utc))
+        self.kill_switch_active = False
+        self.kill_switch_reasons = []
+        self.peak_equity = max(self.equity, self.starting_equity)
+        self.current_drawdown_pct = 0.0
+        self._persist_risk_state(now)
+        return self.risk_status(now=now, refresh=False)
+
+    def entry_block_reasons(
+        self, symbol: Symbol, *, now: datetime | None = None
+    ) -> list[str]:
+        now = _as_utc(now or datetime.now(timezone.utc))
+        self.refresh_risk_controls(now=now)
+        reasons: list[str] = []
+        if self.kill_switch_active:
+            reasons.extend(self.kill_switch_reasons or ["paper kill switch is active"])
+        if any(item.symbol == symbol for item in self.open_positions):
+            reasons.append("maximum one open paper position per symbol reached")
+        if len(self.open_positions) >= self.max_total_open_positions:
+            reasons.append(
+                "maximum open paper positions reached: "
+                "maximum total open paper positions reached"
+            )
+        global_until = self._global_cooldown_until()
+        if global_until is not None and now < global_until:
+            reasons.append("global paper entry cooldown is active")
+        symbol_until = self.symbol_cooldown_until.get(symbol)
+        if symbol_until is not None and now < symbol_until:
+            reasons.append(f"paper symbol cooldown is active for {symbol.value}")
+        return list(dict.fromkeys(reasons))
+
+    def risk_status(
+        self, *, now: datetime | None = None, refresh: bool = True
+    ) -> dict[str, object]:
+        now = _as_utc(now or datetime.now(timezone.utc))
+        if refresh:
+            self.refresh_risk_controls(now=now)
+        global_until = self._global_cooldown_until()
+        global_remaining = (
+            max(0.0, (global_until - now).total_seconds())
+            if global_until is not None else 0.0
+        )
+        symbol_state = {
+            symbol.value: {
+                "until": until.isoformat(),
+                "remaining_seconds": max(0.0, (until - now).total_seconds()),
+            }
+            for symbol, until in self.symbol_cooldown_until.items()
+            if until > now
+        }
+        general_entries_allowed = (
+            not self.kill_switch_active
+            and len(self.open_positions) < self.max_total_open_positions
+            and global_remaining <= 0
+        )
+        return {
+            "entries_allowed": general_entries_allowed,
+            "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reasons": list(self.kill_switch_reasons),
+            "current_drawdown_pct": self.current_drawdown_pct,
+            "daily_pnl": self.daily_pnl,
+            "weekly_pnl": self.weekly_pnl,
+            "cooldown_state": {
+                "global_until": global_until.isoformat() if global_until else None,
+                "global_remaining_seconds": global_remaining,
+                "symbols": symbol_state,
+            },
+            "open_positions": len(self.open_positions),
+            "maximum_positions": self.max_total_open_positions,
+            "last_execution_error": self.last_execution_error_code or self.last_error,
+        }
+
+    def _global_cooldown_until(self) -> datetime | None:
+        if self.last_entry_at is None or self.global_entry_cooldown <= timedelta(0):
+            return None
+        return self.last_entry_at + self.global_entry_cooldown
+
+    def _expire_cooldowns(self, now: datetime) -> None:
+        self.symbol_cooldown_until = {
+            symbol: until
+            for symbol, until in self.symbol_cooldown_until.items()
+            if until > now
+        }
+
+    def _persist_risk_state(self, now: datetime) -> None:
+        saver = getattr(self.repository, "save_paper_risk_state", None)
+        if not callable(saver):
+            return
+        saver({
+            "kill_switch_active": self.kill_switch_active,
+            "kill_switch_reasons": list(self.kill_switch_reasons),
+            "peak_equity": self.peak_equity,
+            "daily_pnl": self.daily_pnl,
+            "weekly_pnl": self.weekly_pnl,
+            "current_drawdown_pct": self.current_drawdown_pct,
+            "last_entry_at": self.last_entry_at,
+            "symbol_cooldowns": {
+                symbol.value: until.isoformat()
+                for symbol, until in self.symbol_cooldown_until.items()
+            },
+            "updated_at": now,
+        })
 
     def open_from_candidate(
         self,
@@ -154,9 +347,10 @@ class PaperTradingService:
             self.paper_execution_risk_blocked += 1
             self.last_error = "risk preview is not approved"
             return None
-        if self.open_position is not None:
+        entry_blocks = self.entry_block_reasons(market.symbol)
+        if entry_blocks:
             self.paper_execution_risk_blocked += 1
-            self.last_error = "conflicting open paper position exists"
+            self.last_error = "; ".join(entry_blocks)
             return None
         execution_key = f"paper:{candidate_key}"
         side = Side.BUY if candidate.final_action == NewsSignalAction.BUY else Side.SELL
@@ -193,7 +387,13 @@ class PaperTradingService:
         position.unrealized_pnl = self._auto_net_pnl(position, market.last_price)
         atomic_persist = getattr(self.repository, "persist_paper_open_transaction", None)
         if callable(atomic_persist):
-            transaction = atomic_persist(candidate_key, risk_preview, position)
+            transaction = atomic_persist(
+                candidate_key,
+                risk_preview,
+                position,
+                max_total_open_positions=self.max_total_open_positions,
+                starting_equity=self.starting_equity,
+            )
             if transaction.get("status") == "EXISTING":
                 self.paper_execution_duplicates_blocked += 1
                 self.last_execution_duplicate = True
@@ -212,6 +412,12 @@ class PaperTradingService:
                     transaction.get("error_code") or "DB_PERSISTENCE_ERROR"
                 )
                 self.last_execution_retryable = bool(transaction.get("retryable", True))
+                return None
+            if transaction.get("status") == "BLOCKED":
+                self.paper_execution_risk_blocked += 1
+                self.last_error = str(
+                    transaction.get("reason") or "paper position limit reached"
+                )
                 return None
             position.risk_decision_id = int(transaction["risk_decision_id"])
             execution_key = str(transaction["execution_key"])
@@ -238,6 +444,8 @@ class PaperTradingService:
         self.last_position_opened = True
         self.last_execution_details = position.model_dump(mode="json")
         self.last_error = None
+        self.last_entry_at = datetime.now(timezone.utc)
+        self.refresh_risk_controls(now=self.last_entry_at)
         if not callable(atomic_persist):
             self._persist(position)
             self._update_execution(candidate_key, "PAPER_OPENED", position)
@@ -291,7 +499,7 @@ class PaperTradingService:
 
     @property
     def open_position(self) -> PaperPosition | None:
-        return next((position for position in self.positions if position.status == PositionStatus.OPEN), None)
+        return next(iter(self.open_positions), None)
 
     @property
     def status(self) -> str:
@@ -322,8 +530,9 @@ class PaperTradingService:
         if not risk_decision.approved:
             self.last_error = "risk manager rejected signal"
             raise PermissionError(self.last_error)
-        if self.open_position is not None:
-            self.last_error = "maximum open paper positions reached"
+        entry_blocks = self.entry_block_reasons(signal.symbol)
+        if entry_blocks:
+            self.last_error = "; ".join(entry_blocks)
             raise RuntimeError(self.last_error)
         if signal.side is None:
             self.last_error = "signal side is required"
@@ -377,6 +586,8 @@ class PaperTradingService:
         )
         self.positions.append(position)
         self._persist(position)
+        self.last_entry_at = datetime.now(timezone.utc)
+        self.refresh_risk_controls(now=self.last_entry_at)
         self.last_error = None
         return position
 
@@ -386,9 +597,12 @@ class PaperTradingService:
         *,
         now: datetime | None = None,
     ) -> PaperPosition | None:
-        position = self.open_position
-        if position is None or position.symbol != market.symbol:
-            return position
+        position = next(
+            (item for item in self.open_positions if item.symbol == market.symbol),
+            None,
+        )
+        if position is None:
+            return None
 
         now = now or datetime.now(timezone.utc)
         position.current_price = market.last_price
@@ -402,12 +616,22 @@ class PaperTradingService:
         )
 
         if _stop_loss_hit(position):
-            return self.close_position(market.last_price, reason="stop_loss", now=now)
+            return self.close_position(
+                market.last_price, reason="stop_loss", now=now,
+                position_id=position.id,
+            )
         if _take_profit_hit(position):
-            return self.close_position(market.last_price, reason="take_profit", now=now)
+            return self.close_position(
+                market.last_price, reason="take_profit", now=now,
+                position_id=position.id,
+            )
         if now - position.opened_at >= self.timeout:
-            return self.close_position(market.last_price, reason="timeout", now=now)
+            return self.close_position(
+                market.last_price, reason="timeout", now=now,
+                position_id=position.id,
+            )
         self._persist(position)
+        self.refresh_risk_controls(now=now)
         return position
 
     def close_position(
@@ -416,9 +640,12 @@ class PaperTradingService:
         *,
         reason: str,
         now: datetime | None = None,
+        position_id: object | None = None,
     ) -> PaperPosition:
         with self._execution_lock:
-            return self._close_position(exit_price, reason=reason, now=now)
+            return self._close_position(
+                exit_price, reason=reason, now=now, position_id=position_id
+            )
 
     def _close_position(
         self,
@@ -426,12 +653,19 @@ class PaperTradingService:
         *,
         reason: str,
         now: datetime | None = None,
+        position_id: object | None = None,
     ) -> PaperPosition:
         allowed_reasons = {"manual_close", "stop_loss", "take_profit", "timeout"}
         if reason not in allowed_reasons:
             self.last_error = f"unsupported close reason: {reason}"
             raise ValueError(self.last_error)
-        open_position = self.open_position
+        open_position = next(
+            (
+                item for item in self.open_positions
+                if position_id is None or str(item.id) == str(position_id)
+            ),
+            None,
+        )
         if open_position is None:
             self.last_error = "no open paper position"
             raise RuntimeError(self.last_error)
@@ -499,6 +733,11 @@ class PaperTradingService:
                 self._update_execution(
                     str(position.candidate_id), "PAPER_CLOSED", position
                 )
+        if self.symbol_cooldown > timedelta(0):
+            self.symbol_cooldown_until[position.symbol] = (
+                _as_utc(now) + self.symbol_cooldown
+            )
+        self.refresh_risk_controls(now=_as_utc(now))
         self.last_error = None
         return position
 
@@ -527,6 +766,7 @@ class PaperTradingService:
         return [position.model_dump(mode="json") for position in self.closed_trades]
 
     def as_status(self) -> dict[str, object]:
+        risk = self.risk_status()
         return {
             "status": self.status,
             "starting_equity": self.starting_equity,
@@ -534,6 +774,7 @@ class PaperTradingService:
             "open_position": (
                 self.open_position.model_dump(mode="json") if self.open_position else None
             ),
+            "open_positions": self.positions_payload(),
             "realized_pnl": self.pnl().realized_pnl,
             "unrealized_pnl": self.pnl().unrealized_pnl,
             "last_trade": (
@@ -551,7 +792,25 @@ class PaperTradingService:
             "paper_execution_duplicates_blocked": self.paper_execution_duplicates_blocked,
             "paper_execution_risk_blocked": self.paper_execution_risk_blocked,
             "paper_fees_paid": self.fees_paid,
+            **risk,
         }
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if isinstance(value, str) and value:
+        try:
+            return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+        except ValueError:
+            return None
+    return None
 
 
 def _calculate_pnl(

@@ -50,6 +50,7 @@ def build_status(
         api_stable=market_data.status == "OK",
     )
     risk_rules = RiskRules(
+        max_open_positions=settings.paper_max_total_open_positions,
         max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
         max_daily_loss_pct=settings.max_daily_loss_pct,
         max_weekly_loss_pct=settings.max_weekly_loss_pct,
@@ -116,6 +117,7 @@ def build_status(
         "strategy": "NewsMomentumStrategy",
         "execution": "paper" if settings.bot_mode == BotMode.PAPER else "disabled",
         "auto_paper_execution": settings.auto_paper_execution,
+        "auto_paper_enabled": settings.auto_paper_execution,
         "open_paper_position": paper_status["open_position"],
         "last_signal": signal.model_dump(mode="json") if signal else None,
         "last_signal_candidate": (
@@ -239,6 +241,16 @@ def build_status(
         "paper_execution_risk_blocked": paper_status["paper_execution_risk_blocked"],
         "paper_equity": paper_status["equity"],
         "paper_fees_paid": paper_status["paper_fees_paid"],
+        "entries_allowed": paper_status["entries_allowed"],
+        "kill_switch_active": paper_status["kill_switch_active"],
+        "kill_switch_reasons": paper_status["kill_switch_reasons"],
+        "current_drawdown_pct": paper_status["current_drawdown_pct"],
+        "daily_pnl": paper_status["daily_pnl"],
+        "weekly_pnl": paper_status["weekly_pnl"],
+        "cooldown_state": paper_status["cooldown_state"],
+        "open_positions": paper_status["open_positions"],
+        "maximum_positions": paper_status["maximum_positions"],
+        "last_execution_error": paper_status["last_execution_error"],
         "last_paper_trade": paper_status["last_trade"],
         "last_risk_decision": paper_status["last_risk_decision"],
         "risk_status": {

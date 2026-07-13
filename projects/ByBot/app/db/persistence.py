@@ -7,7 +7,7 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, String, UniqueConstraint, create_engine, select
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, String, UniqueConstraint, create_engine, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
@@ -100,7 +100,13 @@ class PaperPositionRow(Base):
     __tablename__ = "paper_positions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False)
+    symbol: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    open_slot: Mapped[str | None] = mapped_column(String(20), nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    __table_args__ = (
+        Index("uq_paper_positions_open_slot", "open_slot", unique=True),
+    )
 
 
 class PaperTradeRow(Base):
@@ -117,6 +123,24 @@ class PaperAccountRow(Base):
     realized_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     fees_paid: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     equity: Mapped[float] = mapped_column(Float, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+
+class PaperRiskStateRow(Base):
+    __tablename__ = "paper_risk_state"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    kill_switch_reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    peak_equity: Mapped[float] = mapped_column(Float, nullable=False)
+    daily_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    weekly_pnl: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    current_drawdown_pct: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    last_entry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    symbol_cooldowns: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
@@ -329,6 +353,9 @@ class PersistenceRepository:
         candidate_id: str,
         preview: SignalRiskPreview,
         position: PaperPosition,
+        *,
+        max_total_open_positions: int = 1,
+        starting_equity: float = 10_000.0,
     ) -> dict[str, Any]:
         """Atomically persist risk, execution reservation, and opened position."""
         if not self.available:
@@ -352,6 +379,25 @@ class PersistenceRepository:
                         "position_id": existing_execution.position_id,
                         "state": existing_execution.state,
                         "payload": existing_execution.payload,
+                    }
+
+                # Lock the singleton account row to serialize all paper entry
+                # reservations, including the empty-position case.
+                self._paper_account_for_update(session, starting_equity)
+                open_rows = session.scalars(
+                    select(PaperPositionRow)
+                    .where(PaperPositionRow.status == PositionStatus.OPEN.value)
+                    .with_for_update()
+                ).all()
+                if any(row.open_slot == position.symbol.value for row in open_rows):
+                    return {
+                        "status": "BLOCKED",
+                        "reason": "maximum one open paper position per symbol reached",
+                    }
+                if len(open_rows) >= max_total_open_positions:
+                    return {
+                        "status": "BLOCKED",
+                        "reason": "maximum total open paper positions reached",
                     }
 
                 risk_row = None
@@ -413,6 +459,9 @@ class PersistenceRepository:
                 position_payload = _paper_execution_payload(position)
                 session.add(PaperPositionRow(
                     id=str(position.id), status=position.status.value,
+                    symbol=position.symbol.value,
+                    candidate_id=candidate_id,
+                    open_slot=position.symbol.value,
                     payload=position.model_dump(mode="json"),
                 ))
                 session.flush()
@@ -428,7 +477,7 @@ class PersistenceRepository:
                 "risk_decision_id": risk_row.id,
                 "payload": position_payload,
             }
-        except IntegrityError:
+        except IntegrityError as exc:
             session.rollback()
             existing = self.paper_execution_details(candidate_id)
             if existing and existing.get("position_id"):
@@ -683,6 +732,11 @@ class PersistenceRepository:
 
                 payload = position.model_dump(mode="json")
                 row.status = PositionStatus.CLOSED.value
+                row.symbol = position.symbol.value
+                row.candidate_id = (
+                    str(position.candidate_id) if position.candidate_id else None
+                )
+                row.open_slot = None
                 row.payload = payload
                 session.add(PaperTradeRow(
                     id=position_id,
@@ -766,13 +820,75 @@ class PersistenceRepository:
         session.flush()
         return account
 
+    def load_or_create_paper_risk_state(
+        self, starting_equity: float
+    ) -> dict[str, Any] | None:
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(PaperRiskStateRow, 1)
+                if row is None:
+                    now = datetime.now(timezone.utc)
+                    row = PaperRiskStateRow(
+                        id=1,
+                        kill_switch_active=False,
+                        kill_switch_reasons=[],
+                        peak_equity=float(starting_equity),
+                        daily_pnl=0.0,
+                        weekly_pnl=0.0,
+                        current_drawdown_pct=0.0,
+                        last_entry_at=None,
+                        symbol_cooldowns={},
+                        updated_at=now,
+                    )
+                    session.add(row)
+                    session.flush()
+                return _paper_risk_state_payload(row)
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def save_paper_risk_state(self, state: dict[str, Any]) -> None:
+        if not self.available:
+            return
+        try:
+            with Session(self.engine) as session:
+                session.merge(PaperRiskStateRow(
+                    id=1,
+                    kill_switch_active=bool(state["kill_switch_active"]),
+                    kill_switch_reasons=list(state["kill_switch_reasons"]),
+                    peak_equity=float(state["peak_equity"]),
+                    daily_pnl=float(state["daily_pnl"]),
+                    weekly_pnl=float(state["weekly_pnl"]),
+                    current_drawdown_pct=float(state["current_drawdown_pct"]),
+                    last_entry_at=state.get("last_entry_at"),
+                    symbol_cooldowns=dict(state["symbol_cooldowns"]),
+                    updated_at=state.get("updated_at") or datetime.now(timezone.utc),
+                ))
+                session.commit()
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+
     def save_paper_position(self, position: PaperPosition) -> None:
         if not self.available:
             return
         try:
             with Session(self.engine) as session:
                 payload = position.model_dump(mode="json")
-                session.merge(PaperPositionRow(id=str(position.id), status=position.status.value, payload=payload))
+                session.merge(PaperPositionRow(
+                    id=str(position.id),
+                    status=position.status.value,
+                    symbol=position.symbol.value,
+                    candidate_id=(
+                        str(position.candidate_id) if position.candidate_id else None
+                    ),
+                    open_slot=(
+                        position.symbol.value
+                        if position.status == PositionStatus.OPEN else None
+                    ),
+                    payload=payload,
+                ))
                 if position.closed_at:
                     session.merge(PaperTradeRow(id=str(position.id), realized_pnl=position.realized_pnl, payload=payload))
                 session.commit()
@@ -832,6 +948,20 @@ def _paper_account_payload(account: PaperAccountRow) -> dict[str, float]:
         "realized_pnl": float(account.realized_pnl),
         "fees_paid": float(account.fees_paid),
         "equity": float(account.equity),
+    }
+
+
+def _paper_risk_state_payload(row: PaperRiskStateRow) -> dict[str, Any]:
+    return {
+        "kill_switch_active": bool(row.kill_switch_active),
+        "kill_switch_reasons": list(row.kill_switch_reasons),
+        "peak_equity": float(row.peak_equity),
+        "daily_pnl": float(row.daily_pnl),
+        "weekly_pnl": float(row.weekly_pnl),
+        "current_drawdown_pct": float(row.current_drawdown_pct),
+        "last_entry_at": row.last_entry_at,
+        "symbol_cooldowns": dict(row.symbol_cooldowns),
+        "updated_at": row.updated_at,
     }
 
 

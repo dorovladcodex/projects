@@ -78,6 +78,41 @@ def test_health_and_status_report_live_disabled() -> None:
     assert payload["account"]["trading_enabled"] is False
     assert payload["paper_trading_status"] in {"IDLE", "OPEN_POSITION"}
     assert payload["risk_status"]["state"] in {"OK", "BLOCKED"}
+    for field in (
+        "auto_paper_enabled",
+        "entries_allowed",
+        "kill_switch_active",
+        "kill_switch_reasons",
+        "current_drawdown_pct",
+        "daily_pnl",
+        "weekly_pnl",
+        "cooldown_state",
+        "open_positions",
+        "maximum_positions",
+        "last_execution_error",
+        "persistence_status",
+    ):
+        assert field in payload
+
+
+def test_local_test_mode_can_reset_persisted_paper_kill_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        Settings(_env_file=None, app_env="local", test_mode=True),
+    )
+    service = PaperTradingService()
+    service.kill_switch_active = True
+    service.kill_switch_reasons = ["test loss limit"]
+    monkeypatch.setattr(main_module, "paper_trading_service", service)
+
+    payload = main_module.paper_test_reset_kill_switch()
+
+    assert payload["risk_control"]["kill_switch_active"] is False
+    assert payload["risk_control"]["kill_switch_reasons"] == []
+    assert payload["exchange_order_placement"] == "blocked"
 
 
 def test_market_endpoint_returns_snapshots() -> None:

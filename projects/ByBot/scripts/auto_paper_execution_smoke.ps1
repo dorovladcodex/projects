@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$HelpersOnly)
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -587,6 +587,8 @@ function Write-FailureDiagnostics {
         Write-Warning "Could not read uvicorn diagnostic logs: $($_.Exception.Message)"
     }
 }
+
+if ($HelpersOnly) { return }
 
 try {
     New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
