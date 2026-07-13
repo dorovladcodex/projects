@@ -7,13 +7,15 @@ import re
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, String, UniqueConstraint, create_engine, select
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Numeric, String, UniqueConstraint, create_engine, event, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from app.models import (
     CandidateLifecycleState,
     ClassificationStatus,
+    DemoExecutionRecord,
+    DemoExecutionState,
     NewsClassification,
     NewsItem,
     PaperPosition,
@@ -23,6 +25,8 @@ from app.models import (
     SignalDryRunResult,
 )
 from app.db.url import normalize_database_url
+from app.db.news_repair import audit_news_row, audit_persistence_payload, inspect_or_repair_news_rows, sanitized_validation_error
+from pydantic import ValidationError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,8 +40,45 @@ class NewsItemRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     normalized_url: Mapped[str | None] = mapped_column(String(1000), unique=True, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    title: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    summary: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    asset_hint: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    raw_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    importance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    is_quarantined: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PersistenceQuarantineRow(Base):
+    __tablename__ = "persistence_quarantine"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    original_table: Mapped[str] = mapped_column(String(100), nullable=False)
+    original_row_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    original_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    validation_error: Mapped[str] = mapped_column(String(1000), nullable=False)
+    repair_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    quarantined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("original_table", "original_row_id", name="uq_persistence_quarantine_origin"),
+    )
+
+
+@event.listens_for(NewsItemRow, "before_insert")
+@event.listens_for(NewsItemRow, "before_update")
+def _enforce_complete_news_payload(_mapper: object, _connection: object, target: NewsItemRow) -> None:
+    if target.is_quarantined:
+        return
+    item = NewsItem.model_validate(target.payload)
+    if any(value in (None, "") for value in (
+        target.title, target.summary, target.source, target.published_at
+    )):
+        raise ValueError("non-quarantined NewsItem rows require complete dedicated fields")
+    if str(item.id) != str(target.id):
+        raise ValueError("NewsItem payload ID must match the database row ID")
 
 
 class NewsClassificationRow(Base):
@@ -163,6 +204,52 @@ class PaperExecutionRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class DemoExecutionRow(Base):
+    __tablename__ = "demo_executions"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("signal_candidates.id"), unique=True, nullable=False
+    )
+    risk_decision_id: Mapped[int | None] = mapped_column(
+        ForeignKey("risk_decisions.id"), nullable=True
+    )
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_link_id: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    state: Mapped[str] = mapped_column(String(40), nullable=False)
+    requested_quantity: Mapped[Any] = mapped_column(Numeric(36, 18), nullable=False)
+    accepted_quantity: Mapped[Any] = mapped_column(Numeric(36, 18), nullable=False)
+    average_fill_price: Mapped[Any | None] = mapped_column(Numeric(36, 18), nullable=True)
+    close_order_link_id: Mapped[str | None] = mapped_column(String(36), unique=True, nullable=True)
+    close_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    realized_exchange_pnl: Mapped[Any] = mapped_column(Numeric(36, 18), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DemoExecutionEventRow(Base):
+    __tablename__ = "demo_execution_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    execution_id: Mapped[str | None] = mapped_column(
+        ForeignKey("demo_executions.id"), nullable=True
+    )
+    event_key: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DemoKillSwitchRow(Base):
+    __tablename__ = "demo_kill_switch"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class PersistenceRepository:
     """Small synchronous repository. Failures degrade persistence, never trading safety."""
 
@@ -173,6 +260,10 @@ class PersistenceRepository:
         self.available = False
         self.last_error: str | None = None
         self.last_error_code: str | None = None
+        self.news_restore_valid_count = 0
+        self.news_restore_repaired_count = 0
+        self.news_restore_quarantined_count = 0
+        self.news_restore_last_error: str | None = None
         try:
             self.engine = create_engine(
                 sqlalchemy_url, pool_pre_ping=True, connect_args=connect_args
@@ -188,10 +279,17 @@ class PersistenceRepository:
     def save_news(self, item: NewsItem) -> bool:
         if not self.available:
             return False
+        # Revalidate the serialized boundary as well as the typed input. This
+        # prevents future producer changes from persisting partial payloads.
+        payload = item.model_dump(mode="json")
+        validated = NewsItem.model_validate(payload)
         row = NewsItemRow(
-            id=str(item.id), normalized_url=normalize_url(item.url),
-            content_hash=news_content_hash(item), payload=item.model_dump(mode="json"),
-            received_at=item.received_at,
+            id=str(validated.id), normalized_url=normalize_url(validated.url),
+            content_hash=news_content_hash(validated),
+            title=validated.title, summary=validated.summary, source=validated.source,
+            published_at=validated.published_at, asset_hint=validated.asset_hint.value,
+            raw_category=validated.raw_category, importance=validated.importance,
+            is_quarantined=False, payload=payload, received_at=validated.received_at,
         )
         try:
             with Session(self.engine) as session:
@@ -649,20 +747,118 @@ class PersistenceRepository:
         if not self.available:
             return [], []
         try:
-            with Session(self.engine) as session:
-                news = [NewsItem.model_validate(row.payload) for row in session.scalars(select(NewsItemRow)).all()]
-                classifications = [NewsClassification.model_validate(row.payload) for row in session.scalars(select(NewsClassificationRow)).all()]
+            news: list[NewsItem] = []
+            classifications: list[NewsClassification] = []
+            with Session(self.engine) as session, session.begin():
+                report = inspect_or_repair_news_rows(session, apply=True)
+                rows = session.scalars(select(NewsItemRow).where(
+                    NewsItemRow.is_quarantined.is_(False)
+                ).order_by(NewsItemRow.received_at, NewsItemRow.id)).all()
+                for row in rows:
+                    try:
+                        news.append(NewsItem.model_validate(row.payload))
+                    except (ValidationError, ValueError, TypeError) as exc:
+                        # A concurrent/manual malformed row still cannot take down
+                        # startup. The next repair pass quarantines it atomically.
+                        error = sanitized_validation_error(exc)
+                        LOGGER.warning(
+                            "news restore rejected row: table=news_items row_id=%s error=%s",
+                            row.id, error,
+                        )
+                        audit_news_row(
+                            session, row, validation_error=error,
+                            repair_status="QUARANTINED",
+                            now=datetime.now(timezone.utc),
+                        )
+                        row.is_quarantined = True
+                valid_ids = {str(item.id) for item in news}
+                for row in session.scalars(select(NewsClassificationRow)).all():
+                    if row.news_id not in valid_ids:
+                        continue
+                    try:
+                        classifications.append(NewsClassification.model_validate(row.payload))
+                    except (ValidationError, ValueError, TypeError) as exc:
+                        LOGGER.warning(
+                            "classification restore rejected row: table=news_classifications row_id=%s error=%s",
+                            row.id, sanitized_validation_error(exc),
+                        )
+
+                quarantine_rows = session.scalars(select(PersistenceQuarantineRow).where(
+                    PersistenceQuarantineRow.original_table == "news_items"
+                )).all()
+                self.news_restore_valid_count = len(news)
+                self.news_restore_repaired_count = sum(
+                    row.repair_status == "REPAIRED" for row in quarantine_rows
+                )
+                self.news_restore_quarantined_count = sum(
+                    row.repair_status == "QUARANTINED" for row in quarantine_rows
+                )
+                latest_quarantine = next(
+                    (
+                        row for row in sorted(
+                            quarantine_rows, key=lambda item: item.updated_at, reverse=True
+                        ) if row.repair_status == "QUARANTINED"
+                    ),
+                    None,
+                )
+                self.news_restore_last_error = (
+                    latest_quarantine.validation_error if latest_quarantine else None
+                )
+                for row_id in report.quarantined_row_ids:
+                    LOGGER.warning(
+                        "news row quarantined during restore: table=news_items row_id=%s",
+                        row_id,
+                    )
             return news, classifications
         except SQLAlchemyError as exc:
             self._failed(exc)
             return [], []
 
-    def load_signal_results(self) -> list[SignalDryRunResult]:
+    def quarantined_news_ids(self) -> list[str]:
         if not self.available:
             return []
         try:
             with Session(self.engine) as session:
-                return [SignalDryRunResult.model_validate({"candidate": row.payload, "risk_preview": row.risk_preview}) for row in session.scalars(select(SignalCandidateRow)).all()]
+                return list(session.scalars(select(NewsItemRow.id).where(
+                    NewsItemRow.is_quarantined.is_(True)
+                )).all())
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
+    def load_signal_results(self) -> list[SignalDryRunResult]:
+        if not self.available:
+            return []
+        try:
+            results: list[SignalDryRunResult] = []
+            with Session(self.engine) as session, session.begin():
+                rows = session.scalars(
+                    select(SignalCandidateRow)
+                    .join(NewsItemRow, SignalCandidateRow.news_id == NewsItemRow.id)
+                    .where(NewsItemRow.is_quarantined.is_(False))
+                ).all()
+                for row in rows:
+                    try:
+                        results.append(SignalDryRunResult.model_validate({
+                            "candidate": row.payload,
+                            "risk_preview": row.risk_preview,
+                        }))
+                    except (ValidationError, ValueError, TypeError) as exc:
+                        error = sanitized_validation_error(exc)
+                        audit_persistence_payload(
+                            session,
+                            original_table="signal_candidates",
+                            original_row_id=str(row.id),
+                            original_payload=(dict(row.payload) if isinstance(row.payload, dict) else None),
+                            validation_error=error,
+                            repair_status="QUARANTINED",
+                            now=datetime.now(timezone.utc),
+                        )
+                        LOGGER.warning(
+                            "signal candidate quarantined during restore: row_id=%s error=%s",
+                            row.id, error,
+                        )
+            return results
         except SQLAlchemyError as exc:
             self._failed(exc)
             return []
@@ -905,6 +1101,184 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
+    def reserve_demo_execution(
+        self, record: DemoExecutionRecord
+    ) -> DemoExecutionRecord | None:
+        """Durably reserve a candidate before any exchange create-order call."""
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session, session.begin():
+                existing = session.scalar(
+                    select(DemoExecutionRow)
+                    .where(DemoExecutionRow.candidate_id == str(record.candidate_id))
+                    .with_for_update()
+                )
+                if existing is not None:
+                    return DemoExecutionRecord.model_validate(existing.payload)
+                candidate = session.get(SignalCandidateRow, str(record.candidate_id))
+                if candidate is None:
+                    raise ValueError("signal candidate row is missing")
+                row = _demo_execution_row(record)
+                session.add(row)
+                _set_candidate_demo_state(candidate, record.state)
+                session.flush()
+            return record
+        except IntegrityError:
+            return self.get_demo_execution(str(record.candidate_id))
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+        except ValueError as exc:
+            self.last_error = type(exc).__name__
+            self.last_error_code = "DB_DEMO_RESERVATION_INVALID"
+            LOGGER.error("Demo reservation failed: type=%s", type(exc).__name__)
+            return None
+
+    def save_demo_execution(
+        self, record: DemoExecutionRecord, *, event_type: str
+    ) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                existing = session.get(DemoExecutionRow, str(record.id))
+                row = _demo_execution_row(record)
+                if existing is None:
+                    session.add(row)
+                else:
+                    for column in (
+                        "risk_decision_id", "run_id", "order_link_id", "order_id",
+                        "symbol", "side", "state", "requested_quantity",
+                        "accepted_quantity", "average_fill_price", "close_order_link_id", "close_order_id",
+                        "realized_exchange_pnl", "payload", "updated_at",
+                    ):
+                        setattr(existing, column, getattr(row, column))
+                candidate = session.get(SignalCandidateRow, str(record.candidate_id))
+                if candidate is not None:
+                    _set_candidate_demo_state(candidate, record.state)
+                session.add(DemoExecutionEventRow(
+                    id=str(uuid4()),
+                    execution_id=str(record.id),
+                    event_key=(
+                        f"local:{record.id}:{event_type}:"
+                        f"{record.updated_at.isoformat()}"
+                    ),
+                    event_type=event_type,
+                    payload=record.model_dump(mode="json"),
+                    occurred_at=record.updated_at,
+                ))
+                session.flush()
+            return True
+        except IntegrityError:
+            # Replayed state-transition events are harmless.
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def get_demo_execution(self, candidate_id: str) -> DemoExecutionRecord | None:
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session:
+                row = session.scalar(select(DemoExecutionRow).where(
+                    DemoExecutionRow.candidate_id == candidate_id
+                ))
+                return DemoExecutionRecord.model_validate(row.payload) if row else None
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def find_demo_execution(
+        self, order_link_id: str, order_id: str
+    ) -> DemoExecutionRecord | None:
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session:
+                predicates = []
+                if order_link_id:
+                    predicates.append(DemoExecutionRow.order_link_id == order_link_id)
+                    predicates.append(DemoExecutionRow.close_order_link_id == order_link_id)
+                if order_id:
+                    predicates.append(DemoExecutionRow.order_id == order_id)
+                    predicates.append(DemoExecutionRow.close_order_id == order_id)
+                for predicate in predicates:
+                    row = session.scalar(select(DemoExecutionRow).where(predicate))
+                    if row is not None:
+                        return DemoExecutionRecord.model_validate(row.payload)
+            return None
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def load_demo_executions(self) -> list[DemoExecutionRecord]:
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                return [
+                    DemoExecutionRecord.model_validate(row.payload)
+                    for row in session.scalars(select(DemoExecutionRow)).all()
+                ]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
+    def record_demo_event(
+        self, event_key: str, event_type: str, payload: dict[str, Any]
+    ) -> bool:
+        """Return False for an already processed private-stream event."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session:
+                session.add(DemoExecutionEventRow(
+                    id=str(uuid4()), execution_id=None, event_key=event_key,
+                    event_type=event_type, payload=payload,
+                    occurred_at=datetime.now(timezone.utc),
+                ))
+                session.commit()
+            return True
+        except IntegrityError:
+            return False
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def load_demo_kill_switch(self) -> dict[str, Any] | None:
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session:
+                row = session.get(DemoKillSwitchRow, 1)
+                if row is None:
+                    return None
+                return {
+                    "active": row.active,
+                    "reasons": list(row.reasons),
+                    "updated_at": row.updated_at,
+                }
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def save_demo_kill_switch(self, active: bool, reasons: list[str]) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session:
+                session.merge(DemoKillSwitchRow(
+                    id=1, active=active, reasons=list(reasons),
+                    updated_at=datetime.now(timezone.utc),
+                ))
+                session.commit()
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
     def _failed(self, exc: SQLAlchemyError) -> None:
         self.available = False
         self.last_error = type(exc).__name__
@@ -914,6 +1288,38 @@ class PersistenceRepository:
             type(exc).__name__,
             _sanitize_database_error(str(exc)),
         )
+
+
+def _demo_execution_row(record: DemoExecutionRecord) -> DemoExecutionRow:
+    return DemoExecutionRow(
+        id=str(record.id),
+        candidate_id=str(record.candidate_id),
+        risk_decision_id=record.risk_decision_id,
+        run_id=record.run_id,
+        order_link_id=record.order_link_id,
+        order_id=record.order_id,
+        symbol=record.symbol.value,
+        side=record.side.value,
+        state=record.state.value,
+        requested_quantity=record.requested_quantity,
+        accepted_quantity=record.accepted_quantity,
+        average_fill_price=record.average_fill_price,
+        close_order_link_id=record.close_order_link_id,
+        close_order_id=record.close_order_id,
+        realized_exchange_pnl=record.realized_exchange_pnl,
+        payload=record.model_dump(mode="json"),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _set_candidate_demo_state(
+    candidate: SignalCandidateRow, state: DemoExecutionState
+) -> None:
+    candidate.state = state.value
+    payload = dict(candidate.payload)
+    payload["state"] = state.value
+    candidate.payload = payload
 
 
 def normalize_url(url: str | None) -> str | None:

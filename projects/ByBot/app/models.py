@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from uuid import UUID, uuid4
 
@@ -84,6 +85,73 @@ class CandidateLifecycleState(str, Enum):
     PAPER_OPENED = "PAPER_OPENED"
     PAPER_CLOSED = "PAPER_CLOSED"
     EXECUTION_BLOCKED = "EXECUTION_BLOCKED"
+    DEMO_SUBMITTING = "DEMO_SUBMITTING"
+    DEMO_ACCEPTED = "DEMO_ACCEPTED"
+    DEMO_PARTIALLY_FILLED = "DEMO_PARTIALLY_FILLED"
+    DEMO_FILLED = "DEMO_FILLED"
+    DEMO_PROTECTION_PENDING = "DEMO_PROTECTION_PENDING"
+    DEMO_POSITION_OPEN = "DEMO_POSITION_OPEN"
+    DEMO_CLOSING = "DEMO_CLOSING"
+    DEMO_CLOSED = "DEMO_CLOSED"
+    DEMO_FAILED = "DEMO_FAILED"
+    DEMO_RECONCILIATION_REQUIRED = "DEMO_RECONCILIATION_REQUIRED"
+
+
+class DemoExecutionState(str, Enum):
+    DEMO_SUBMITTING = "DEMO_SUBMITTING"
+    DEMO_ACCEPTED = "DEMO_ACCEPTED"
+    DEMO_PARTIALLY_FILLED = "DEMO_PARTIALLY_FILLED"
+    DEMO_FILLED = "DEMO_FILLED"
+    DEMO_PROTECTION_PENDING = "DEMO_PROTECTION_PENDING"
+    DEMO_POSITION_OPEN = "DEMO_POSITION_OPEN"
+    DEMO_CLOSING = "DEMO_CLOSING"
+    DEMO_CLOSED = "DEMO_CLOSED"
+    DEMO_FAILED = "DEMO_FAILED"
+    DEMO_RECONCILIATION_REQUIRED = "DEMO_RECONCILIATION_REQUIRED"
+
+
+class DemoFill(BaseModel):
+    execution_id: str
+    order_id: str
+    quantity: Decimal = Field(gt=0)
+    price: Decimal = Field(gt=0)
+    fee: Decimal = Decimal("0")
+    fee_currency: str | None = None
+    executed_at: datetime
+
+
+class DemoExecutionRecord(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    candidate_id: UUID
+    risk_decision_id: int | None = None
+    run_id: str
+    order_link_id: str
+    state: DemoExecutionState
+    symbol: Symbol
+    side: Side
+    requested_quantity: Decimal = Field(gt=0)
+    reference_entry_price: Decimal | None = Field(default=None, gt=0)
+    accepted_quantity: Decimal = Field(default=Decimal("0"), ge=0)
+    average_fill_price: Decimal | None = Field(default=None, gt=0)
+    order_id: str | None = None
+    fills: list[DemoFill] = Field(default_factory=list)
+    exchange_fees: Decimal = Decimal("0")
+    take_profit: Decimal | None = None
+    stop_loss: Decimal | None = None
+    tp_identifier: str | None = None
+    sl_identifier: str | None = None
+    protection_confirmed: bool = False
+    close_order_link_id: str | None = None
+    close_order_id: str | None = None
+    close_fills: list[DemoFill] = Field(default_factory=list)
+    realized_exchange_pnl: Decimal = Decimal("0")
+    entry_slippage: Decimal | None = None
+    exit_slippage: Decimal | None = None
+    paper_shadow_pnl: Decimal | None = None
+    close_reason: str | None = None
+    last_error: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class PositionStatus(str, Enum):
@@ -353,6 +421,7 @@ class SignalDryRunResult(BaseModel):
     execution_block_reason: str | None = None
     execution_error_code: str | None = None
     execution_retryable: bool = False
+    demo_execution: dict[str, object] | None = None
 
 
 class PaperOrder(BaseModel):

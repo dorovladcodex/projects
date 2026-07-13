@@ -41,8 +41,8 @@ try {
 
     $unique = [guid]::NewGuid().ToString("N")
     $news = Invoke-Api POST "/news/test-item" @{
-        title = "SEC closes Bitcoin investigation without enforcement $unique"
-        summary = "Removal of a major regulatory barrier is materially bullish for BTC institutional demand."
+        title = "SEC approves spot Bitcoin ETF from BlackRock $unique"
+        summary = "The Bitcoin ETF approval is confirmed and supports institutional adoption."
         source = "paper-execution-smoke"
         url = "https://example.invalid/paper-execution/$unique"
         published_at = [DateTimeOffset]::UtcNow.ToString("o")

@@ -136,7 +136,10 @@ Deferred from Phase 4A:
 
 ## Phase 4B - Bybit demo only
 
-- Authenticated Bybit Demo adapter with strict environment checks
-- Idempotent order lifecycle and reconciliation
+- Authenticated exact-domain Bybit Demo adapter with fail-closed environment checks
+- Durable idempotent order/fill/protection/close lifecycle and reconciliation
+- Private Demo WebSocket plus REST fallback and controlled restart recovery
+- Exchange-side TP/SL with emergency reduce-only close and persisted kill switch
+- Human-confirmed 12-hour real-pipeline Demo soak runner
 - Operational runbooks for Docker Compose on GCP VM
-- No live-trading activation path in v1
+- No live/mainnet/testnet activation path

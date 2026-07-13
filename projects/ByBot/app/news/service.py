@@ -76,6 +76,10 @@ class NewsService:
         self.news_duplicates_skipped = 0
         self.news_skipped_before_codex_count = 0
         self.classifications_trade_eligible = 0
+        self.news_restore_valid_count = 0
+        self.news_restore_repaired_count = 0
+        self.news_restore_quarantined_count = 0
+        self.news_restore_last_error: str | None = None
         self._deterministic_classifier = MockNewsClassifier(
             minimum_confidence=min_classification_confidence
         )
@@ -84,6 +88,10 @@ class NewsService:
         if not self.repository or not self.repository.available:
             return
         items, classifications = self.repository.load_news()
+        self.news_restore_valid_count = self.repository.news_restore_valid_count
+        self.news_restore_repaired_count = self.repository.news_restore_repaired_count
+        self.news_restore_quarantined_count = self.repository.news_restore_quarantined_count
+        self.news_restore_last_error = self.repository.news_restore_last_error
         self.items = items
         self.filtered_items = list(items)
         self.classifications = classifications

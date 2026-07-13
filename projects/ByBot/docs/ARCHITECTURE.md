@@ -100,3 +100,12 @@ the execution safety boundary remains unchanged.
 Live trading is outside v1 and requires a separately designed, reviewed, and
 approved future version. There is intentionally no automatic promotion path
 from shadow mode to live execution.
+
+### Implemented BYBIT_DEMO execution path
+
+`READY` candidates retain normal deterministic confirmation and risk preview,
+sized from fixed Demo risk capital. `DemoExecutionService` validates current
+instrument filters and remote conflicts, persists a unique reservation, submits
+through an exact-domain V5 adapter, then advances state only from private stream
+or REST evidence. Protection uses actual average fill price; remote state is
+authoritative during startup, periodic, restart, and cleanup reconciliation.

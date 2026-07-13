@@ -5,7 +5,7 @@ from typing import Any
 
 from app.bybit.market_data import MarketDataService, snapshot_to_payload
 from app.bybit.private import BybitAccountService, order_placement_blocked_reason
-from app.config import BotMode, Settings
+from app.config import BotMode, ExecutionMode, Settings
 from app.models import CandidateLifecycleState, RiskContext, Symbol
 from app.news.classifier import MockNewsClassifier
 from app.news.service import NewsService
@@ -21,6 +21,7 @@ def build_status(
     paper_trading: PaperTradingService,
     news_service: NewsService | None = None,
     signal_candidates: SignalCandidateService | None = None,
+    demo_execution: object | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic status snapshot.
 
@@ -84,15 +85,35 @@ def build_status(
         max_loss_amount = 0.0
 
     trading_blocked_data_unavailable = market_data.status != "OK"
-    order_placement_blocked = True
+    demo_status = (
+        demo_execution.as_status() if demo_execution is not None else {"enabled": False}
+    )
+    demo_orders_enabled = bool(
+        settings.execution_mode == ExecutionMode.BYBIT_DEMO
+        and settings.bybit_demo_trading_enabled
+        and demo_status.get("account_verified")
+        and not demo_status.get("kill_switch_active")
+    )
+    order_placement_blocked = not demo_orders_enabled
     order_placement_blocked_reason_text = order_placement_blocked_reason(
         settings,
         account_status,
     )
+    if demo_orders_enabled:
+        order_placement_blocked_reason_text = None
+    elif settings.execution_mode == ExecutionMode.BYBIT_DEMO:
+        order_placement_blocked_reason_text = (
+            demo_status.get("last_error") or "Bybit Demo execution preflight is blocked"
+        )
     trading_enabled = settings.bot_mode in {BotMode.PAPER, BotMode.BYBIT_DEMO}
     trading_enabled = trading_enabled and not settings.trading_paused
     trading_enabled = trading_enabled and not trading_blocked_data_unavailable
-    trading_enabled = trading_enabled and account_status.connected
+    private_connected = (
+        bool(demo_status.get("account_verified"))
+        if settings.execution_mode == ExecutionMode.BYBIT_DEMO
+        else account_status.connected
+    )
+    trading_enabled = trading_enabled and private_connected
     trading_enabled = trading_enabled and not order_placement_blocked
     risk_state = "OK" if risk_approved else "BLOCKED"
     btc_snapshot = market_data.latest_snapshot(Symbol.BTCUSDT)
@@ -108,14 +129,19 @@ def build_status(
         "trading_enabled": trading_enabled,
         "trading_paused": settings.trading_paused,
         "trading_blocked_data_unavailable": trading_blocked_data_unavailable,
-        "private_api_connected": account_status.connected,
-        "account_connection_status": "CONNECTED" if account_status.connected else "DISCONNECTED",
+        "private_api_connected": private_connected,
+        "account_connection_status": "CONNECTED" if private_connected else "DISCONNECTED",
         "order_placement_blocked": order_placement_blocked,
         "order_placement_blocked_reason": order_placement_blocked_reason_text,
         "active_symbols": list(settings.allowed_symbols),
         "allowed_symbols": list(settings.allowed_symbols),
         "strategy": "NewsMomentumStrategy",
-        "execution": "paper" if settings.bot_mode == BotMode.PAPER else "disabled",
+        "execution": settings.execution_mode.value,
+        "execution_mode": settings.execution_mode.value,
+        "demo_order_placement_enabled": demo_orders_enabled,
+        "live_order_placement_blocked": True,
+        "bybit_live_trading_enabled": False,
+        "demo_execution": demo_status,
         "auto_paper_execution": settings.auto_paper_execution,
         "auto_paper_enabled": settings.auto_paper_execution,
         "open_paper_position": paper_status["open_position"],
@@ -164,6 +190,10 @@ def build_status(
         ),
         "news_items_seen_count": news_service.items_seen_count,
         "news_items_filtered_count": news_service.items_filtered_count,
+        "news_restore_valid_count": news_service.news_restore_valid_count,
+        "news_restore_repaired_count": news_service.news_restore_repaired_count,
+        "news_restore_quarantined_count": news_service.news_restore_quarantined_count,
+        "news_restore_last_error": news_service.news_restore_last_error,
         "rss_items_seen": news_service.items_seen_count,
         "rss_items_accepted": news_service.items_filtered_count,
         "news_duplicates_skipped": news_service.news_duplicates_skipped,

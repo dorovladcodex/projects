@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from enum import Enum
 from functools import lru_cache
+from decimal import Decimal
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.db.url import normalize_database_url
@@ -11,6 +12,11 @@ from app.db.url import normalize_database_url
 
 class BotMode(str, Enum):
     DATA_ONLY = "DATA_ONLY"
+    PAPER = "PAPER"
+    BYBIT_DEMO = "BYBIT_DEMO"
+
+
+class ExecutionMode(str, Enum):
     PAPER = "PAPER"
     BYBIT_DEMO = "BYBIT_DEMO"
 
@@ -42,6 +48,7 @@ class Settings(BaseSettings):
     bot_name: str = "bybot"
     app_env: str = "local"
     bot_mode: BotMode = BotMode.PAPER
+    execution_mode: ExecutionMode = ExecutionMode.PAPER
     log_level: str = "INFO"
     database_url: str = "postgresql+psycopg://bybot:bybot@localhost:5432/bybot"
 
@@ -49,8 +56,11 @@ class Settings(BaseSettings):
     bybit_api_secret: str | None = None
     bybit_env: BybitEnvironment = BybitEnvironment.DEMO
     bybit_enable_trading: bool = False
+    bybit_demo_trading_enabled: bool = False
+    bybit_live_trading_enabled: bool = False
     bybit_public_base_url: str = "https://api.bybit.com"
     bybit_private_demo_base_url: str = "https://api-demo.bybit.com"
+    bybit_private_demo_ws_url: str = "wss://stream-demo.bybit.com"
     bybit_private_mainnet_base_url: str = "https://api.bybit.com"
     bybit_private_recv_window_ms: int = Field(default=5000, gt=0, le=60_000)
     bybit_private_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
@@ -93,6 +103,12 @@ class Settings(BaseSettings):
     news_enable_mock_classifier: bool = True
     test_mode: bool = False
     auto_paper_execution: bool = False
+    demo_risk_capital_usdt: Decimal = Field(default=Decimal("10000"), gt=0)
+    demo_leverage: int = Field(default=1, ge=1, le=1)
+    demo_order_link_prefix: str = Field(default="bybot", min_length=3, max_length=20)
+    demo_run_id: str | None = Field(default=None, min_length=3, max_length=64)
+    demo_reconciliation_interval_seconds: int = Field(default=15, ge=5, le=300)
+    demo_order_confirmation_timeout_seconds: int = Field(default=30, ge=5, le=300)
 
     signal_min_classification_confidence: float = Field(default=0.80, ge=0, le=1)
     signal_min_news_importance: float = Field(default=0.70, ge=0, le=1)
@@ -104,7 +120,10 @@ class Settings(BaseSettings):
     signal_default_stop_loss_pct: float = Field(default=0.5, gt=0)
     signal_default_take_profit_pct: float = Field(default=1.0, gt=0)
 
-    allowed_symbols: tuple[str, ...] = ("BTCUSDT", "ETHUSDT")
+    allowed_symbols: tuple[str, ...] = Field(
+        default=("BTCUSDT", "ETHUSDT"),
+        validation_alias=AliasChoices("ACTIVE_SYMBOLS", "ALLOWED_SYMBOLS", "allowed_symbols"),
+    )
     market_data_provider: MarketDataProviderName = MarketDataProviderName.MOCK
     market_data_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
     market_data_history_limit: int = Field(default=120, ge=2, le=2000)
@@ -179,12 +198,63 @@ class Settings(BaseSettings):
     def normalize_news_classifier_mode(cls, value: object) -> object:
         return value.lower() if isinstance(value, str) else value
 
+    @field_validator("execution_mode", mode="before")
+    @classmethod
+    def normalize_execution_mode(cls, value: object) -> object:
+        return value.upper() if isinstance(value, str) else value
+
     @field_validator("bybit_enable_trading")
     @classmethod
     def reject_bybit_trading_enabled(cls, value: bool) -> bool:
         if value:
             raise ValueError("Bybit order placement is blocked in Phase 3A")
         return value
+
+    @field_validator("bybit_live_trading_enabled")
+    @classmethod
+    def reject_live_trading_enabled(cls, value: bool) -> bool:
+        if value:
+            raise ValueError("Bybit live trading is permanently unavailable")
+        return value
+
+    @field_validator("demo_order_link_prefix")
+    @classmethod
+    def validate_demo_order_link_prefix(cls, value: str) -> str:
+        normalized = value.lower()
+        if not normalized.replace("-", "").isalnum():
+            raise ValueError("Demo order link prefix must be alphanumeric or hyphenated")
+        return normalized
+
+    @model_validator(mode="after")
+    def enforce_demo_execution_guard(self) -> "Settings":
+        if self.execution_mode != ExecutionMode.BYBIT_DEMO:
+            return self
+        errors: list[str] = []
+        if self.app_env.lower() != "demo":
+            errors.append("APP_ENV must be demo")
+        if self.test_mode:
+            errors.append("TEST_MODE must be false")
+        if self.bot_mode != BotMode.BYBIT_DEMO:
+            errors.append("BOT_MODE must be BYBIT_DEMO")
+        if self.bybit_env != BybitEnvironment.DEMO:
+            errors.append("BYBIT_ENV must be demo")
+        if not self.bybit_demo_trading_enabled:
+            errors.append("BYBIT_DEMO_TRADING_ENABLED must be true")
+        if self.bybit_live_trading_enabled:
+            errors.append("BYBIT_LIVE_TRADING_ENABLED must be false")
+        if self.bybit_private_demo_base_url.rstrip("/") != "https://api-demo.bybit.com":
+            errors.append("Demo REST domain must be exactly https://api-demo.bybit.com")
+        if self.bybit_private_demo_ws_url.rstrip("/") != "wss://stream-demo.bybit.com":
+            errors.append("Demo private WebSocket domain must be exactly wss://stream-demo.bybit.com")
+        if self.auto_paper_execution:
+            errors.append("AUTO_PAPER_EXECUTION must be false in BYBIT_DEMO mode")
+        if self.demo_leverage != 1:
+            errors.append("Demo leverage must be exactly 1")
+        if not self.bybit_api_key or not self.bybit_api_secret:
+            errors.append("Demo API credentials are required")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return self
 
     @field_validator("allowed_symbols")
     @classmethod

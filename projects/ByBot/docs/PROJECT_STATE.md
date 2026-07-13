@@ -12,6 +12,11 @@
   paper account recovery, position limits, cooldowns, loss/drawdown kill switch.
 - Windows PowerShell 5.1 soak runner for real RSS/public Bybit data, Codex CLI,
   continuous accounting/database checks, controlled restart, and artifacts.
+- Explicit fail-closed Bybit Demo execution: durable reservation, deterministic
+  orderLinkId, private order/execution/position/wallet stream, REST reconciliation,
+  actual-fill TP/SL protection, emergency reduce-only close, and ownership cleanup.
+- Startup-safe NewsItem restore with dedicated repair columns, durable quarantine
+  audit, idempotent repair CLI, and visible restore metrics.
 
 ## Architecture and data
 
@@ -27,8 +32,12 @@ PostgreSQL relationships:
 - closed position -> one `paper_trades` row.
 - `paper_accounts` stores singleton realized totals; `paper_risk_state` stores
   kill switch, peak equity, entry time, and cooldowns.
+- candidate -> one `demo_executions`; `demo_execution_events` deduplicates stream
+  events and records transitions; `demo_kill_switch` persists fail-closed incidents.
+- `persistence_quarantine` preserves malformed historical row audits; quarantined
+  `news_items` and their candidates are excluded from normal restore.
 
-Current Alembic head: `20260714_0006`.
+Current Alembic head: `20260714_0008`.
 
 Paper equity is authoritative and consistent across API/restart:
 
@@ -38,8 +47,11 @@ Paper sizing never uses Bybit demo equity.
 
 ## Safety guarantees
 
-- `BYBIT_ENABLE_TRADING=true` is rejected by configuration.
-- No Bybit order-placement adapter is called; PAPER is the only execution path.
+- `BYBIT_ENABLE_TRADING=true` and live trading are rejected by configuration.
+- Demo execution requires all explicit Demo gates and exact api-demo/stream-demo
+  domains; mainnet and testnet adapters are unreachable.
+- Demo create acknowledgement never means FILLED; remote exchange state is
+  authoritative and entry protection is verified before POSITION_OPEN.
 - One open paper position per symbol plus configurable total cap.
 - Candidate/execution/open-slot/close idempotency prevents duplicate accounting.
 - Stop loss is mandatory; no martingale or averaging down.
@@ -63,7 +75,7 @@ Run all four scripts in `scripts/` for Windows/Docker E2E validation.
   workers require distributed coordination.
 - Financial storage remains SQL float in legacy tables; API smoke assertions use Decimal.
 - RSS quality and real-provider classification still need production tuning.
-- Next: complete 24-hour and multi-day PAPER soak observation, dashboard/alerts,
-  operational metrics, backup/restore drills, then BYBIT_DEMO order design behind
-  a new explicit gate.
-- Demo/live order placement remains out of scope.
+- Demo runner intentionally has no synthetic trade: zero trades is valid. It is
+  single-process and requires PostgreSQL, valid Demo credentials, network, RSS,
+  public market data, and the configured classifier.
+- Live order placement remains permanently out of scope.

@@ -6,7 +6,7 @@ from uuid import UUID
 
 from app.bybit.market_data import MarketDataService
 from app.bybit.private import BybitAccountService
-from app.config import BotMode, Settings
+from app.config import BotMode, ExecutionMode, Settings
 from app.models import (
     Asset,
     CandidateLifecycleState,
@@ -46,6 +46,7 @@ class SignalCandidateService:
         account_service: BybitAccountService,
         paper_trading: PaperTradingService,
         repository: PersistenceRepository | None = None,
+        demo_execution: object | None = None,
     ) -> None:
         self.settings = settings
         self.news_service = news_service
@@ -53,6 +54,7 @@ class SignalCandidateService:
         self.account_service = account_service
         self.paper_trading = paper_trading
         self.repository = repository
+        self.demo_execution = demo_execution
         self.processed_news_ids: set[UUID] = set()
         self.results: list[SignalDryRunResult] = []
         self.risk_preview_approved_count = 0
@@ -411,8 +413,13 @@ class SignalCandidateService:
                     self.risk_preview_approved_count += 1
                 else:
                     self.risk_preview_blocked_count += 1
-            if self.settings.auto_paper_execution:
+            if self.settings.execution_mode == ExecutionMode.PAPER and self.settings.auto_paper_execution:
                 self._execute_paper_result(result, classification, snapshot)
+            elif (
+                self.settings.execution_mode == ExecutionMode.BYBIT_DEMO
+                and self.settings.bybit_demo_trading_enabled
+            ):
+                self._execute_demo_result(result, classification, snapshot)
         else:
             result.risk_preview = _preview_not_performed()
         if self.repository:
@@ -425,8 +432,11 @@ class SignalCandidateService:
         candidate: NewsSignalCandidate,
     ) -> list[str]:
         reasons: list[str] = []
-        if self.settings.bot_mode != BotMode.PAPER:
-            reasons.append("automatic paper execution requires PAPER mode")
+        if self.settings.execution_mode == ExecutionMode.PAPER:
+            if self.settings.bot_mode != BotMode.PAPER:
+                reasons.append("paper execution requires PAPER mode")
+        elif self.settings.bot_mode != BotMode.BYBIT_DEMO:
+            reasons.append("Demo execution requires BYBIT_DEMO mode")
         if classification.sentiment == Sentiment.NEUTRAL:
             reasons.append("neutral classification")
         if classification.confidence < self.settings.signal_min_classification_confidence:
@@ -435,7 +445,10 @@ class SignalCandidateService:
             reasons.append("news importance below signal threshold")
         if candidate.symbol is None:
             reasons.append("news asset cannot be mapped to a supported symbol")
-        if candidate.symbol is not None:
+        if (
+            candidate.symbol is not None
+            and self.settings.execution_mode == ExecutionMode.PAPER
+        ):
             reasons.extend(self.paper_trading.entry_block_reasons(candidate.symbol))
         return reasons
 
@@ -581,13 +594,29 @@ class SignalCandidateService:
             take_profit_pct=candidate.proposed_take_profit_pct,
             reasons=list(candidate.reasons),
         )
-        paper_equity = self.paper_trading.equity
+        demo_mode = self.settings.execution_mode == ExecutionMode.BYBIT_DEMO
+        risk_equity = risk_capital_for_execution(
+            self.settings, self.paper_trading.equity
+        )
+        active_demo_states = {
+            CandidateLifecycleState.DEMO_SUBMITTING,
+            CandidateLifecycleState.DEMO_ACCEPTED,
+            CandidateLifecycleState.DEMO_PARTIALLY_FILLED,
+            CandidateLifecycleState.DEMO_FILLED,
+            CandidateLifecycleState.DEMO_PROTECTION_PENDING,
+            CandidateLifecycleState.DEMO_POSITION_OPEN,
+            CandidateLifecycleState.DEMO_CLOSING,
+            CandidateLifecycleState.DEMO_RECONCILIATION_REQUIRED,
+        }
         context = RiskContext(
-            equity=paper_equity,
-            available_balance=paper_equity,
+            equity=risk_equity,
+            available_balance=risk_equity,
             requested_risk_pct=self.settings.max_risk_per_trade_pct,
-            leverage=self.settings.max_leverage,
-            open_positions=len(self.paper_trading.open_positions),
+            leverage=self.settings.demo_leverage if demo_mode else self.settings.max_leverage,
+            open_positions=(
+                sum(result.candidate.state in active_demo_states for result in self.results)
+                if demo_mode else len(self.paper_trading.open_positions)
+            ),
             daily_pnl_pct=self.settings.paper_daily_pnl_pct,
             weekly_pnl_pct=self.settings.paper_weekly_pnl_pct,
             consecutive_losses=self.settings.paper_consecutive_losses,
@@ -622,17 +651,68 @@ class SignalCandidateService:
             self.market_data.latest_snapshot(result.candidate.symbol)
             if result.candidate.symbol else None
         )
-        if not force and not self.settings.auto_paper_execution:
-            return result
-        self._execute_paper_result(result, classification, snapshot)
+        if self.settings.execution_mode == ExecutionMode.BYBIT_DEMO:
+            if not self.settings.bybit_demo_trading_enabled:
+                return result
+            self._execute_demo_result(result, classification, snapshot)
+        else:
+            if not force and not self.settings.auto_paper_execution:
+                return result
+            self._execute_paper_result(result, classification, snapshot)
         return result
 
     def execute_ready_candidates(self) -> None:
-        if not self.settings.auto_paper_execution:
+        enabled = (
+            self.settings.auto_paper_execution
+            if self.settings.execution_mode == ExecutionMode.PAPER
+            else self.settings.bybit_demo_trading_enabled
+        )
+        if not enabled:
             return
         for result in list(self.results):
             if result.candidate.state == CandidateLifecycleState.READY:
                 self.execute_ready_candidate(result.candidate.id)
+
+    def _execute_demo_result(
+        self,
+        result: SignalDryRunResult,
+        classification: NewsClassification,
+        snapshot: MarketSnapshot | None,
+    ) -> None:
+        """Delegate only fully approved candidates to the guarded Demo adapter."""
+        if self.demo_execution is None or snapshot is None:
+            result.execution_block_reason = "Demo execution service is unavailable"
+            return
+        candidate = result.candidate
+        now = datetime.now(timezone.utc)
+        if (
+            candidate.state != CandidateLifecycleState.READY
+            or candidate.final_action not in {NewsSignalAction.BUY, NewsSignalAction.SELL}
+            or not result.risk_preview.preview_performed
+            or not result.risk_preview.approved
+            or now >= candidate.expires_at
+            or not classification.trade_eligible
+            or not candidate.market_confirmation.fresh
+            or now - snapshot.timestamp > timedelta(
+                seconds=self.settings.signal_confirmation_window_seconds
+            )
+        ):
+            result.execution_block_reason = "candidate failed Demo execution preflight"
+            return
+        record = self.demo_execution.submit_candidate(
+            candidate, result.risk_preview, classification, snapshot
+        )
+        if record is None:
+            result.execution_block_reason = (
+                getattr(self.demo_execution, "last_error", None)
+                or "Demo execution was blocked"
+            )
+            return
+        candidate.state = CandidateLifecycleState(record.state.value)
+        result.execution_attempted = True
+        result.demo_execution = record.model_dump(mode="json")
+        if self.repository:
+            self.repository.save_signal_result(result)
 
     def _execute_paper_result(
         self,
@@ -770,6 +850,23 @@ class SignalCandidateService:
                 if self.repository:
                     self.repository.save_signal_result(result)
 
+    def sync_demo_states(self) -> None:
+        if self.demo_execution is None or self.repository is None:
+            return
+        records = {
+            record.candidate_id: record
+            for record in self.repository.load_demo_executions()
+        }
+        for result in self.results:
+            record = records.get(result.candidate.id)
+            if record is None:
+                continue
+            state = CandidateLifecycleState(record.state.value)
+            if result.candidate.state != state:
+                result.candidate.state = state
+                result.demo_execution = record.model_dump(mode="json")
+                self.repository.save_signal_result(result)
+
     def _find_news_and_classification(
         self, news_id: UUID
     ) -> tuple[NewsItem, NewsClassification]:
@@ -787,6 +884,13 @@ def _preview_not_performed() -> SignalRiskPreview:
         preview_performed=False,
         preview_reason="candidate is not tradeable yet",
     )
+
+
+def risk_capital_for_execution(settings: Settings, paper_equity: float) -> float:
+    """Demo sizing is deliberately detached from both paper and wallet equity."""
+    if settings.execution_mode == ExecutionMode.BYBIT_DEMO:
+        return float(settings.demo_risk_capital_usdt)
+    return paper_equity
 
 
 def _proposed_action(sentiment: Sentiment) -> NewsSignalAction:

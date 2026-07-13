@@ -154,3 +154,16 @@ no acceptable degraded state with live execution in v1.
 - Reconcile open paper/demo state before accepting new signals.
 - Resume in `DATA_ONLY`; promote back to `PAPER` or `BYBIT_DEMO` only after
   health, freshness, and risk checks pass.
+
+## Twelve-hour Bybit Demo soak
+
+With Demo-only credentials in untracked `.env`, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_soak.ps1 -Hours 12 -SampleSeconds 30 -AllowDemoOrders
+```
+
+The explicit flag authorizes Demo orders. The runner uses one local worker,
+performs a controlled restart, reconciles exchange/PostgreSQL state, and cleans
+up only bot-owned state. Never use mainnet/testnet or `TEST_MODE=true`. Inspect
+`artifacts\demo-soak` before retrying any failed run.

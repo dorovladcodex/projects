@@ -91,6 +91,10 @@ def test_health_and_status_report_live_disabled() -> None:
         "maximum_positions",
         "last_execution_error",
         "persistence_status",
+        "news_restore_valid_count",
+        "news_restore_repaired_count",
+        "news_restore_quarantined_count",
+        "news_restore_last_error",
     ):
         assert field in payload
 

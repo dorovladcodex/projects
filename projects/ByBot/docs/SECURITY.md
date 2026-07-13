@@ -105,3 +105,13 @@ and resume only in `DATA_ONLY` after review.
 Live execution is outside v1. It requires a separate threat model, architecture,
 credential path, approval process, kill switch, reconciliation design, security
 review, and release. No environment-variable change may promote v1 to live.
+
+## Bybit Demo execution boundary
+
+Demo execution is the sole non-paper order path. Configuration validation and
+the adapter independently require exact `api-demo.bybit.com` and
+`stream-demo.bybit.com` domains, Demo credentials, `APP_ENV=demo`, false
+`TEST_MODE`, false live/generic flags, and explicit Demo enablement. Every entry
+has a durable reservation and deterministic bot-owned `orderLinkId`. Create
+acknowledgement is not a fill. Missing exchange protection triggers a reduce-only
+close and persisted kill switch. Cleanup never touches unattributed state.

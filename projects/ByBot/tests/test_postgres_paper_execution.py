@@ -8,6 +8,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.sql.sqltypes import Integer
 from sqlalchemy.orm import Session
 
@@ -38,9 +39,22 @@ from app.portfolio.paper_trading import PaperTradingService
 
 
 POSTGRES_TEST_URL = os.getenv("BYBOT_TEST_POSTGRES_URL")
+POSTGRES_TEST_DATABASE = (
+    make_url(POSTGRES_TEST_URL).database if POSTGRES_TEST_URL else None
+)
+POSTGRES_TEST_DATABASE_IS_ISOLATED = bool(
+    POSTGRES_TEST_DATABASE
+    and (
+        POSTGRES_TEST_DATABASE.startswith("bybot_test")
+        or POSTGRES_TEST_DATABASE.endswith("_test")
+    )
+)
 pytestmark = pytest.mark.skipif(
-    not POSTGRES_TEST_URL,
-    reason="set BYBOT_TEST_POSTGRES_URL to run PostgreSQL transaction tests",
+    not POSTGRES_TEST_URL or not POSTGRES_TEST_DATABASE_IS_ISOLATED,
+    reason=(
+        "set BYBOT_TEST_POSTGRES_URL to an isolated database named "
+        "bybot_test* or *_test"
+    ),
 )
 
 
@@ -53,7 +67,23 @@ def _seed_candidate(
         session.add(NewsItemRow(
             id=news_id, normalized_url=f"https://example.invalid/{news_id}",
             content_hash=uuid4().hex + uuid4().hex,
-            payload={"id": news_id}, received_at=now,
+            title="PostgreSQL paper execution fixture",
+            summary="Complete persisted NewsItem fixture for paper transaction tests.",
+            source="postgres-test", published_at=now, asset_hint="BTC",
+            raw_category="test", importance=0.8, is_quarantined=False,
+            payload={
+                "id": news_id,
+                "title": "PostgreSQL paper execution fixture",
+                "summary": "Complete persisted NewsItem fixture for paper transaction tests.",
+                "source": "postgres-test",
+                "url": f"https://example.invalid/{news_id}",
+                "published_at": now.isoformat(),
+                "received_at": now.isoformat(),
+                "asset_hint": "BTC",
+                "raw_category": "test",
+                "importance": 0.8,
+            },
+            received_at=now,
         ))
         session.add(SignalCandidateRow(
             id=candidate_id, news_id=news_id, symbol=symbol.value, state="READY",

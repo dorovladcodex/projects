@@ -10,7 +10,12 @@ from fastapi import FastAPI, HTTPException
 
 from app.bybit.market_data import build_market_data_service, snapshot_to_payload
 from app.bybit.private import build_account_service
-from app.config import BotMode, get_settings
+from app.bybit.demo import (
+    BybitDemoPrivateWebSocket,
+    BybitDemoRestClient,
+    DemoExecutionService,
+)
+from app.config import BotMode, ExecutionMode, get_settings
 from app.models import (
     MarketSnapshot,
     ClassifierTestRequest,
@@ -41,6 +46,23 @@ settings = get_settings()
 persistence = PersistenceRepository(settings.database_url, create_schema=False)
 market_data_service = build_market_data_service(settings)
 account_service = build_account_service(settings)
+demo_client = (
+    BybitDemoRestClient(
+        api_key=settings.bybit_api_key or "",
+        api_secret=settings.bybit_api_secret or "",
+        base_url=settings.bybit_private_demo_base_url,
+        private_ws_url=settings.bybit_private_demo_ws_url,
+        recv_window_ms=settings.bybit_private_recv_window_ms,
+        timeout_seconds=settings.bybit_private_timeout_seconds,
+    )
+    if settings.execution_mode == ExecutionMode.BYBIT_DEMO else None
+)
+demo_execution_service = DemoExecutionService(
+    settings, persistence, demo_client, run_id=settings.demo_run_id
+)
+demo_private_websocket = (
+    BybitDemoPrivateWebSocket(demo_client) if demo_client is not None else None
+)
 paper_trading_service = PaperTradingService(
     timeout=timedelta(minutes=settings.paper_position_timeout_minutes),
     starting_equity=settings.paper_starting_equity_usdt,
@@ -72,6 +94,7 @@ signal_candidate_service = SignalCandidateService(
     account_service,
     paper_trading_service,
     persistence,
+    demo_execution_service,
 )
 news_service.restore()
 paper_trading_service.restore()
@@ -80,22 +103,43 @@ signal_candidate_service.restore()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    account_service.refresh_if_stale(force=True)
+    demo_ws_task = None
+    if settings.execution_mode == ExecutionMode.BYBIT_DEMO:
+        await asyncio.to_thread(demo_execution_service.verify_account_and_environment)
+        await asyncio.to_thread(demo_execution_service.reconcile)
+        if demo_private_websocket is not None:
+            demo_ws_task = asyncio.create_task(demo_private_stream_loop())
+    else:
+        account_service.refresh_if_stale(force=True)
     await asyncio.to_thread(news_service.poll)
     market_data_service.refresh_all()
     signal_candidate_service.process_pending()
     signal_candidate_service.execute_ready_candidates()
     task = asyncio.create_task(news_polling_loop())
     signal_task = asyncio.create_task(signal_recheck_loop())
+    demo_reconcile_task = (
+        asyncio.create_task(demo_reconciliation_loop())
+        if demo_client is not None else None
+    )
     try:
         yield
     finally:
         task.cancel()
         signal_task.cancel()
+        if demo_ws_task:
+            demo_ws_task.cancel()
+        if demo_reconcile_task:
+            demo_reconcile_task.cancel()
         with suppress(asyncio.CancelledError):
             await task
         with suppress(asyncio.CancelledError):
             await signal_task
+        if demo_ws_task:
+            with suppress(asyncio.CancelledError):
+                await demo_ws_task
+        if demo_reconcile_task:
+            with suppress(asyncio.CancelledError):
+                await demo_reconcile_task
 
 
 app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
@@ -116,12 +160,26 @@ def status() -> dict[str, object]:
         paper_trading_service,
         news_service,
         signal_candidate_service,
+        demo_execution_service,
     )
 
 
 @app.get("/news")
 def news() -> dict[str, object]:
     return news_service.as_payload()
+
+
+@app.get("/news/restore-status")
+def news_restore_status() -> dict[str, object]:
+    return {
+        "restore_completed": persistence.available,
+        "persistence_status": "OK" if persistence.available else "UNAVAILABLE",
+        "news_restore_valid_count": news_service.news_restore_valid_count,
+        "news_restore_repaired_count": news_service.news_restore_repaired_count,
+        "news_restore_quarantined_count": news_service.news_restore_quarantined_count,
+        "news_restore_last_error": news_service.news_restore_last_error,
+        "quarantined_news_ids": persistence.quarantined_news_ids(),
+    }
 
 
 @app.get("/news/filtered")
@@ -611,6 +669,40 @@ def paper_test_reset_kill_switch() -> dict[str, object]:
     }
 
 
+@app.get("/demo/status")
+def demo_status() -> dict[str, object]:
+    """Read-only execution status; never exposes credentials."""
+    return demo_execution_service.as_status()
+
+
+@app.get("/demo/executions")
+def demo_executions() -> dict[str, object]:
+    return {
+        "executions": [
+            item.model_dump(mode="json")
+            for item in persistence.load_demo_executions()
+        ],
+        "live_execution_blocked": True,
+    }
+
+
+@app.post("/demo/reconcile")
+def demo_reconcile() -> dict[str, object]:
+    if settings.execution_mode != ExecutionMode.BYBIT_DEMO:
+        raise HTTPException(status_code=404, detail="Demo execution is disabled")
+    return demo_execution_service.reconcile()
+
+
+@app.post("/demo/cleanup")
+def demo_cleanup() -> dict[str, object]:
+    if settings.execution_mode != ExecutionMode.BYBIT_DEMO:
+        raise HTTPException(status_code=404, detail="Demo execution is disabled")
+    return {
+        **demo_execution_service.cleanup_bot_owned(),
+        "live_execution_blocked": True,
+    }
+
+
 async def news_polling_loop() -> None:
     while True:
         await asyncio.sleep(settings.news_poll_interval_seconds)
@@ -628,3 +720,20 @@ async def signal_recheck_loop() -> None:
         signal_candidate_service.reevaluate_pending()
         signal_candidate_service.execute_ready_candidates()
         monitor_paper_positions()
+
+
+async def demo_private_stream_loop() -> None:
+    if demo_private_websocket is None:
+        return
+    async for event in demo_private_websocket.events():
+        demo_execution_service.websocket_connected = True
+        demo_execution_service.websocket_reconnects = demo_private_websocket.reconnects
+        await asyncio.to_thread(demo_execution_service.handle_private_event, event)
+        signal_candidate_service.sync_demo_states()
+
+
+async def demo_reconciliation_loop() -> None:
+    while True:
+        await asyncio.sleep(settings.demo_reconciliation_interval_seconds)
+        await asyncio.to_thread(demo_execution_service.reconcile)
+        signal_candidate_service.sync_demo_states()

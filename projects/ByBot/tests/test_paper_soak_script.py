@@ -46,7 +46,7 @@ def test_soak_script_declares_required_artifacts_and_parameters() -> None:
         assert artifact in text
 
 
-def test_soak_accounting_and_report_helpers_pass_on_powershell_51() -> None:
+def _run_helper_scenario(scenario: str) -> None:
     completed = subprocess.run(
         [
             "powershell.exe",
@@ -56,6 +56,8 @@ def test_soak_accounting_and_report_helpers_pass_on_powershell_51() -> None:
             "-File",
             str(SCRIPT),
             "-ValidateHelpersOnly",
+            "-HelperScenario",
+            scenario,
         ],
         cwd=ROOT,
         text=True,
@@ -65,3 +67,32 @@ def test_soak_accounting_and_report_helpers_pass_on_powershell_51() -> None:
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "HELPERS: PASS" in completed.stdout
+
+
+def test_soak_historical_closed_trades_are_separated_from_run_activity() -> None:
+    _run_helper_scenario("historical")
+
+
+def test_soak_no_trade_accounting_preserves_opening_equity() -> None:
+    _run_helper_scenario("no_trades")
+
+
+def test_soak_one_trade_opened_and_closed_during_run() -> None:
+    _run_helper_scenario("opened_closed")
+
+
+def test_soak_preexisting_position_closed_during_run() -> None:
+    _run_helper_scenario("preexisting_closed")
+    assert "preexisting_at_start" in _script_text()
+
+
+def test_soak_controlled_restart_helper() -> None:
+    _run_helper_scenario("restart")
+
+
+def test_soak_deterministic_classification_without_codex_call() -> None:
+    _run_helper_scenario("deterministic")
+
+
+def test_soak_counters_do_not_double_after_restart() -> None:
+    _run_helper_scenario("counter_restart")

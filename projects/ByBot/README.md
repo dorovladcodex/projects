@@ -570,8 +570,41 @@ cannot exceed the configured take-profit target.
 
 `BOT_MODE=LIVE` (or any unsupported mode) fails configuration validation and
 prevents application startup. `PaperExecutionEngine` only accepts PAPER mode.
-`BYBIT_ENABLE_TRADING=true` fails configuration validation in Phase 3A.
-No module in v1 sends orders to Bybit.
+`BYBIT_ENABLE_TRADING=true` and `BYBIT_LIVE_TRADING_ENABLED=true` fail
+configuration validation. Live/mainnet/testnet execution remains impossible.
+The only exchange adapter is Bybit Demo and it requires the complete explicit
+Demo gate plus exact Demo domains.
+
+## Bybit Demo soak (explicit opt-in)
+
+Configure Demo-only API credentials in the untracked `.env`. The runner uses
+real RSS, real public market data, the configured classifier, actual Demo fills,
+and exchange-side TP/SL. It performs a controlled restart and cleans up only
+bot-owned Demo orders and positions. It has no synthetic trade; zero trades is
+a valid result.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_soak.ps1 -Hours 12 -SampleSeconds 30 -AllowDemoOrders
+```
+
+The explicit `-AllowDemoOrders` switch is mandatory. Never point this command
+at mainnet or testnet credentials/domains.
+
+## Repair historical NewsItem payloads
+
+Apply migrations first, inspect without writes, then apply the transactional
+repair. Host-run commands use the PostgreSQL URL with `127.0.0.1`:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe .\scripts\repair_news_payloads.py --dry-run
+.\.venv\Scripts\python.exe .\scripts\repair_news_payloads.py --apply
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Unrecoverable records are preserved in `persistence_quarantine` and excluded
+from normal startup restore. `/news/restore-status` and `/status` expose counts
+and sanitized warnings without returning archived payloads.
 
 See [PLAN.md](PLAN.md) for phase boundaries.
 
