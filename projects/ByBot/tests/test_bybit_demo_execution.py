@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import pytest
@@ -143,6 +144,11 @@ class FakeDemoClient:
         self.closed_pnl = []
         self.protection_ok = True
         self.leverage_calls = []
+        self.position_scopes = []
+        self.open_order_scopes = []
+        self.history_scopes = []
+        self.execution_scopes = []
+        self.closed_pnl_scopes = []
 
     def verify_credentials(self):
         return True
@@ -153,23 +159,30 @@ class FakeDemoClient:
     def get_instrument(self, symbol):
         return instrument()
 
-    def get_positions(self, symbol=None):
+    def get_positions(self, symbol=None, settle_coin=None):
+        assert symbol is None or settle_coin is None
+        self.position_scopes.append((symbol, settle_coin))
         if symbol is None:
             return list(self.positions)
         return [item for item in self.positions if item.get("symbol") == symbol.value]
 
-    def get_open_orders(self, symbol=None):
+    def get_open_orders(self, symbol=None, settle_coin=None):
+        assert symbol is None or settle_coin is None
+        self.open_order_scopes.append((symbol, settle_coin))
         if symbol is None:
             return list(self.open_orders)
         return [item for item in self.open_orders if item.get("symbol") == symbol.value]
 
-    def get_order_history(self, symbol=None):
+    def get_order_history(self, symbol=None, settle_coin=None):
+        self.history_scopes.append((symbol, settle_coin))
         return list(self.history)
 
-    def get_executions(self, symbol=None):
+    def get_executions(self, symbol=None, settle_coin=None):
+        self.execution_scopes.append((symbol, settle_coin))
         return list(self.executions)
 
-    def get_closed_pnl(self, symbol=None):
+    def get_closed_pnl(self, symbol=None, settle_coin=None):
+        self.closed_pnl_scopes.append((symbol, settle_coin))
         return list(self.closed_pnl)
 
     def set_leverage(self, symbol, leverage):
@@ -222,7 +235,8 @@ class LeveragePreparationClient(FakeDemoClient):
         self.set_leverage_calls: list[tuple[Symbol, Decimal]] = []
         self.position_queries: list[Symbol | None] = []
 
-    def get_positions(self, symbol=None):
+    def get_positions(self, symbol=None, settle_coin=None):
+        assert symbol is None or settle_coin is None
         self.position_queries.append(symbol)
         if symbol is None:
             symbols = [Symbol.BTCUSDT, Symbol.ETHUSDT]
@@ -240,7 +254,8 @@ class LeveragePreparationClient(FakeDemoClient):
             for item in symbols
         ]
 
-    def get_open_orders(self, symbol=None):
+    def get_open_orders(self, symbol=None, settle_coin=None):
+        assert symbol is None or settle_coin is None
         if symbol is None:
             return list(self.open_orders)
         return [
@@ -332,6 +347,58 @@ def test_demo_startup_leverage_already_one_is_idempotent() -> None:
     assert client.set_leverage_calls == []
 
 
+def test_demo_startup_uses_symbol_and_usdt_scopes() -> None:
+    client = FakeDemoClient()
+    demo = service(client)
+
+    assert demo.verify_account_and_environment() is True
+
+    assert (Symbol.BTCUSDT, None) in client.open_order_scopes
+    assert (Symbol.ETHUSDT, None) in client.open_order_scopes
+    assert (None, "USDT") in client.open_order_scopes
+    assert (Symbol.BTCUSDT, None) in client.position_scopes
+    assert (Symbol.ETHUSDT, None) in client.position_scopes
+    assert (None, "USDT") in client.position_scopes
+    assert demo.as_status()["open_orders_by_symbol"] == {
+        "BTCUSDT": 0,
+        "ETHUSDT": 0,
+    }
+    assert demo.as_status()["usdt_order_reconciliation"] == "PASS"
+    assert demo.as_status()["usdt_position_reconciliation"] == "PASS"
+    assert client.orders == []
+
+
+def test_demo_startup_allows_known_persisted_bot_order() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+    record = demo.submit_candidate(candidate, preview, classification, snapshot)
+    assert record is not None
+    client.open_orders = [{
+        "symbol": "BTCUSDT",
+        "orderId": record.order_id,
+        "orderLinkId": record.order_link_id,
+    }]
+
+    restarted = service(client, repo)
+    assert restarted.verify_account_and_environment() is True
+    assert restarted.as_status()["open_orders_by_symbol"]["BTCUSDT"] == 1
+
+
+def test_demo_startup_rejects_unattributed_active_order() -> None:
+    client = FakeDemoClient()
+    client.open_orders = [{
+        "symbol": "BTCUSDT",
+        "orderId": "manual-order",
+        "orderLinkId": "manual-link",
+    }]
+
+    with pytest.raises(DemoSafetyError, match="unrelated active Demo order"):
+        service(client).verify_account_and_environment()
+
+    assert client.orders == []
+
+
 def test_demo_startup_normalizes_flat_symbols_to_one() -> None:
     client = LeveragePreparationClient(
         leverage={Symbol.BTCUSDT: "10", Symbol.ETHUSDT: "2.00"}
@@ -373,6 +440,102 @@ def test_demo_set_leverage_sends_both_buy_and_sell_values() -> None:
     assert payload["buyLeverage"] == "1"
     assert payload["sellLeverage"] == "1"
     assert payload["symbol"] == "BTCUSDT"
+
+
+def test_linear_open_orders_rejects_missing_scope_without_http() -> None:
+    calls = []
+
+    def fake_http(method, url, headers, body, timeout):
+        calls.append(url)
+        return {"retCode": 0, "result": {"list": []}}
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+
+    with pytest.raises(DemoSafetyError, match="symbol or settleCoin"):
+        client.get_open_orders()
+
+    assert calls == []
+
+
+def test_linear_list_requests_apply_symbol_or_usdt_scope() -> None:
+    queries: list[dict[str, list[str]]] = []
+
+    def fake_http(method, url, headers, body, timeout):
+        queries.append(parse_qs(urlparse(url).query))
+        return {"retCode": 0, "result": {"list": []}}
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+    client.get_open_orders("btcusdt")
+    client.get_open_orders(settle_coin="usdt")
+    client.get_positions(Symbol.ETHUSDT)
+    client.get_positions(settle_coin="USDT")
+
+    assert queries[0]["symbol"] == ["BTCUSDT"]
+    assert "settleCoin" not in queries[0]
+    assert queries[1]["settleCoin"] == ["USDT"]
+    assert queries[2]["symbol"] == ["ETHUSDT"]
+    assert queries[3]["settleCoin"] == ["USDT"]
+    assert all(query["category"] == ["linear"] for query in queries)
+
+
+def test_v5_list_pagination_preserves_scope_and_deduplicates() -> None:
+    queries: list[dict[str, list[str]]] = []
+
+    def fake_http(method, url, headers, body, timeout):
+        query = parse_qs(urlparse(url).query)
+        queries.append(query)
+        if "cursor" not in query:
+            return {
+                "retCode": 0,
+                "result": {
+                    "list": [{"orderId": "one"}, {"orderId": "shared"}],
+                    "nextPageCursor": "page-2",
+                },
+            }
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [{"orderId": "shared"}, {"orderId": "two"}],
+                "nextPageCursor": "",
+            },
+        }
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+    rows = client.get_order_history(settle_coin="USDT")
+
+    assert [row["orderId"] for row in rows] == ["one", "shared", "two"]
+    assert len(queries) == 2
+    assert queries[0]["settleCoin"] == ["USDT"]
+    assert queries[1]["settleCoin"] == ["USDT"]
+    assert queries[1]["cursor"] == ["page-2"]
+
+
+def test_v5_list_pagination_stops_repeated_cursor() -> None:
+    calls = 0
+
+    def fake_http(method, url, headers, body, timeout):
+        nonlocal calls
+        calls += 1
+        return {
+            "retCode": 0,
+            "result": {
+                "list": [{"execId": str(calls)}],
+                "nextPageCursor": "same-cursor",
+            },
+        }
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+
+    assert len(client.get_executions(settle_coin="USDT")) == 2
+    assert calls == 2
 
 
 def test_demo_startup_does_not_change_leverage_with_open_position() -> None:
@@ -626,6 +789,27 @@ def test_reconciliation_fails_closed_on_remote_quantity_mismatch() -> None:
     demo.reconcile()
     assert demo.kill_switch_active is True
     assert "quantity mismatch" in demo.kill_switch_reasons[-1]
+
+
+def test_reconciliation_uses_usdt_scope_and_keeps_unrelated_visibility() -> None:
+    client = FakeDemoClient()
+    client.open_orders = [
+        {"symbol": "BTCUSDT", "orderId": "old-bot", "orderLinkId": "bybot-old-e-1"},
+        {"symbol": "ETHUSDT", "orderId": "manual", "orderLinkId": "manual-order"},
+    ]
+    demo = service(client)
+
+    result = demo.reconcile()
+
+    assert client.open_order_scopes == [(None, "USDT")]
+    assert client.history_scopes == [(None, "USDT")]
+    assert client.execution_scopes == [(None, "USDT")]
+    assert client.closed_pnl_scopes == [(None, "USDT")]
+    assert client.position_scopes == [(None, "USDT")]
+    assert result["bot_owned_open_orders"] == 1
+    assert result["unrelated_open_orders"] == 1
+    assert demo.as_status()["unrelated_open_orders"] == 1
+    assert client.orders == []
 
 
 def test_order_link_id_is_stable_and_purpose_specific() -> None:

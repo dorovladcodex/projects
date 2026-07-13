@@ -31,6 +31,27 @@ def test_demo_soak_uses_real_mode_and_has_no_test_pipeline() -> None:
     assert "Assert-NoInvalidCurrentRunCandidates" in text
 
 
+def test_demo_soak_waits_for_readiness_and_reports_real_startup_failure() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'Invoke-Api -Path "/health"' in text
+    assert 'Invoke-Api -Path "/status"' in text
+    assert "$script:Child.WaitForExit()" in text
+    assert "Get-UvicornExitCode" in text
+    assert '"FastAPI exit code: $exitText"' in text
+    assert '"First exception line:' in text
+    assert '"Final error line:' in text
+    assert '{ "unknown" }' in text
+    assert "if ($exitCode -eq 0) { return $null }" in text
+
+
+def test_demo_soak_prints_sanitized_reconciliation_preflight() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'Invoke-Api -Method "POST" -Path "/demo/reconcile"' in text
+    assert '"DEMO OPEN ORDERS ${symbol}: $count"' in text
+    assert '"DEMO USDT ORDER RECONCILIATION: PASS"' in text
+    assert '"DEMO USDT POSITION RECONCILIATION: PASS"' in text
+
+
 def test_demo_soak_script_parses_in_windows_powershell() -> None:
     command = (
         "$errors=$null; [void][System.Management.Automation.Language.Parser]::"

@@ -64,11 +64,21 @@ class DemoExchangeClient(Protocol):
     def verify_credentials(self) -> bool: ...
     def get_account_info(self) -> dict[str, Any]: ...
     def get_instrument(self, symbol: Symbol) -> InstrumentRules: ...
-    def get_positions(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
-    def get_open_orders(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
-    def get_order_history(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
-    def get_executions(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
-    def get_closed_pnl(self, symbol: Symbol | None = None) -> list[dict[str, Any]]: ...
+    def get_positions(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]: ...
+    def get_open_orders(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]: ...
+    def get_order_history(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]: ...
+    def get_executions(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]: ...
+    def get_closed_pnl(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]: ...
     def set_leverage(self, symbol: Symbol, leverage: Decimal) -> dict[str, Any]: ...
     def create_order(self, payload: dict[str, str]) -> dict[str, Any]: ...
     def cancel_order(self, symbol: Symbol, order_id: str) -> dict[str, Any]: ...
@@ -224,20 +234,50 @@ class BybitDemoRestClient:
             raise DemoSafetyError("instrument does not support leverage 1")
         return rules
 
-    def get_positions(self, symbol: Symbol | None = None) -> list[dict[str, Any]]:
-        return self._list("/v5/position/list", symbol)
+    def get_positions(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._paginate_list(
+            "/v5/position/list",
+            self._linear_scope(symbol, settle_coin),
+            identity_fields=("symbol", "positionIdx"),
+        )
 
-    def get_open_orders(self, symbol: Symbol | None = None) -> list[dict[str, Any]]:
-        return self._list("/v5/order/realtime", symbol, {"openOnly": "0"})
+    def get_open_orders(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]:
+        params = self._linear_scope(symbol, settle_coin)
+        params["openOnly"] = "0"
+        return self._paginate_list(
+            "/v5/order/realtime", params, identity_fields=("orderId",)
+        )
 
-    def get_order_history(self, symbol: Symbol | None = None) -> list[dict[str, Any]]:
-        return self._list("/v5/order/history", symbol)
+    def get_order_history(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._paginate_list(
+            "/v5/order/history",
+            self._linear_scope(symbol, settle_coin),
+            identity_fields=("orderId",),
+        )
 
-    def get_executions(self, symbol: Symbol | None = None) -> list[dict[str, Any]]:
-        return self._list("/v5/execution/list", symbol)
+    def get_executions(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._paginate_list(
+            "/v5/execution/list",
+            self._linear_scope(symbol, settle_coin),
+            identity_fields=("execId",),
+        )
 
-    def get_closed_pnl(self, symbol: Symbol | None = None) -> list[dict[str, Any]]:
-        return self._list("/v5/position/closed-pnl", symbol)
+    def get_closed_pnl(
+        self, symbol: Symbol | str | None = None, settle_coin: str | None = None
+    ) -> list[dict[str, Any]]:
+        return self._paginate_list(
+            "/v5/position/closed-pnl",
+            self._linear_scope(symbol, settle_coin),
+            identity_fields=("orderId",),
+        )
 
     def set_leverage(self, symbol: Symbol, leverage: Decimal) -> dict[str, Any]:
         value = _format_decimal(leverage)
@@ -272,16 +312,68 @@ class BybitDemoRestClient:
              "slOrderType": "Market"},
         )
 
-    def _list(
-        self, path: str, symbol: Symbol | None, extra: dict[str, str] | None = None
-    ) -> list[dict[str, Any]]:
-        params = {"category": "linear", **(extra or {})}
+    @staticmethod
+    def _linear_scope(
+        symbol: Symbol | str | None, settle_coin: str | None
+    ) -> dict[str, str]:
+        if symbol is None and not settle_coin:
+            raise DemoSafetyError("linear list request requires symbol or settleCoin")
+        params = {"category": "linear"}
         if symbol is not None:
-            params["symbol"] = symbol.value
-        data = self._request("GET", path, params)
-        result = data.get("result") or {}
-        items = result.get("list") if isinstance(result, dict) else None
-        return [item for item in (items or []) if isinstance(item, dict)]
+            value = symbol.value if isinstance(symbol, Symbol) else str(symbol)
+            value = value.strip().upper()
+            if not value:
+                raise DemoSafetyError("linear list request symbol is empty")
+            params["symbol"] = value
+        else:
+            coin = str(settle_coin).strip().upper()
+            if coin != "USDT":
+                raise DemoSafetyError("Demo account-wide linear scope must be USDT")
+            params["settleCoin"] = coin
+        return params
+
+    def _paginate_list(
+        self,
+        path: str,
+        params: dict[str, str],
+        *,
+        identity_fields: tuple[str, ...],
+    ) -> list[dict[str, Any]]:
+        """Read all V5 pages, preserving scope and stopping cursor loops."""
+        original = dict(params)
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        seen_items: set[tuple[str, ...] | str] = set()
+        collected: list[dict[str, Any]] = []
+        while True:
+            page_params = dict(original)
+            if cursor:
+                page_params["cursor"] = cursor
+            data = self._request("GET", path, page_params)
+            result = data.get("result") or {}
+            items = result.get("list") if isinstance(result, dict) else None
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                identity = tuple(str(item.get(field) or "") for field in identity_fields)
+                key: tuple[str, ...] | str = (
+                    identity
+                    if any(identity)
+                    else json.dumps(item, sort_keys=True, separators=(",", ":"), default=str)
+                )
+                if key in seen_items:
+                    continue
+                seen_items.add(key)
+                collected.append(item)
+            next_cursor = (
+                str(result.get("nextPageCursor") or "")
+                if isinstance(result, dict) else ""
+            )
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return collected
 
     def _request(
         self,
@@ -392,9 +484,13 @@ class DemoExecutionService:
         self.partial_fills = 0
         self.complete_fills = 0
         self.bot_owned_open_orders = 0
+        self.unrelated_open_orders = 0
         self.bot_owned_open_positions = 0
         self.account_verified = False
         self.symbol_leverage: dict[str, dict[str, str]] = {}
+        self.symbol_open_order_counts: dict[str, int] = {}
+        self.usdt_order_reconciliation_ok = False
+        self.usdt_position_reconciliation_ok = False
         self.leverage_normalized = False
         self.account_margin_mode: str | None = None
         self.last_reconciliation_at: datetime | None = None
@@ -417,6 +513,9 @@ class DemoExecutionService:
             return False
         self.leverage_normalized = False
         self.symbol_leverage = {}
+        self.symbol_open_order_counts = {}
+        self.usdt_order_reconciliation_ok = False
+        self.usdt_position_reconciliation_ok = False
         require_demo_execution(self.settings)
         validate_demo_domains(self.client.base_url, self.client.private_ws_url)
         self.account_verified = self.client.verify_credentials()
@@ -438,14 +537,35 @@ class DemoExecutionService:
                 DemoExecutionState.DEMO_CLOSED, DemoExecutionState.DEMO_FAILED
             }
         }
+        local_order_links = {
+            link
+            for item in local
+            for link in (item.order_link_id, item.close_order_link_id)
+            if link
+        }
         for symbol_value in self.settings.allowed_symbols:
             symbol = Symbol(symbol_value)
             self.client.get_instrument(symbol)
             positions = self.client.get_positions(symbol)
+            open_orders = self.client.get_open_orders(symbol=symbol)
+            self.symbol_open_order_counts[symbol.value] = len(open_orders)
+            conflicts = [
+                order for order in open_orders
+                if str(order.get("orderLinkId") or "") not in local_order_links
+            ]
+            if conflicts:
+                self._activate_kill_switch(
+                    f"unattributed active Demo order for {symbol.value}"
+                )
+                raise DemoSafetyError(
+                    f"unrelated active Demo order conflicts with {symbol.value} preflight"
+                )
             for position in positions:
                 if int(position.get("positionIdx") or 0) != 0:
                     raise DemoSafetyError("hedge position mode is not supported")
-            self._ensure_symbol_leverage(symbol, positions=positions)
+            self._ensure_symbol_leverage(
+                symbol, positions=positions, open_orders=open_orders
+            )
             for position in positions:
                 if (
                     _decimal(position.get("size"), default="0") > 0
@@ -453,6 +573,26 @@ class DemoExecutionService:
                 ):
                     self._activate_kill_switch("unattributed remote Demo position")
                     raise DemoSafetyError("unrelated open Demo position conflicts with preflight")
+        # Bybit V5 linear list endpoints must always be scoped. Account-wide
+        # reconciliation deliberately uses USDT, while symbol checks above stay
+        # symbol-scoped so their diagnostics remain actionable.
+        usdt_orders = self.client.get_open_orders(settle_coin="USDT")
+        self.usdt_order_reconciliation_ok = True
+        if any(
+            str(order.get("orderLinkId") or "") not in local_order_links
+            for order in usdt_orders
+        ):
+            self._activate_kill_switch("unattributed active USDT Demo order")
+            raise DemoSafetyError("unrelated active USDT Demo order conflicts with preflight")
+        usdt_positions = self.client.get_positions(settle_coin="USDT")
+        self.usdt_position_reconciliation_ok = True
+        if any(
+            _decimal(position.get("size"), default="0") > 0
+            and str(position.get("symbol") or "") not in active_local_symbols
+            for position in usdt_positions
+        ):
+            self._activate_kill_switch("unattributed remote Demo position")
+            raise DemoSafetyError("unrelated open USDT Demo position conflicts with preflight")
         self.leverage_normalized = True
         return self.account_verified
 
@@ -461,6 +601,7 @@ class DemoExecutionService:
         symbol: Symbol,
         *,
         positions: list[dict[str, Any]] | None = None,
+        open_orders: list[dict[str, Any]] | None = None,
     ) -> None:
         """Confirm 1x on both sides, normalizing only a completely flat Demo symbol."""
         if self.client is None:
@@ -481,7 +622,12 @@ class DemoExecutionService:
             raise DemoSafetyError(
                 f"{symbol.value} leverage is not 1x and an open position prevents normalization"
             )
-        if self.client.get_open_orders(symbol):
+        active_orders = (
+            open_orders
+            if open_orders is not None
+            else self.client.get_open_orders(symbol=symbol)
+        )
+        if active_orders:
             raise DemoSafetyError(
                 f"{symbol.value} leverage is not 1x and active orders prevent normalization"
             )
@@ -639,26 +785,31 @@ class DemoExecutionService:
     def reconcile(self) -> dict[str, Any]:
         if not self.enabled or self.client is None:
             return {"status": "DISABLED"}
-        remote_orders = self.client.get_open_orders()
-        history = self.client.get_order_history()
-        executions = self.client.get_executions()
-        closed_pnl = self.client.get_closed_pnl()
+        remote_orders = self.client.get_open_orders(settle_coin="USDT")
+        history = self.client.get_order_history(settle_coin="USDT")
+        executions = self.client.get_executions(settle_coin="USDT")
+        closed_pnl = self.client.get_closed_pnl(settle_coin="USDT")
         self.last_reconciliation_at = datetime.now(timezone.utc)
         local = self.repository.load_demo_executions()
-        local_links = {item.order_link_id: item for item in local}
-        prefix = f"{self.order_prefix}-"
+        local_links = {
+            link: item
+            for item in local
+            for link in (item.order_link_id, item.close_order_link_id)
+            if link
+        }
         bot_prefix = f"{self.settings.demo_order_link_prefix}-"
         self.bot_owned_open_orders = sum(
-            str(item.get("orderLinkId") or "").startswith(prefix)
+            str(item.get("orderLinkId") or "").startswith(bot_prefix)
             for item in remote_orders
         )
+        self.unrelated_open_orders = len(remote_orders) - self.bot_owned_open_orders
         remote_by_link: dict[str, list[dict[str, Any]]] = {}
         for order in [*remote_orders, *history]:
             link = str(order.get("orderLinkId") or "")
             if link:
                 remote_by_link.setdefault(link, []).append(order)
         if any(len(items) > 1 and len({str(x.get("orderId")) for x in items}) > 1
-               for link, items in remote_by_link.items() if link.startswith(prefix)):
+               for link, items in remote_by_link.items() if link.startswith(bot_prefix)):
             self.reconciliation_incidents += 1
             self._activate_kill_switch("duplicate bot-created Demo entry order")
         for order in [*remote_orders, *history]:
@@ -696,7 +847,7 @@ class DemoExecutionService:
                 self.repository.save_demo_execution(record, event_type="REMOTE_ORDER_MISSING")
                 self.reconciliation_incidents += 1
                 self._activate_kill_switch("local Demo order is missing remotely")
-        positions = self.client.get_positions()
+        positions = self.client.get_positions(settle_coin="USDT")
         active_positions = [p for p in positions if _decimal(p.get("size"), default="0") > 0]
         active_owned_symbols = {
             item.symbol.value for item in local
@@ -763,8 +914,17 @@ class DemoExecutionService:
         return {
             "status": "OK" if not self.kill_switch_active else "BLOCKED",
             "remote_orders": len(remote_orders),
+            "bot_owned_open_orders": self.bot_owned_open_orders,
+            "unrelated_open_orders": self.unrelated_open_orders,
             "remote_positions": len(active_positions),
             "incidents": self.reconciliation_incidents,
+            "open_orders_by_symbol": dict(self.symbol_open_order_counts),
+            "usdt_order_reconciliation": (
+                "PASS" if self.usdt_order_reconciliation_ok else "UNAVAILABLE"
+            ),
+            "usdt_position_reconciliation": (
+                "PASS" if self.usdt_position_reconciliation_ok else "UNAVAILABLE"
+            ),
         }
 
     def cleanup_bot_owned(self) -> dict[str, int]:
@@ -779,14 +939,14 @@ class DemoExecutionService:
             if item.run_id == self.run_id
             if item.state not in {DemoExecutionState.DEMO_CLOSED, DemoExecutionState.DEMO_FAILED}
         }
-        for order in self.client.get_open_orders():
+        for order in self.client.get_open_orders(settle_coin="USDT"):
             link = str(order.get("orderLinkId") or "")
             if not link.startswith(prefix):
                 continue
             symbol = Symbol(str(order["symbol"]))
             self.client.cancel_order(symbol, str(order["orderId"]))
             cancelled += 1
-        for position in self.client.get_positions():
+        for position in self.client.get_positions(settle_coin="USDT"):
             size = _decimal(position.get("size"), default="0")
             if size <= 0:
                 continue
@@ -818,6 +978,16 @@ class DemoExecutionService:
             "websocket_connected": self.websocket_connected,
             "websocket_reconnects": self.websocket_reconnects,
             "reconciliation_incidents": self.reconciliation_incidents,
+            "symbol_open_order_counts": dict(self.symbol_open_order_counts),
+            "open_orders_by_symbol": dict(self.symbol_open_order_counts),
+            "usdt_order_reconciliation_ok": self.usdt_order_reconciliation_ok,
+            "usdt_position_reconciliation_ok": self.usdt_position_reconciliation_ok,
+            "usdt_order_reconciliation": (
+                "PASS" if self.usdt_order_reconciliation_ok else "UNAVAILABLE"
+            ),
+            "usdt_position_reconciliation": (
+                "PASS" if self.usdt_position_reconciliation_ok else "UNAVAILABLE"
+            ),
             "orders_submitted": self.orders_submitted,
             "orders_accepted": self.orders_accepted,
             "orders_rejected": self.orders_rejected,
@@ -825,6 +995,7 @@ class DemoExecutionService:
             "complete_fills": self.complete_fills,
             "states": counts,
             "bot_owned_open_orders": self.bot_owned_open_orders,
+            "unrelated_open_orders": self.unrelated_open_orders,
             "bot_owned_open_positions": self.bot_owned_open_positions,
             "last_error": self.last_error,
             "account_verified": self.account_verified,
@@ -1070,15 +1241,15 @@ class DemoExecutionService:
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
         positions = [
-            item for item in self.client.get_positions(symbol)
+            item for item in self.client.get_positions(symbol=symbol)
             if _decimal(item.get("size"), default="0") > 0
         ]
         if positions:
             raise DemoSafetyError("conflicting remote Demo position exists")
-        if self.client.get_open_orders(symbol):
+        if self.client.get_open_orders(symbol=symbol):
             raise DemoSafetyError("conflicting active Demo order exists")
         all_positions = [
-            item for item in self.client.get_positions()
+            item for item in self.client.get_positions(settle_coin="USDT")
             if _decimal(item.get("size"), default="0") > 0
         ]
         if len(all_positions) >= self.settings.paper_max_total_open_positions:
@@ -1104,7 +1275,7 @@ class DemoExecutionService:
                 seconds=self.settings.paper_symbol_cooldown_seconds
             ):
                 raise DemoSafetyError("symbol cooldown is active")
-        closed = self.client.get_closed_pnl()
+        closed = self.client.get_closed_pnl(settle_coin="USDT")
         daily = Decimal("0")
         weekly = Decimal("0")
         for item in closed:
@@ -1131,7 +1302,7 @@ class DemoExecutionService:
     def _verify_leverage_and_mode(self, symbol: Symbol) -> None:
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
-        positions = self.client.get_positions(symbol)
+        positions = self.client.get_positions(symbol=symbol)
         for item in positions:
             leverage = _decimal(item.get("leverage"), default="1")
             position_idx = int(item.get("positionIdx") or 0)

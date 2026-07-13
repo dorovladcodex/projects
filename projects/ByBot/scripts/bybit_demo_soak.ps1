@@ -147,14 +147,61 @@ function Get-SanitizedStderrTail {
     return Protect-Text ($lines -join [Environment]::NewLine)
 }
 
+function Get-SanitizedStartupErrorSummary {
+    param([string]$Path)
+    $text = Safe-ReadTextFile -Path $Path
+    if (-not $text) {
+        return @{
+            FirstExceptionLine = "(not available)"
+            FinalErrorLine = "(not available)"
+        }
+    }
+    $lines = @($text -split "`r?`n" | ForEach-Object { $_.Trim() } |
+        Where-Object { $_ })
+    $errorLines = @($lines | Where-Object {
+        $_ -match '(?i)(traceback|exception|error|failed|failure)'
+    })
+    $first = if ($errorLines.Count -gt 0) { $errorLines[0] } else { $lines[0] }
+    $last = if ($errorLines.Count -gt 0) {
+        $errorLines[$errorLines.Count - 1]
+    }
+    else {
+        $lines[$lines.Count - 1]
+    }
+    return @{
+        FirstExceptionLine = Protect-Text $first
+        FinalErrorLine = Protect-Text $last
+    }
+}
+
+function Get-UvicornExitCode {
+    if ($null -eq $script:Child) { return $null }
+    try {
+        if (-not $script:Child.HasExited) { return $null }
+        $script:Child.WaitForExit()
+        $exitCode = [int]$script:Child.ExitCode
+        # A clean process code before either readiness endpoint responded is not
+        # a meaningful startup result (Start-Process/Windows can surface 0 for
+        # a launcher that exited before the child startup failure was observed).
+        if ($exitCode -eq 0) { return $null }
+        return $exitCode
+    }
+    catch {
+        return $null
+    }
+}
+
 function New-UvicornStartupFailure {
-    param([string]$Reason, [Nullable[int]]$ExitCode)
-    $exitText = if ($null -eq $ExitCode) { "not available" } else { [string]$ExitCode }
+    param([string]$Reason, $ExitCode)
+    $exitText = if ($null -eq $ExitCode) { "unknown" } else { [string]$ExitCode }
     $reportText = if ($script:ReportPath) { $script:ReportPath } else { "not created" }
     $stderrTail = Get-SanitizedStderrTail -Path $script:StderrPath
+    $errorSummary = Get-SanitizedStartupErrorSummary -Path $script:StderrPath
     return @(
         $Reason,
         "FastAPI exit code: $exitText",
+        "First exception line: $($errorSummary.FirstExceptionLine)",
+        "Final error line: $($errorSummary.FinalErrorLine)",
         "Last relevant sanitized stderr lines:",
         $stderrTail,
         "Report path: $reportText"
@@ -188,8 +235,7 @@ function Wait-ForApi {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
         if ($script:Child -and $script:Child.HasExited) {
-            $script:Child.WaitForExit()
-            $exitCode = [int]$script:Child.ExitCode
+            $exitCode = Get-UvicornExitCode
             throw (New-UvicornStartupFailure `
                 -Reason "FastAPI exited during startup" -ExitCode $exitCode)
         }
@@ -197,7 +243,14 @@ function Wait-ForApi {
             $health = Invoke-Api -Path "/health" -TimeoutSec 3
             if ($health.status -eq "ok") { return }
         }
-        catch { Start-Sleep -Seconds 1 }
+        catch {
+            try {
+                $status = Invoke-Api -Path "/status" -TimeoutSec 3
+                if ($null -ne $status) { return }
+            }
+            catch { }
+        }
+        Start-Sleep -Seconds 1
     }
     throw (New-UvicornStartupFailure `
         -Reason "FastAPI did not become healthy before the startup timeout" `
@@ -231,6 +284,23 @@ function Assert-DemoPreflight {
     Write-Host "DEMO LEVERAGE BTCUSDT: 1x PASS"
     Write-Host "DEMO LEVERAGE ETHUSDT: 1x PASS"
     Write-Host "DEMO LEVERAGE NORMALIZATION: PASS"
+    $reconciliation = Invoke-Api -Method "POST" -Path "/demo/reconcile"
+    Assert-Condition ($reconciliation.status -eq "OK") `
+        "Demo USDT reconciliation did not pass"
+    Assert-Condition ($null -ne $reconciliation.PSObject.Properties["open_orders_by_symbol"]) `
+        "Demo per-symbol open-order reconciliation status is missing"
+    foreach ($symbol in @("BTCUSDT", "ETHUSDT")) {
+        Assert-Condition ($null -ne $reconciliation.open_orders_by_symbol.PSObject.Properties[$symbol]) `
+            "$symbol open-order reconciliation status is missing"
+        $count = [int]$reconciliation.open_orders_by_symbol.$symbol
+        Write-Host "DEMO OPEN ORDERS ${symbol}: $count"
+    }
+    Assert-Condition ($reconciliation.usdt_order_reconciliation -eq "PASS") `
+        "Demo USDT order reconciliation did not pass"
+    Assert-Condition ($reconciliation.usdt_position_reconciliation -eq "PASS") `
+        "Demo USDT position reconciliation did not pass"
+    Write-Host "DEMO USDT ORDER RECONCILIATION: PASS"
+    Write-Host "DEMO USDT POSITION RECONCILIATION: PASS"
     $status = Invoke-Api -Path "/status"
     Assert-Condition ($status.execution_mode -eq "BYBIT_DEMO") "Wrong execution mode"
     Assert-Condition ($status.live_order_placement_blocked -eq $true) "Live execution is not blocked"
