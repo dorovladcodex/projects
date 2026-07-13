@@ -10,6 +10,8 @@
 - Risk preview, capped PAPER sizing, stops/targets, fees, slippage, and net-edge checks.
 - Durable automatic PAPER execution, idempotency, SL/TP/timeout/manual close,
   paper account recovery, position limits, cooldowns, loss/drawdown kill switch.
+- Windows PowerShell 5.1 soak runner for real RSS/public Bybit data, Codex CLI,
+  continuous accounting/database checks, controlled restart, and artifacts.
 
 ## Architecture and data
 
@@ -61,6 +63,7 @@ Run all four scripts in `scripts/` for Windows/Docker E2E validation.
   workers require distributed coordination.
 - Financial storage remains SQL float in legacy tables; API smoke assertions use Decimal.
 - RSS quality and real-provider classification still need production tuning.
-- Next: longer PAPER soak/shadow-live observation, dashboard/alerts, operational
-  metrics, backup/restore drills, then BYBIT_DEMO order design behind a new explicit gate.
+- Next: complete 24-hour and multi-day PAPER soak observation, dashboard/alerts,
+  operational metrics, backup/restore drills, then BYBIT_DEMO order design behind
+  a new explicit gate.
 - Demo/live order placement remains out of scope.

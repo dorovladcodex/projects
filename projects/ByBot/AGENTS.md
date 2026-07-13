@@ -53,12 +53,15 @@ powershell -ExecutionPolicy Bypass -File .\scripts\postgres_e2e_smoke.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\paper_execution_smoke.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\auto_paper_execution_smoke.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\paper_stabilization_smoke.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\paper_soak.ps1 -Hours 1
 ```
 
 - `postgres_e2e_smoke.ps1`: Codex/news persistence and dry-run restart recovery.
 - `paper_execution_smoke.ps1`: manual PAPER execution idempotency and TP close.
 - `auto_paper_execution_smoke.ps1`: automatic PAPER open/close/account recovery.
 - `paper_stabilization_smoke.ps1`: limits, cooldowns, loss kill switch, restart.
+- `paper_soak.ps1`: unattended real RSS/public Bybit PAPER soak with JSONL,
+  accounting/invariant checks, a controlled restart, and Markdown report.
 
 Run targeted tests while editing, the full suite once at the end, then all
 smokes. Preserve unrelated user changes and keep `.env` untracked.
