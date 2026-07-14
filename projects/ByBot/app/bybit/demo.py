@@ -39,6 +39,10 @@ TERMINAL_DEMO_STATES = {
     DemoExecutionState.DEMO_CLOSED,
     DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
     DemoExecutionState.DEMO_FAILED,
+    DemoExecutionState.DEMO_NOT_SUBMITTED,
+    DemoExecutionState.DEMO_ORDER_CANCELLED,
+    DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+    DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
 }
 
 
@@ -656,6 +660,9 @@ class DemoExecutionService:
         self.leverage_normalized = False
         self.account_margin_mode: str | None = None
         self.last_reconciliation_at: datetime | None = None
+        self._last_reconcile_monotonic: float | None = None
+        self._discard_ws_before_ms: int | None = None
+        self.sleep_resume_reconciliations = 0
         if self.enabled:
             require_demo_execution(settings)
             if client is None:
@@ -982,6 +989,14 @@ class DemoExecutionService:
         for item in event.get("data") or []:
             if not isinstance(item, dict):
                 continue
+            event_ms = _event_timestamp_ms(event, item)
+            if self._discard_ws_before_ms is not None and (
+                event_ms is None or event_ms <= self._discard_ws_before_ms
+            ):
+                # A private stream can replay buffered messages after Windows
+                # resumes.  The REST watermark is authoritative; never let an
+                # older event regress a reconciled execution.
+                continue
             event_key = _event_key(topic, item)
             if not self.repository.record_demo_event(event_key, topic, item):
                 continue
@@ -1053,7 +1068,15 @@ class DemoExecutionService:
             ),
             None,
         )
-        if position is not None and record.state not in TERMINAL_DEMO_STATES:
+        close_started = bool(
+            record.close_order_id or record.close_order_link_id or record.close_fills
+        )
+        if (
+            position is not None
+            and record.state not in TERMINAL_DEMO_STATES
+            and not close_started
+            and record.state != DemoExecutionState.DEMO_CLOSING
+        ):
             remote_size = _decimal(position.get("size"), default="0")
             if record.accepted_quantity == 0:
                 record.accepted_quantity = remote_size
@@ -1086,6 +1109,18 @@ class DemoExecutionService:
     def reconcile(self) -> dict[str, Any]:
         if not self.enabled or self.client is None:
             return {"status": "DISABLED"}
+        monotonic_now = time.monotonic()
+        gap_limit = max(
+            30.0,
+            float(self.settings.demo_reconciliation_interval_seconds) * 2.0,
+        )
+        if (
+            self._last_reconcile_monotonic is not None
+            and monotonic_now - self._last_reconcile_monotonic > gap_limit
+        ):
+            self.sleep_resume_reconciliations += 1
+            self._discard_ws_before_ms = int(time.time() * 1000)
+        self._last_reconcile_monotonic = monotonic_now
         remote_orders = self.client.get_open_orders(settle_coin="USDT")
         history = self.client.get_order_history(settle_coin="USDT")
         executions = self.client.get_executions(settle_coin="USDT")
@@ -1504,6 +1539,8 @@ class DemoExecutionService:
                 self.last_reconciliation_at.isoformat()
                 if self.last_reconciliation_at else None
             ),
+            "sleep_resume_reconciliations": self.sleep_resume_reconciliations,
+            "rest_reconciliation_watermark_ms": self._discard_ws_before_ms,
         }
 
     def _apply_order_update(self, record: DemoExecutionRecord, item: dict[str, Any]) -> None:
@@ -1524,6 +1561,17 @@ class DemoExecutionService:
                 record.last_error = f"close order ended with status {status}"
             record.updated_at = datetime.now(timezone.utc)
             self.repository.save_demo_execution(record, event_type=f"CLOSE_{status or 'UNKNOWN'}")
+            return
+        # Entry history is commonly replayed after close history on reconnect.
+        # Once close activity exists it is historical evidence only and must
+        # never move the durable state back to FILLED/PROTECTION_PENDING.
+        if (
+            record.close_order_id
+            or record.close_order_link_id
+            or record.close_fills
+            or record.state == DemoExecutionState.DEMO_CLOSING
+            or record.state in TERMINAL_DEMO_STATES
+        ):
             return
         record.exchange_order_status = status or record.exchange_order_status
         if record.state in {
@@ -1562,6 +1610,9 @@ class DemoExecutionService:
             else f"ORDER_{status or 'UNKNOWN'}"
         )
         self.repository.save_demo_execution(record, event_type=event_type)
+        # Protection is installed only by the REST reconciler after a fresh,
+        # attributable non-zero position read.  Order events alone are stale-
+        # prone and are insufficient authority for an exchange mutation.
         if record.state in {
             DemoExecutionState.DEMO_FILLED,
             DemoExecutionState.DEMO_FULLY_FILLED,
@@ -1646,6 +1697,14 @@ class DemoExecutionService:
                     ):
                         record.close_reason = "stop_loss"
         else:
+            if (
+                record.close_order_id
+                or record.close_order_link_id
+                or record.close_fills
+                or record.state == DemoExecutionState.DEMO_CLOSING
+                or record.state in TERMINAL_DEMO_STATES
+            ):
+                return
             record.fills.append(fill)
             total_qty = sum((entry.quantity for entry in record.fills), Decimal("0"))
             total_value = sum((entry.quantity * entry.price for entry in record.fills), Decimal("0"))
@@ -1690,6 +1749,8 @@ class DemoExecutionService:
                 else "EXECUTION_FILL"
             ),
         )
+        # See _apply_order_update: the next authoritative REST reconciliation
+        # owns protection installation.
         if (
             not is_close_fill
             and record.state == DemoExecutionState.DEMO_FULLY_FILLED
@@ -1700,6 +1761,39 @@ class DemoExecutionService:
     def _install_protection(self, record: DemoExecutionRecord) -> None:
         if self.client is None or record.average_fill_price is None:
             self._emergency_close(record, "average fill price unavailable")
+            return
+        if (
+            record.close_order_id
+            or record.close_order_link_id
+            or record.close_fills
+            or record.state == DemoExecutionState.DEMO_CLOSING
+            or record.state in TERMINAL_DEMO_STATES
+        ):
+            return
+        positions = self.client.get_positions(record.symbol)
+        position = next(
+            (
+                item for item in positions
+                if str(item.get("symbol") or "") == record.symbol.value
+                and _decimal(item.get("size"), default="0") > 0
+            ),
+            None,
+        )
+        if position is None:
+            record.last_reconciliation_at = datetime.now(timezone.utc)
+            record.updated_at = record.last_reconciliation_at
+            self.repository.save_demo_execution(
+                record, event_type="PROTECTION_SKIPPED_POSITION_FLAT"
+            )
+            return
+        remote_size = _decimal(position.get("size"), default="0")
+        expected_side = "BUY" if record.side == Side.BUY else "SELL"
+        remote_side = str(position.get("side") or "").upper()
+        if remote_side and remote_side != expected_side:
+            self._emergency_close(record, "remote position side mismatch")
+            return
+        if record.accepted_quantity <= 0 or remote_size != record.accepted_quantity:
+            self._emergency_close(record, "remote position quantity mismatch")
             return
         rules = self.client.get_instrument(record.symbol)
         entry = record.average_fill_price
@@ -1716,9 +1810,17 @@ class DemoExecutionService:
         record.stop_loss = stop_loss
         self.repository.save_demo_execution(record, event_type="PROTECTION_PENDING")
         try:
-            self.client.set_trading_stop(record.symbol, take_profit, stop_loss)
+            if not _protection_matches(position, take_profit, stop_loss):
+                try:
+                    self.client.set_trading_stop(record.symbol, take_profit, stop_loss)
+                except DemoExchangeError as exc:
+                    if "not modified" not in str(exc).lower():
+                        raise
             positions = self.client.get_positions(record.symbol)
-            position = next((item for item in positions if _decimal(item.get("size"), default="0") > 0), None)
+            position = next(
+                (item for item in positions if _decimal(item.get("size"), default="0") > 0),
+                None,
+            )
             if position is None or not _protection_matches(position, take_profit, stop_loss):
                 raise DemoExchangeError("exchange-side TP/SL could not be verified")
             record.protection_confirmed = True
@@ -1730,7 +1832,15 @@ class DemoExecutionService:
                 record, event_type="DEMO_POSITION_OPEN"
             )
         except Exception as exc:
-            self._emergency_close(record, _sanitized_error(exc))
+            error = _sanitized_error(exc)
+            if "can not set tp/sl/ts for zero position" in error.lower():
+                record.last_error = "position became flat before TP/SL confirmation"
+                record.updated_at = datetime.now(timezone.utc)
+                self.repository.save_demo_execution(
+                    record, event_type="PROTECTION_SKIPPED_POSITION_FLAT"
+                )
+                return
+            self._emergency_close(record, error)
 
     def _emergency_close(self, record: DemoExecutionRecord, reason: str) -> None:
         quantity = record.accepted_quantity or record.requested_quantity
@@ -1869,6 +1979,7 @@ class DemoExecutionService:
         return candidates[0] if len(candidates) == 1 else None
 
     def _activate_kill_switch(self, reason: str) -> None:
+        reason = " ".join(reason.split())[:250]
         self.kill_switch_active = True
         if reason not in self.kill_switch_reasons:
             self.kill_switch_reasons.append(reason)
@@ -1984,6 +2095,26 @@ def _event_key(topic: str, item: dict[str, Any]) -> str:
         or hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()
     )
     return f"{topic}:{stable}:{item.get('orderStatus', '')}"
+
+
+def _event_timestamp_ms(
+    event: dict[str, Any], item: dict[str, Any]
+) -> int | None:
+    values = (
+        item.get("execTime"),
+        item.get("updatedTime"),
+        item.get("creationTime"),
+        event.get("creationTime"),
+    )
+    parsed: list[int] = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            parsed.append(int(str(value)))
+        except (TypeError, ValueError):
+            continue
+    return max(parsed) if parsed else None
 
 
 def _protection_present(position: dict[str, Any]) -> bool:

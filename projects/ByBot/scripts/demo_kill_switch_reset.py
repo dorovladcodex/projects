@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from decimal import Decimal
 from pathlib import Path
 import sys
 
@@ -10,8 +9,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.bybit.demo_diagnostics import (  # noqa: E402
     DemoDiagnosticsConfig,
     DemoDiagnosticsError,
+    evaluate_demo_recovery_readiness,
+    format_demo_recovery_readiness,
     run_demo_diagnostics,
-    validate_recoverable_demo_latch,
 )
 from app.db.persistence import PersistenceRepository  # noqa: E402
 
@@ -34,14 +34,11 @@ def main() -> int:
         config = DemoDiagnosticsConfig.load()
         repository = PersistenceRepository(config.database_url, create_schema=False)
         result = run_demo_diagnostics(config, repository=repository)
-        blockers = validate_recoverable_demo_latch(result, args.execution_id)
-        if result.bot_owned_open_orders or any(
-            Decimal(item["size"]) > 0 for item in result.positions.values()
-        ):
-            blockers.append("final remote reconciliation is not flat")
-        if blockers:
+        readiness = evaluate_demo_recovery_readiness(result, args.execution_id)
+        print(format_demo_recovery_readiness(readiness))
+        if readiness.blockers:
             print("KILL SWITCH RESET: REFUSED", file=sys.stderr)
-            for blocker in dict.fromkeys(blockers):
+            for blocker in readiness.blockers:
                 print(f"- {blocker}", file=sys.stderr)
             return 1
         print("REMOTE DEMO STATE FLAT: PASS")
@@ -50,6 +47,23 @@ def main() -> int:
         if not args.confirm_reset:
             print("KILL SWITCH RESET: DRY RUN")
             return 0
+        if readiness.linked_activation_id == "repair-audit-inference":
+            if not repository.link_demo_kill_switch_execution(
+                args.execution_id,
+                reason=(
+                    "guarded linkage from run/order timestamps and complete "
+                    "sleep-resume execution repair audit"
+                ),
+            ):
+                print("KILL SWITCH RESET: FAIL", file=sys.stderr)
+                return 1
+            result = run_demo_diagnostics(config, repository=repository)
+            readiness = evaluate_demo_recovery_readiness(result, args.execution_id)
+            if readiness.blockers or readiness.linked_activation_id in {
+                None, "repair-audit-inference"
+            }:
+                print("KILL SWITCH RESET: FAIL", file=sys.stderr)
+                return 1
         if not repository.reset_demo_kill_switch(
             args.execution_id,
             reason="operator-confirmed recovery after flat Demo reconciliation",

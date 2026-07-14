@@ -289,6 +289,22 @@ class DemoSoakRunRow(Base):
     final_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
+class DemoCanaryJobRow(Base):
+    __tablename__ = "demo_canary_jobs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    execution_id: Mapped[str | None] = mapped_column(
+        ForeignKey("demo_executions.id"), nullable=True
+    )
+    request_payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    result_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class PersistenceRepository:
     """Small synchronous repository. Failures degrade persistence, never trading safety."""
 
@@ -1206,9 +1222,9 @@ class PersistenceRepository:
                 else:
                     for column in (
                         "execution_environment", "risk_decision_id", "run_id",
-                        "order_link_id", "order_id",
-                        "symbol", "side", "state", "requested_quantity",
-                        "accepted_quantity", "average_fill_price", "close_order_link_id", "close_order_id",
+                        "order_link_id", "order_id", "symbol", "side", "state",
+                        "requested_quantity", "accepted_quantity",
+                        "average_fill_price", "close_order_link_id", "close_order_id",
                         "realized_exchange_pnl", "payload", "updated_at",
                     ):
                         setattr(existing, column, getattr(row, column))
@@ -1216,12 +1232,9 @@ class PersistenceRepository:
                 if candidate is not None:
                     _set_candidate_demo_state(candidate, record.state)
                 session.add(DemoExecutionEventRow(
-                    id=str(uuid4()),
-                    execution_id=str(record.id),
-                    event_key=(
-                        f"local:{record.id}:{event_type}:"
-                        f"{record.updated_at.isoformat()}"
-                    ),
+                    id=str(uuid4()), execution_id=str(record.id),
+                    event_key=(f"local:{record.id}:{event_type}:"
+                               f"{record.updated_at.isoformat()}"),
                     event_type=event_type,
                     payload=record.model_dump(mode="json"),
                     occurred_at=record.updated_at,
@@ -1229,7 +1242,53 @@ class PersistenceRepository:
                 session.flush()
             return True
         except IntegrityError:
-            # Replayed state-transition events are harmless.
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def repair_demo_execution(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        event_types: list[str],
+        repair_payload: dict[str, Any],
+    ) -> bool:
+        """Atomically finalize one flat, read-only-verified Demo execution."""
+        if not self.available or not event_types:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                existing = session.get(DemoExecutionRow, str(record.id))
+                if existing is None:
+                    return False
+                row = _demo_execution_row(record)
+                for column in (
+                    "state", "accepted_quantity", "average_fill_price",
+                    "close_order_id", "realized_exchange_pnl", "payload",
+                    "updated_at",
+                ):
+                    setattr(existing, column, getattr(row, column))
+                candidate = session.get(
+                    SignalCandidateRow, str(record.candidate_id)
+                )
+                if candidate is not None:
+                    _set_candidate_demo_state(candidate, record.state)
+                base_time = record.updated_at
+                for index, event_type in enumerate(event_types):
+                    occurred_at = base_time + timedelta(microseconds=index)
+                    event_payload = record.model_dump(mode="json")
+                    event_payload["repair"] = dict(repair_payload)
+                    session.add(DemoExecutionEventRow(
+                        id=str(uuid4()), execution_id=str(record.id),
+                        event_key=(
+                            f"repair:{record.id}:{event_type}:"
+                            f"{base_time.isoformat()}"
+                        ),
+                        event_type=event_type, payload=event_payload,
+                        occurred_at=occurred_at,
+                    ))
+                session.flush()
             return True
         except SQLAlchemyError as exc:
             self._failed(exc)
@@ -1300,10 +1359,23 @@ class PersistenceRepository:
                         "event_type": row.event_type,
                         "occurred_at": _utc_aware(row.occurred_at).isoformat(),
                         "state": (row.payload or {}).get("state"),
+                        "run_id": (row.payload or {}).get("run_id"),
+                        "order_link_id": (row.payload or {}).get("order_link_id"),
                         "order_id": (row.payload or {}).get("order_id"),
+                        "close_order_link_id": (row.payload or {}).get(
+                            "close_order_link_id"
+                        ),
                         "close_order_id": (row.payload or {}).get("close_order_id"),
                         "failure_reason": (row.payload or {}).get("failure_reason"),
                         "cleanup_result": (row.payload or {}).get("cleanup_result"),
+                        "last_error": (row.payload or {}).get("last_error"),
+                        "close_reason": (row.payload or {}).get("close_reason"),
+                        "protection_confirmed": (row.payload or {}).get(
+                            "protection_confirmed"
+                        ),
+                        "accepted_quantity": (row.payload or {}).get(
+                            "accepted_quantity"
+                        ),
                     }
                     for row in rows
                 ]
@@ -1517,6 +1589,99 @@ class PersistenceRepository:
             self._failed(exc)
             return False
 
+    def reserve_demo_canary_job(
+        self, job_id: str, run_id: str, symbol: str, request_payload: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not self.available:
+            return None
+        now = datetime.now(timezone.utc)
+        try:
+            with Session(self.engine) as session:
+                existing = session.scalar(
+                    select(DemoCanaryJobRow).where(DemoCanaryJobRow.run_id == run_id)
+                )
+                if existing is None:
+                    session.add(DemoCanaryJobRow(
+                        id=job_id, run_id=run_id, symbol=symbol, status="PENDING",
+                        execution_id=None, request_payload=request_payload,
+                        result_payload=None, error_code=None,
+                        created_at=now, updated_at=now,
+                    ))
+                    session.commit()
+            return self.get_demo_canary_job(job_id=job_id, run_id=run_id)
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def update_demo_canary_job(
+        self, job_id: str, *, status: str,
+        execution_id: str | None = None,
+        result_payload: dict[str, Any] | None = None,
+        error_code: str | None = None,
+    ) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session:
+                row = session.get(DemoCanaryJobRow, job_id)
+                if row is None:
+                    return False
+                row.status = status
+                if execution_id is not None:
+                    row.execution_id = execution_id
+                if result_payload is not None:
+                    row.result_payload = result_payload
+                row.error_code = error_code
+                row.updated_at = datetime.now(timezone.utc)
+                session.commit()
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def get_demo_canary_job(
+        self, *, job_id: str | None = None, run_id: str | None = None
+    ) -> dict[str, Any] | None:
+        if not self.available or (job_id is None and run_id is None):
+            return None
+        try:
+            with Session(self.engine) as session:
+                row = (
+                    session.get(DemoCanaryJobRow, job_id)
+                    if job_id is not None
+                    else session.scalar(select(DemoCanaryJobRow).where(
+                        DemoCanaryJobRow.run_id == run_id
+                    ))
+                )
+                if row is None:
+                    return None
+                return {
+                    "job_id": row.id, "run_id": row.run_id,
+                    "symbol": row.symbol, "status": row.status,
+                    "execution_id": row.execution_id,
+                    "request": dict(row.request_payload),
+                    "result": dict(row.result_payload) if row.result_payload else None,
+                    "error_code": row.error_code,
+                    "created_at": row.created_at.isoformat(),
+                    "updated_at": row.updated_at.isoformat(),
+                }
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def recoverable_demo_canary_jobs(self) -> list[dict[str, Any]]:
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                rows = session.scalars(select(DemoCanaryJobRow).where(
+                    DemoCanaryJobRow.status.in_(["PENDING", "RUNNING"])
+                )).all()
+                return [self.get_demo_canary_job(job_id=row.id) for row in rows]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
     def load_demo_kill_switch(self) -> dict[str, Any] | None:
         if not self.available:
             return None
@@ -1612,6 +1777,40 @@ class PersistenceRepository:
                     active=False, reasons=preserved_reasons,
                     execution_id=execution_id,
                     payload={"reset_reason": reason[:250]}, created_at=now,
+                ))
+                session.flush()
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def link_demo_kill_switch_execution(
+        self, execution_id: str, *, reason: str
+    ) -> bool:
+        """Append, never rewrite, guarded historical incident linkage."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(DemoKillSwitchRow, 1)
+                execution = session.get(DemoExecutionRow, execution_id)
+                if row is None or not row.active or execution is None:
+                    return False
+                existing = session.scalar(select(DemoKillSwitchEventRow).where(
+                    DemoKillSwitchEventRow.event_type
+                    == "KILL_SWITCH_EXECUTION_LINK_REPAIRED",
+                    DemoKillSwitchEventRow.execution_id == execution_id,
+                ))
+                if existing is not None:
+                    return True
+                session.add(DemoKillSwitchEventRow(
+                    id=str(uuid4()),
+                    event_type="KILL_SWITCH_EXECUTION_LINK_REPAIRED",
+                    active=True,
+                    reasons=list(row.reasons),
+                    execution_id=execution_id,
+                    payload={"link_reason": reason[:250]},
+                    created_at=datetime.now(timezone.utc),
                 ))
                 session.flush()
             return True

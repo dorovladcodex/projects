@@ -10,6 +10,7 @@ from app.bybit.demo_diagnostics import (
     DEMO_READ_ONLY_REST_URL,
     DemoDiagnosticsConfig,
     ReadOnlyBybitDemoClient,
+    evaluate_demo_recovery_readiness,
     run_demo_diagnostics,
     validate_recoverable_demo_latch,
 )
@@ -39,8 +40,13 @@ class DiagnosticRepository:
             "updated_at": datetime.now(timezone.utc),
             "activated_at": datetime.now(timezone.utc),
             "activation_count": 1,
-            "events": [],
+            "events": [{
+                "id": "activation-1", "event_type": "KILL_SWITCH_ACTIVATED",
+                "execution_id": str(self.execution.id),
+                "created_at": datetime.now(timezone.utc),
+            }],
         }
+        self.execution_events = []
 
     def load_demo_kill_switch(self):
         return self.kill
@@ -48,12 +54,16 @@ class DiagnosticRepository:
     def load_demo_executions(self):
         return [self.execution]
 
+    def load_demo_execution_events(self, execution_id):
+        return list(self.execution_events)
+
 
 class DiagnosticClient:
-    def __init__(self, *, orders=None, positions=None, fail=False) -> None:
+    def __init__(self, *, orders=None, positions=None, history=None, fail=False) -> None:
         self.orders = list(orders or [])
         self.positions = dict(positions or {})
         self.fail = fail
+        self.history = list(history or [])
 
     def verify(self):
         if self.fail:
@@ -65,6 +75,9 @@ class DiagnosticClient:
     def get_positions(self, symbol):
         size = self.positions.get(symbol.value, "0")
         return [{"symbol": symbol.value, "size": size, "side": "Buy"}]
+
+    def get_order_history(self, symbol):
+        return list(self.history)
 
 
 def config() -> DemoDiagnosticsConfig:
@@ -95,6 +108,39 @@ def resolved_execution() -> DemoExecutionRecord:
         failure_reason="local position-open state timeout",
         cleanup_result="remote position flat and bot-owned orders zero",
     )
+
+
+def interruption_case(*, include_flat_audit=True, open_order=False, size="0"):
+    execution = resolved_execution().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+        "failure_reason": "Windows sleep/resume interrupted canary client workflow",
+    })
+    repository = DiagnosticRepository(execution, reasons=[
+        "unprotected position: position update has no TP/SL",
+        "unprotected position: DemoExchangeError: Bybit Demo request failed: not modified",
+        "unprotected position: DemoExchangeError: Bybit Demo request failed: can not set tp/sl/ts for zero position",
+    ])
+    audit = [
+        "READ_ONLY_RECONCILIATION_COMPLETED", "EXECUTION_REPAIR_APPLIED",
+    ]
+    if include_flat_audit:
+        audit.append("FINAL_REMOTE_STATE_FLAT")
+    repository.execution_events = [
+        {"event_type": name, "occurred_at": datetime.now(timezone.utc)}
+        for name in audit
+    ]
+    history = [
+        {"orderId": "entry-id", "orderLinkId": execution.order_link_id,
+         "orderStatus": "Filled", "reduceOnly": False},
+        {"orderId": "close-id", "orderLinkId": execution.close_order_link_id,
+         "orderStatus": "Filled", "reduceOnly": True},
+    ]
+    orders = ([{"orderId": "open", "orderLinkId": execution.order_link_id}]
+              if open_order else [])
+    client = DiagnosticClient(
+        orders=orders, positions={"BTCUSDT": size}, history=history
+    )
+    return execution, repository, client
 
 
 def test_diagnostics_config_ignores_demo_trading_startup_flags() -> None:
@@ -202,6 +248,12 @@ def test_successful_reset_preserves_activation_reasons_and_audit(tmp_path) -> No
     )
     assert repository.reserve_demo_execution(execution) is not None
     assert repository.save_demo_kill_switch(True, [RECOVERABLE_REASON])
+    before = repository.load_demo_kill_switch()
+    assert before is not None
+    activation_count = before["activation_count"]
+    assert repository.link_demo_kill_switch_execution(
+        str(execution.id), reason="complete repair audit linkage"
+    )
 
     assert repository.reset_demo_kill_switch(
         str(execution.id), reason="operator-confirmed flat recovery"
@@ -210,8 +262,57 @@ def test_successful_reset_preserves_activation_reasons_and_audit(tmp_path) -> No
 
     assert state is not None and state["active"] is False
     assert state["reasons"] == [RECOVERABLE_REASON]
+    assert state["activation_count"] == activation_count
+    assert any(
+        event["event_type"] == "KILL_SWITCH_EXECUTION_LINK_REPAIRED"
+        and event["execution_id"] == str(execution.id)
+        for event in state["events"]
+    )
     assert any(
         event["event_type"] == "KILL_SWITCH_RESET"
         and event["execution_id"] == str(execution.id)
         for event in state["events"]
     )
+
+
+def test_closed_after_interruption_is_ready_after_complete_repair_audit() -> None:
+    execution, repository, client = interruption_case()
+    result = run_demo_diagnostics(config(), repository=repository, client=client)
+    readiness = evaluate_demo_recovery_readiness(result, str(execution.id))
+    assert readiness.latest_execution_terminal is True
+    assert readiness.repair_audit_complete is True
+    assert readiness.latest_execution_safely_closed is True
+    assert readiness.recoverable_latch is True
+    assert readiness.blockers == ()
+
+
+def test_closed_after_interruption_requires_final_flat_audit() -> None:
+    execution, repository, client = interruption_case(include_flat_audit=False)
+    result = run_demo_diagnostics(config(), repository=repository, client=client)
+    readiness = evaluate_demo_recovery_readiness(result, str(execution.id))
+    assert readiness.repair_audit_complete is False
+    assert "interruption repair audit is incomplete" in readiness.blockers
+
+
+@pytest.mark.parametrize("open_order,size", [(True, "0"), (False, "0.001")])
+def test_closed_after_interruption_requires_remote_flat_and_no_bot_order(
+    open_order: bool, size: str
+) -> None:
+    execution, repository, client = interruption_case(
+        open_order=open_order, size=size
+    )
+    result = run_demo_diagnostics(config(), repository=repository, client=client)
+    readiness = evaluate_demo_recovery_readiness(result, str(execution.id))
+    assert readiness.recoverable_latch is False
+    assert readiness.blockers
+
+
+def test_unknown_protection_error_is_not_recoverable() -> None:
+    execution, repository, client = interruption_case()
+    repository.kill["reasons"] = [
+        "unprotected position: unexpected exchange protection failure"
+    ]
+    result = run_demo_diagnostics(config(), repository=repository, client=client)
+    readiness = evaluate_demo_recovery_readiness(result, str(execution.id))
+    assert readiness.reason_classification == "unknown_protection_incident"
+    assert readiness.recoverable_latch is False

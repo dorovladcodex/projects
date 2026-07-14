@@ -865,6 +865,10 @@ def test_fill_installs_and_verifies_exchange_protection() -> None:
     demo = service(client, repo)
     candidate, classification, preview, snapshot = candidate_bundle()
     record = demo.submit_candidate(candidate, preview, classification, snapshot)
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.010", "side": "Buy",
+        "avgPrice": "65000", "leverage": "1", "positionIdx": 0,
+    }]
     demo.handle_private_event({"topic": "order", "data": [{
         "orderId": record.order_id, "orderLinkId": record.order_link_id,
         "orderStatus": "Filled", "cumExecQty": "0.010", "avgPrice": "65000",
@@ -889,6 +893,10 @@ def test_restart_rest_reconciliation_recovers_filled_entry() -> None:
         "orderLinkId": record.order_link_id, "execQty": "0.010",
         "execPrice": "65000", "execFee": "0.3", "execTime": "1783900000000",
     }]
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.010", "side": "Buy",
+        "avgPrice": "65000", "leverage": "1", "positionIdx": 0,
+    }]
     recovered = service(client, repo)
     recovered.reconcile()
     saved = repo.get_demo_execution(str(candidate.id))
@@ -903,6 +911,10 @@ def test_unprotected_fill_causes_reduce_only_close_and_kill_switch() -> None:
     demo = service(client, repo)
     candidate, classification, preview, snapshot = candidate_bundle()
     record = demo.submit_candidate(candidate, preview, classification, snapshot)
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.010", "side": "Buy",
+        "avgPrice": "65000", "leverage": "1", "positionIdx": 0,
+    }]
     demo.handle_private_event({"topic": "order", "data": [{
         "orderId": record.order_id, "orderLinkId": record.order_link_id,
         "orderStatus": "Filled", "cumExecQty": "0.010", "avgPrice": "65000",
@@ -1271,3 +1283,50 @@ def test_demo_execution_and_kill_switch_survive_repository_restart(tmp_path) -> 
     assert loaded is not None and loaded.id == record.id
     assert loaded.state == DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
     assert restored.load_demo_kill_switch()["reasons"] == ["test incident"]
+
+
+def test_entry_replay_after_close_started_cannot_regress_state() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+    record = demo.submit_candidate(candidate, preview, classification, snapshot)
+    record.state = DemoExecutionState.DEMO_CLOSING
+    record.close_order_link_id = "bybot-close-existing"
+    repo.save_demo_execution(record, event_type="CLOSE_SUBMITTING")
+
+    demo._apply_order_update(record, {
+        "orderId": record.order_id, "orderLinkId": record.order_link_id,
+        "orderStatus": "Filled", "cumExecQty": "0.010", "avgPrice": "65000",
+    })
+
+    assert record.state == DemoExecutionState.DEMO_CLOSING
+    assert record.close_order_link_id == "bybot-close-existing"
+
+
+def test_zero_position_before_protection_never_calls_trading_stop() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+    record = demo.submit_candidate(candidate, preview, classification, snapshot)
+    record.average_fill_price = Decimal("65000")
+    record.accepted_quantity = Decimal("0.010")
+    record.state = DemoExecutionState.DEMO_FULLY_FILLED
+    calls = []
+    client.set_trading_stop = lambda *args: calls.append(args)
+
+    demo._install_protection(record)
+
+    assert calls == []
+    assert demo.kill_switch_active is False
+    assert repo.saved_events[-1][0] == "PROTECTION_SKIPPED_POSITION_FLAT"
+
+
+def test_stale_private_event_after_resume_watermark_is_discarded() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    demo._discard_ws_before_ms = 2000
+    demo.handle_private_event({
+        "topic": "order", "creationTime": "1000",
+        "data": [{"orderId": "old", "updatedTime": "1000", "orderStatus": "Filled"}],
+    })
+    assert repo.events == set()

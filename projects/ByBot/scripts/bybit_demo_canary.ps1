@@ -386,12 +386,28 @@ try {
     # makes any intervening rules change fail closed; quantity is the minimum
     # valid quantity, never the entire maximum budget.
     $script:FailureStage = "entry_submission"
+    # Once the request crosses the process boundary its outcome is unknown
+    # until the durable job is recovered.  A client timeout is not evidence
+    # that no candidate, reservation, or exchange order exists.
+    $script:NoCandidateCreated = "unknown"
+    $script:NoReservationCreated = "unknown"
+    $script:NoOrderSubmitted = "unknown"
     $entry = Invoke-Api -Method "POST" -Path "/demo/canary/execute" -Body @{
         symbol = $Symbol
         max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
         expected_rules_fingerprint = [string]$plan.rules_fingerprint
     }
-    Assert-Condition ($null -ne $entry.execution) "Canary did not return an execution"
+    Assert-Condition ([bool]$entry.job_id) "Canary did not return a durable job ID"
+    $jobDeadline = [DateTime]::UtcNow.AddMinutes(3)
+    do {
+        $job = Invoke-Api -Path "/demo/canary/jobs/$($entry.job_id)"
+        if ($job.status -in @("SUCCEEDED", "FAILED")) { break }
+        Start-Sleep -Seconds 2
+    } while ([DateTime]::UtcNow -lt $jobDeadline)
+    Assert-Condition ($job.status -eq "SUCCEEDED") `
+        "Durable canary job did not succeed (status=$($job.status), error=$($job.error_code))"
+    $entry = $job.result
+    Assert-Condition ($null -ne $entry.execution) "Canary job has no execution result"
     $script:ExecutionId = [string]$entry.execution.id
     $script:NoCandidateCreated = $false
     $script:NoReservationCreated = $false
@@ -504,6 +520,17 @@ catch {
     $earlyDemoStatus = $null
     if ($script:BaseUrl) {
         try { $earlyDemoStatus = Invoke-Api -Path "/demo/status" } catch { }
+        if (-not $script:ExecutionId -and $script:RunId) {
+            try {
+                $recoveredJob = Invoke-Api -Path "/demo/canary/jobs/run/$($script:RunId)"
+                if ($recoveredJob.execution_id) {
+                    $script:ExecutionId = [string]$recoveredJob.execution_id
+                    $script:NoCandidateCreated = $false
+                    $script:NoReservationCreated = $false
+                    $script:NoOrderSubmitted = "unknown"
+                }
+            } catch { }
+        }
     }
     if ($script:ExecutionId -and $script:BaseUrl) {
         try {

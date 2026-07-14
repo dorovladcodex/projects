@@ -20,6 +20,10 @@ DEMO_READ_ONLY_REST_URL = "https://api-demo.bybit.com"
 RESOLVED_STATES = {
     DemoExecutionState.DEMO_CLOSED,
     DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+    DemoExecutionState.DEMO_NOT_SUBMITTED,
+    DemoExecutionState.DEMO_ORDER_CANCELLED,
+    DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+    DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
 }
 
 
@@ -111,6 +115,27 @@ class ReadOnlyBybitDemoClient:
             "positionIdx",
         )
 
+    def get_order_history(self, symbol: Symbol) -> list[dict[str, Any]]:
+        return self._paginate(
+            "/v5/order/history",
+            {"category": "linear", "symbol": symbol.value},
+            "orderId",
+        )
+
+    def get_executions(self, symbol: Symbol) -> list[dict[str, Any]]:
+        return self._paginate(
+            "/v5/execution/list",
+            {"category": "linear", "symbol": symbol.value},
+            "execId",
+        )
+
+    def get_closed_pnl(self, symbol: Symbol) -> list[dict[str, Any]]:
+        return self._paginate(
+            "/v5/position/closed-pnl",
+            {"category": "linear", "symbol": symbol.value},
+            "orderId",
+        )
+
     def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         timestamp = str(int(time.time() * 1000))
         query = urlencode(sorted(params.items()))
@@ -172,40 +197,191 @@ class DemoDiagnosticsResult:
     positions: dict[str, dict[str, str]]
     unresolved_executions: list[DemoExecutionRecord]
     failures: list[str]
+    latest_order_history: list[dict[str, Any]]
+    latest_execution_events: list[dict[str, Any]]
 
     @property
     def passed(self) -> bool:
         return not self.failures
 
 
-def validate_recoverable_demo_latch(
+@dataclass(frozen=True)
+class DemoRecoveryReadiness:
+    selected_execution_id: str
+    selected_execution_state: str | None
+    accepted_terminal_states: tuple[str, ...]
+    cleanup_result_matches: bool
+    linked_activation_id: str | None
+    reason_classification: str
+    remote_state_verified: bool
+    remote_positions_flat: bool
+    bot_owned_orders_zero: bool
+    durable_executions_resolved: bool
+    latest_execution_terminal: bool
+    latest_execution_safely_closed: bool
+    repair_audit_complete: bool
+    activation_link_valid: bool
+    recoverable_latch: bool
+    blockers: tuple[str, ...]
+
+
+def evaluate_demo_recovery_readiness(
     result: DemoDiagnosticsResult, execution_id: str
-) -> list[str]:
-    """Return fail-closed reset blockers without mutating any state."""
+) -> DemoRecoveryReadiness:
+    """Single fail-closed policy shared by diagnostics and reset."""
     blockers = list(result.failures)
     latest = result.latest_execution
     kill = result.kill_switch
+    accepted = tuple(sorted(state.value for state in RESOLVED_STATES))
+    terminal = bool(latest and latest.state in RESOLVED_STATES)
+    cleanup_matches = bool(
+        latest
+        and latest.cleanup_result == "remote position flat and bot-owned orders zero"
+    )
+    remote_positions_flat = all(
+        not _positive(position.get("size")) for position in result.positions.values()
+    )
+    bot_orders_zero = not result.bot_owned_open_orders
+    durable_resolved = not result.unresolved_executions
+    remote_verified = result.passed and remote_positions_flat and bot_orders_zero
+
+    audit_types = {
+        str(event.get("event_type") or "")
+        for event in result.latest_execution_events
+    }
+    required_repair_audit = {
+        "READ_ONLY_RECONCILIATION_COMPLETED",
+        "EXECUTION_REPAIR_APPLIED",
+        "FINAL_REMOTE_STATE_FLAT",
+    }
+    repair_complete = required_repair_audit.issubset(audit_types)
+    history = result.latest_order_history
+    entry_rows = [row for row in history if latest and _matches_order(
+        row, latest.order_id, latest.order_link_id
+    )]
+    close_rows = [row for row in history if latest and _matches_order(
+        row, latest.close_order_id, latest.close_order_link_id
+    )]
+    terminal_statuses = {"Filled", "Cancelled", "Rejected", "Deactivated"}
+    orders_terminal = bool(
+        latest
+        and (not latest.order_id or entry_rows)
+        and (not latest.close_order_id or close_rows)
+        and all(str(row.get("orderStatus") or "") in terminal_statuses
+                for row in [*entry_rows, *close_rows])
+    )
+    filled_entry = any(str(row.get("orderStatus") or "") == "Filled" for row in entry_rows)
+    close_reduce_only = bool(
+        not filled_entry
+        or any(
+            str(row.get("orderStatus") or "") == "Filled"
+            and str(row.get("reduceOnly") or "").lower() == "true"
+            for row in close_rows
+        )
+    )
+
+    events = list(kill.get("events") or [])
+    linked = next((event for event in reversed(events)
+                   if str(event.get("execution_id") or "") == execution_id), None)
+    # Historical activations predated execution linkage. Complete repair audit,
+    # exact latest execution selection, and one classified protection incident
+    # form guarded evidence; confirmed reset appends an explicit link audit.
+    activation_events = [
+        event for event in events
+        if event.get("event_type") in {
+            "KILL_SWITCH_ACTIVATED", "LEGACY_ACTIVATION",
+            "KILL_SWITCH_REASON_ADDED",
+        }
+    ]
+    temporal_activation = next((
+        event for event in reversed(activation_events)
+        if latest and _event_within_execution_window(event, latest)
+    ), None)
+    repair_identity_matches = bool(
+        latest and latest.run_id
+        and entry_rows and (close_rows or not latest.close_order_id)
+        and any(
+            event.get("run_id") in {None, latest.run_id}
+            and event.get("order_id") in {None, latest.order_id}
+            and event.get("close_order_id") in {None, latest.close_order_id}
+            for event in result.latest_execution_events
+            if event.get("event_type") == "EXECUTION_REPAIR_APPLIED"
+        )
+    )
+    inferred_link = bool(
+        latest and str(latest.id) == execution_id and repair_complete
+        and repair_identity_matches and temporal_activation is not None
+    )
+    activation_link_valid = linked is not None or inferred_link
+    linked_activation_id = (
+        str(linked.get("id")) if linked else
+        ("repair-audit-inference" if inferred_link else None)
+    )
+
+    reasons = [str(reason) for reason in kill.get("reasons") or []]
+    reason_classes = [_classify_kill_reason(reason) for reason in reasons]
+    reason_classification = ",".join(sorted(set(reason_classes))) or "none"
+    reasons_recoverable = bool(reasons) and all(
+        item == "resolved_protection_incident" for item in reason_classes
+    )
+
+    safely_closed = False
+    if latest and terminal and cleanup_matches:
+        if latest.state == DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION:
+            safely_closed = bool(
+                str(latest.id) == execution_id
+                and orders_terminal and close_reduce_only and repair_complete
+                and remote_positions_flat and bot_orders_zero and durable_resolved
+            )
+        elif latest.state == DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE:
+            safely_closed = bool(latest.failure_reason and remote_verified)
+        else:
+            safely_closed = remote_verified
+
     if not kill.get("active"):
         blockers.append("Demo kill switch is not active")
     if latest is None or str(latest.id) != execution_id:
         blockers.append("confirmation execution ID is not the latest Demo execution")
-    elif (
-        latest.state != DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
-        or latest.cleanup_result != "remote position flat and bot-owned orders zero"
-        or latest.failure_reason != "local position-open state timeout"
-    ):
-        blockers.append("latest failed execution is not safely resolved")
-    reasons = [str(reason) for reason in kill.get("reasons") or []]
-    forbidden_tokens = {
-        "unknown", "uncertain", "unattributed", "mismatch", "missing remotely",
-        "duplicate", "daily", "weekly", "drawdown",
-    }
-    if any(token in reason.lower() for reason in reasons for token in forbidden_tokens):
-        blockers.append("kill-switch reason is not automatically recoverable")
-    recoverable_reason = "unprotected position: position update has no TP/SL"
-    if not reasons or any(reason != recoverable_reason for reason in reasons):
-        blockers.append("recoverable Demo latch was not proven")
-    return list(dict.fromkeys(blockers))
+    if not terminal:
+        blockers.append("latest execution state is not terminal")
+    if not safely_closed:
+        blockers.append("latest execution is not safely closed")
+    if latest and latest.state == DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION:
+        if not repair_complete:
+            blockers.append("interruption repair audit is incomplete")
+        if not orders_terminal:
+            blockers.append("known entry/close orders are not terminal")
+        if not close_reduce_only:
+            blockers.append("filled entry has no terminal reduce-only close")
+    if not activation_link_valid:
+        blockers.append("kill-switch activation is not linked to the execution")
+    if not reasons_recoverable:
+        blockers.append("kill-switch incident is not recoverable")
+    unique = tuple(dict.fromkeys(blockers))
+    return DemoRecoveryReadiness(
+        selected_execution_id=execution_id,
+        selected_execution_state=latest.state.value if latest else None,
+        accepted_terminal_states=accepted,
+        cleanup_result_matches=cleanup_matches,
+        linked_activation_id=linked_activation_id,
+        reason_classification=reason_classification,
+        remote_state_verified=remote_verified,
+        remote_positions_flat=remote_positions_flat,
+        bot_owned_orders_zero=bot_orders_zero,
+        durable_executions_resolved=durable_resolved,
+        latest_execution_terminal=terminal,
+        latest_execution_safely_closed=safely_closed,
+        repair_audit_complete=repair_complete,
+        activation_link_valid=activation_link_valid,
+        recoverable_latch=bool(kill.get("active")) and reasons_recoverable and not unique,
+        blockers=unique,
+    )
+
+
+def validate_recoverable_demo_latch(
+    result: DemoDiagnosticsResult, execution_id: str
+) -> list[str]:
+    return list(evaluate_demo_recovery_readiness(result, execution_id).blockers)
 
 
 def run_demo_diagnostics(
@@ -271,6 +447,15 @@ def run_demo_diagnostics(
     if latest and latest.state in RESOLVED_STATES:
         if latest.symbol.value in active_position_symbols or bot_orders:
             failures.append("remote and durable Demo states disagree")
+    order_history = (
+        read_client.get_order_history(latest.symbol)
+        if latest is not None and hasattr(read_client, "get_order_history") else []
+    )
+    load_events = getattr(repo, "load_demo_execution_events", None)
+    execution_events = (
+        load_events(str(latest.id))
+        if latest is not None and callable(load_events) else []
+    )
     return DemoDiagnosticsResult(
         kill_switch=kill_switch,
         latest_execution=latest,
@@ -279,6 +464,8 @@ def run_demo_diagnostics(
         positions=positions,
         unresolved_executions=unresolved,
         failures=failures,
+        latest_order_history=order_history,
+        latest_execution_events=execution_events,
     )
 
 
@@ -306,12 +493,49 @@ def format_demo_diagnostics(result: DemoDiagnosticsResult) -> str:
     ]
     if result.failures:
         lines.append("FAILURES: " + "; ".join(result.failures))
+    if latest is not None and result.kill_switch.get("active"):
+        readiness = evaluate_demo_recovery_readiness(result, str(latest.id))
+        lines.extend(format_demo_recovery_readiness(readiness).splitlines())
     return "\n".join(lines)
+
+
+def format_demo_recovery_readiness(readiness: DemoRecoveryReadiness) -> str:
+    def verdict(value: bool, detail: str = "") -> str:
+        return ("PASS" if value else "FAIL") + (f" ({detail})" if detail else "")
+
+    return "\n".join([
+        f"SELECTED EXECUTION ID: {readiness.selected_execution_id}",
+        "SELECTED EXECUTION STATE: " + str(readiness.selected_execution_state or "none"),
+        "ACCEPTED TERMINAL STATES: " + ", ".join(readiness.accepted_terminal_states),
+        "CLEANUP RESULT COMPARISON: " + verdict(readiness.cleanup_result_matches),
+        "LINKED KILL-SWITCH ACTIVATION ID: "
+        + str(readiness.linked_activation_id or "none"),
+        "REASON CLASSIFICATION: " + readiness.reason_classification,
+        "UNRESOLVED EXECUTION RESULT: "
+        + verdict(readiness.durable_executions_resolved),
+        "REMOTE FLAT RESULT: " + verdict(readiness.remote_positions_flat),
+        "LATEST EXECUTION TERMINAL: "
+        + verdict(readiness.latest_execution_terminal,
+                  f"state={readiness.selected_execution_state}"),
+        "REPAIR AUDIT COMPLETE: " + verdict(readiness.repair_audit_complete),
+        "REMOTE POSITION FLAT: " + verdict(readiness.remote_positions_flat),
+        "BOT-OWNED ORDERS ZERO: " + verdict(readiness.bot_owned_orders_zero),
+        "ACTIVATION LINK: " + verdict(readiness.activation_link_valid),
+        "RECOVERABLE INCIDENT: " + verdict(readiness.recoverable_latch),
+        "BLOCKERS: " + ("; ".join(readiness.blockers) or "none"),
+    ])
 
 
 def _execution_is_resolved(record: DemoExecutionRecord) -> bool:
     if record.state == DemoExecutionState.DEMO_CLOSED:
         return True
+    if record.state in {
+        DemoExecutionState.DEMO_NOT_SUBMITTED,
+        DemoExecutionState.DEMO_ORDER_CANCELLED,
+        DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+        DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
+    }:
+        return bool(record.cleanup_result)
     return bool(
         record.state == DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
         and record.failure_reason
@@ -328,6 +552,38 @@ def _is_bot_owned_order(
     )
 
 
+def _matches_order(
+    item: dict[str, Any], order_id: str | None, order_link_id: str | None
+) -> bool:
+    return bool(
+        (order_id and str(item.get("orderId") or "") == order_id)
+        or (order_link_id and str(item.get("orderLinkId") or "") == order_link_id)
+    )
+
+
+def _classify_kill_reason(reason: str) -> str:
+    normalized = " ".join(reason.lower().split())
+    risk_tokens = ("daily", "weekly", "drawdown")
+    unsafe_tokens = (
+        "unknown", "uncertain", "unattributed", "mismatch",
+        "missing remotely", "duplicate",
+    )
+    if any(token in normalized for token in risk_tokens):
+        return "risk_limit"
+    if any(token in normalized for token in unsafe_tokens):
+        return "unknown_exchange_state"
+    protection_tokens = (
+        "position update has no tp/sl",
+        "not modified",
+        "can not set tp/sl/ts for zero position",
+    )
+    if normalized.startswith("unprotected position:") and any(
+        token in normalized for token in protection_tokens
+    ):
+        return "resolved_protection_incident"
+    return "unknown_protection_incident"
+
+
 def _positive(value: object) -> bool:
     try:
         return float(str(value or "0")) > 0
@@ -339,6 +595,27 @@ def _display_time(value: object) -> str:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat()
     return str(value or "none")
+
+
+def _event_within_execution_window(
+    event: dict[str, Any], execution: DemoExecutionRecord
+) -> bool:
+    value = event.get("created_at")
+    if not isinstance(value, datetime):
+        try:
+            value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+    value = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    created = execution.created_at
+    created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+    updated = execution.updated_at
+    updated = updated if updated.tzinfo else updated.replace(tzinfo=timezone.utc)
+    # Five minutes allows exchange/DB timestamp skew without linking unrelated
+    # historical incidents. The repaired execution's updated_at is the upper
+    # bound, so future activations cannot be inferred into this incident.
+    from datetime import timedelta
+    return created - timedelta(minutes=5) <= value <= updated
 
 
 def _read_env_file(path: Path) -> dict[str, str]:

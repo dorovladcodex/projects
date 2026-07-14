@@ -5,9 +5,11 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import UUID
+from threading import Lock
+from uuid import NAMESPACE_URL, UUID, uuid5
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from starlette.status import HTTP_202_ACCEPTED
 
 from app.bybit.market_data import build_market_data_service, snapshot_to_payload
 from app.bybit.private import build_account_service
@@ -106,6 +108,7 @@ signal_candidate_service = SignalCandidateService(
 news_service.restore()
 paper_trading_service.restore()
 signal_candidate_service.restore()
+_demo_canary_job_lock = Lock()
 
 
 @asynccontextmanager
@@ -114,6 +117,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.execution_mode == ExecutionMode.BYBIT_DEMO:
         await asyncio.to_thread(demo_execution_service.verify_account_and_environment)
         await asyncio.to_thread(demo_execution_service.reconcile)
+        for job in persistence.recoverable_demo_canary_jobs():
+            asyncio.create_task(asyncio.to_thread(
+                _run_demo_canary_job, str(job["job_id"])
+            ))
         if demo_private_websocket is not None:
             demo_ws_task = asyncio.create_task(demo_private_stream_loop())
     else:
@@ -712,36 +719,87 @@ def _require_demo_canary() -> None:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
-@app.post("/demo/canary/execute")
-def demo_canary_execute(request: DemoCanaryExecuteRequest) -> dict[str, object]:
+@app.post("/demo/canary/execute", status_code=HTTP_202_ACCEPTED)
+def demo_canary_execute(
+    request: DemoCanaryExecuteRequest, background_tasks: BackgroundTasks
+) -> dict[str, object]:
     _require_demo_canary()
-    snapshot = _fresh_canary_snapshot(request.symbol)
-    buffer_pct = (
-        request.market_price_buffer_pct
-        if request.market_price_buffer_pct is not None
-        else settings.demo_canary_market_price_buffer_pct
+    job_id = str(uuid5(
+        NAMESPACE_URL, f"bybot-demo-canary-job:{demo_execution_service.run_id}"
+    ))
+    payload = request.model_dump(mode="json")
+    job = persistence.reserve_demo_canary_job(
+        job_id, demo_execution_service.run_id, request.symbol.value, payload
     )
-    try:
-        result = signal_candidate_service.execute_demo_canary(
-            request.symbol,
-            request.max_notional_usdt,
-            snapshot,
-            expected_rules_fingerprint=request.expected_rules_fingerprint,
-            safety_buffer_pct=buffer_pct,
-        )
-    except (DemoSafetyError, ValueError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if result.demo_execution is None:
-        raise HTTPException(
-            status_code=409,
-            detail=result.execution_block_reason or "Demo canary execution was blocked",
-        )
+    if job is None:
+        raise HTTPException(status_code=503, detail="durable canary job unavailable")
+    if job["status"] in {"PENDING", "RUNNING"}:
+        background_tasks.add_task(_run_demo_canary_job, job_id)
     return {
-        "execution": result.demo_execution,
-        "risk_preview": result.risk_preview.model_dump(mode="json"),
-        "plan": result.canary_plan,
+        "job_id": job_id,
+        "run_id": demo_execution_service.run_id,
+        "status": job["status"],
+        "poll_url": f"/demo/canary/jobs/{job_id}",
         "live_execution_blocked": True,
     }
+
+
+def _run_demo_canary_job(job_id: str) -> None:
+    with _demo_canary_job_lock:
+        job = persistence.get_demo_canary_job(job_id=job_id)
+        if job is None or job["status"] in {"SUCCEEDED", "FAILED"}:
+            return
+        persistence.update_demo_canary_job(job_id, status="RUNNING")
+        try:
+            request = DemoCanaryExecuteRequest.model_validate(job["request"])
+            snapshot = _fresh_canary_snapshot(request.symbol)
+            buffer_pct = (
+                request.market_price_buffer_pct
+                if request.market_price_buffer_pct is not None
+                else settings.demo_canary_market_price_buffer_pct
+            )
+            result = signal_candidate_service.execute_demo_canary(
+                request.symbol, request.max_notional_usdt, snapshot,
+                expected_rules_fingerprint=request.expected_rules_fingerprint,
+                safety_buffer_pct=buffer_pct,
+            )
+            if result.demo_execution is None:
+                raise DemoSafetyError(
+                    result.execution_block_reason or "Demo canary execution was blocked"
+                )
+            result_payload = {
+                "execution": result.demo_execution,
+                "risk_preview": result.risk_preview.model_dump(mode="json"),
+                "plan": result.canary_plan,
+                "live_execution_blocked": True,
+            }
+            persistence.update_demo_canary_job(
+                job_id, status="SUCCEEDED",
+                execution_id=str(result.demo_execution["id"]),
+                result_payload=result_payload,
+            )
+        except Exception as exc:
+            persistence.update_demo_canary_job(
+                job_id, status="FAILED", error_code=type(exc).__name__
+            )
+
+
+@app.get("/demo/canary/jobs/run/{run_id}")
+def demo_canary_job_by_run(run_id: str) -> dict[str, object]:
+    _require_demo_canary()
+    job = persistence.get_demo_canary_job(run_id=run_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Demo canary job not found")
+    return {**job, "live_execution_blocked": True}
+
+
+@app.get("/demo/canary/jobs/{job_id}")
+def demo_canary_job(job_id: str) -> dict[str, object]:
+    _require_demo_canary()
+    job = persistence.get_demo_canary_job(job_id=job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Demo canary job not found")
+    return {**job, "live_execution_blocked": True}
 
 
 @app.post("/demo/canary/preview")
