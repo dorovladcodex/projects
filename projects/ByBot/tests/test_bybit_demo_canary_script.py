@@ -17,16 +17,16 @@ def test_demo_canary_requires_explicit_human_confirmation() -> None:
     assert "AllowDemoOrders" in result.stdout + result.stderr
 
 
-def test_demo_canary_rejects_notional_above_twenty_before_setup() -> None:
+def test_demo_canary_rejects_non_positive_maximum_budget_before_setup() -> None:
     result = subprocess.run(
         [
             "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-File", str(SCRIPT), "-AllowDemoOrders", "-NotionalUSDT", "20.01",
+            "-File", str(SCRIPT), "-AllowDemoOrders", "-MaxNotionalUSDT", "0",
         ],
         text=True, capture_output=True, timeout=15,
     )
     assert result.returncode == 1
-    assert "at most 20" in result.stdout + result.stderr
+    assert "MaxNotionalUSDT" in result.stdout + result.stderr
 
 
 def test_demo_canary_uses_production_demo_service_contract() -> None:
@@ -38,9 +38,11 @@ def test_demo_canary_uses_production_demo_service_contract() -> None:
     assert 'Set-IsolatedEnvironment "BYBIT_LIVE_TRADING_ENABLED" "false"' in text
     assert 'Set-IsolatedEnvironment "DEMO_CANARY_ENABLED" "true"' in text
     assert '"https://api-demo.bybit.com"' in text
+    assert 'Path "/demo/canary/preview"' in text
     assert 'Path "/demo/canary/execute"' in text
     assert 'Path "/demo/canary/$ExecutionId"' in text
     assert 'Path "/demo/canary/$executionId/close"' in text
+    assert 'Path "/demo/canary/$($script:ExecutionId)/failure-cleanup"' in text
     assert "/paper/" not in text
     assert "/signals/test" not in text
     assert "create_order" not in text
@@ -48,7 +50,13 @@ def test_demo_canary_uses_production_demo_service_contract() -> None:
 
 def test_demo_canary_enforces_maximum_notional_and_reconciliation() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
-    assert "$NotionalUSDT -gt [decimal]20" in text
+    assert "[Nullable[decimal]]$MaxNotionalUSDT = $null" in text
+    assert "$null -eq $MaxNotionalUSDT" in text
+    assert "buffered_required_notional" in text
+    assert "calculated_quantity" in text
+    assert "expected_rules_fingerprint" in text
+    assert "requested_quantity" in text
+    assert "\n        notional_usdt =" not in text
     assert 'Path "/demo/reconcile"' in text
     assert "Exactly one durable Demo execution was not created" in text
     assert "DEMO_POSITION_OPEN" in text
@@ -59,12 +67,29 @@ def test_demo_canary_enforces_maximum_notional_and_reconciliation() -> None:
     assert "DEMO_CLOSED" in text
 
 
+def test_demo_canary_prints_exchange_minimum_plan_before_execution() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    preview_index = text.index('Path "/demo/canary/preview"')
+    confirmation_index = text.index("$operatorConfirmation = Read-Host")
+    execute_index = text.index('Path "/demo/canary/execute"')
+    assert preview_index < confirmation_index < execute_index
+    assert '"SUBMIT $Symbol $($plan.calculated_quantity)"' in text
+    for label in (
+        "DEMO SYMBOL:", "MIN ORDER QTY:", "QTY STEP:", "MIN NOTIONAL:",
+        "REFERENCE PRICE:", "CALCULATED ORDER QTY:",
+        "ESTIMATED NOTIONAL:", "BUFFERED REQUIRED BUDGET:",
+        "MAX CANARY BUDGET:", "EXCHANGE MINIMUM VALIDATION: PASS",
+    ):
+        assert label in text
+
+
 def test_demo_canary_declares_required_pass_output() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     for line in (
         "DEMO ACCOUNT VERIFIED: PASS",
-        "DEMO ENTRY ACCEPTED: PASS",
-        "DEMO FILL CONFIRMED: PASS",
+        "DEMO ORDER ACKNOWLEDGED: PASS",
+        "DEMO ENTRY FILL CONFIRMED: PASS",
+        "DEMO POSITION OPEN CONFIRMED: PASS",
         "DEMO TP/SL VERIFIED: PASS",
         "RESTART RECONCILIATION: PASS",
         "IDEMPOTENCY: PASS",
@@ -74,6 +99,22 @@ def test_demo_canary_declares_required_pass_output() -> None:
         "OVERALL: PASS",
     ):
         assert line in text
+
+
+def test_demo_canary_reports_functional_and_cleanup_results_separately() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    for line in (
+        "DEMO ENTRY FILL CONFIRMED DURING CLEANUP: PASS",
+        "DEMO REDUCE-ONLY CLEANUP CLOSE: PASS",
+        "CANARY FUNCTIONAL RESULT: FAIL",
+        "SAFETY CLEANUP RESULT:",
+        "OVERALL: FAIL",
+        "report.json",
+    ):
+        assert line in text
+    finally_index = text.index("finally {")
+    stop_index = text.index("Stop-Uvicorn", finally_index)
+    assert stop_index > finally_index
 
 
 def test_demo_canary_script_parses_in_windows_powershell() -> None:

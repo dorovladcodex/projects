@@ -1271,6 +1271,33 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
+    def load_demo_execution_events(self, execution_id: str) -> list[dict[str, Any]]:
+        """Return the durable audit trail for one execution in timestamp order."""
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                rows = session.scalars(
+                    select(DemoExecutionEventRow)
+                    .where(DemoExecutionEventRow.execution_id == execution_id)
+                    .order_by(DemoExecutionEventRow.occurred_at)
+                ).all()
+                return [
+                    {
+                        "event_type": row.event_type,
+                        "occurred_at": _utc_aware(row.occurred_at).isoformat(),
+                        "state": (row.payload or {}).get("state"),
+                        "order_id": (row.payload or {}).get("order_id"),
+                        "close_order_id": (row.payload or {}).get("close_order_id"),
+                        "failure_reason": (row.payload or {}).get("failure_reason"),
+                        "cleanup_result": (row.payload or {}).get("cleanup_result"),
+                    }
+                    for row in rows
+                ]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
     def begin_demo_soak_run(
         self, run_id: str, started_at: datetime
     ) -> dict[str, Any] | None:

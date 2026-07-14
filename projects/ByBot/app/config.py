@@ -110,6 +110,9 @@ class Settings(BaseSettings):
     demo_run_id: str | None = Field(default=None, min_length=3, max_length=64)
     demo_run_started_at: datetime | None = None
     demo_canary_enabled: bool = False
+    demo_canary_market_price_buffer_pct: Decimal = Field(
+        default=Decimal("5"), ge=0, le=100
+    )
     demo_reconciliation_interval_seconds: int = Field(default=15, ge=5, le=300)
     demo_order_confirmation_timeout_seconds: int = Field(default=30, ge=5, le=300)
 

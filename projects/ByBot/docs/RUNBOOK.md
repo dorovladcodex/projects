@@ -173,12 +173,24 @@ up only bot-owned state. Never use mainnet/testnet or `TEST_MODE=true`. Inspect
 Run only after reviewing the Demo account and with Demo-only credentials:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_canary.ps1 -AllowDemoOrders -Symbol BTCUSDT -NotionalUSDT 20
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\bybit_demo_canary.ps1 `
+  -Symbol BTCUSDT `
+  -MaxNotionalUSDT 75 `
+  -AllowDemoOrders
 ```
 
 The runner requires an exact `api-demo.bybit.com` configuration, a flat
-account, no active order for the selected symbol, and 1x leverage. It submits
-one capped entry through the production Demo execution service, verifies TP/SL
-and restart recovery, then performs a reduce-only close. Never use this runner
-with mainnet or testnet. The runner fails before persistence or order submission
-when current `minOrderQty` makes the selected symbol exceed the 20 USDT cap.
+account, no active order for the selected symbol, and 1x leverage. It fetches
+the current exchange minimums and price, rounds quantity upward to `qtyStep`,
+and submits only that minimum through the production Demo execution service.
+The calculated notional plus the default 5% price buffer must fit inside the
+explicit `MaxNotionalUSDT`; the budget is never silently increased. It verifies
+TP/SL and restart recovery, then performs a reduce-only close. Never use this
+runner with mainnet or testnet. After previewing the plan, type the exact
+confirmation phrase displayed by the runner to authorize that quantity.
+The runner writes `artifacts\demo-canary\<run_id>\report.json` with entry and
+close order history, executions, remote position observations, durable state
+transitions, fees, realized PnL, and separate `functional_result` and
+`safety_cleanup_result`. A functional timeout remains a failure even when the
+idempotent reduce-only safety cleanup successfully leaves the Demo account flat.

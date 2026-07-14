@@ -2,7 +2,8 @@ param(
     [switch]$AllowDemoOrders,
     [ValidateSet("BTCUSDT", "ETHUSDT")]
     [string]$Symbol = "BTCUSDT",
-    [decimal]$NotionalUSDT = 20
+    [Nullable[decimal]]$MaxNotionalUSDT = $null,
+    [decimal]$MarketPriceBufferPct = 5
 )
 
 # This script is intentionally the only human-triggered real Bybit Demo canary.
@@ -13,6 +14,10 @@ $ProgressPreference = "SilentlyContinue"
 $script:Child = $null
 $script:OriginalEnvironment = @{}
 $script:OverallPassed = $false
+$script:FunctionalResult = "FAIL"
+$script:SafetyCleanupResult = "NOT_REQUIRED"
+$script:ExecutionId = $null
+$script:ArtifactDir = $null
 
 function Assert-Condition {
     param([bool]$Condition, [string]$Message)
@@ -181,6 +186,31 @@ function Get-Execution {
     return $response.execution
 }
 
+function Get-ExecutionStatus {
+    param([string]$ExecutionId)
+    return Invoke-Api -Path "/demo/canary/$ExecutionId"
+}
+
+function Write-CanaryReport {
+    param($Status, [string]$FailureReason = $null)
+    if (-not $script:ArtifactDir) { return }
+    $report = [ordered]@{
+        run_id = $script:RunId
+        execution_id = $script:ExecutionId
+        functional_result = $script:FunctionalResult
+        safety_cleanup_result = $script:SafetyCleanupResult
+        failure_reason = $FailureReason
+        generated_at = [DateTimeOffset]::UtcNow.ToString("o")
+        execution_report = $Status
+    }
+    $path = Join-Path $script:ArtifactDir "report.json"
+    [IO.File]::WriteAllText(
+        $path, ($report | ConvertTo-Json -Depth 30),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    Write-Host "CANARY REPORT: $path"
+}
+
 function Wait-ForExecutionState {
     param([string]$ExecutionId, [string[]]$States, [int]$TimeoutSeconds = 120)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -221,8 +251,12 @@ if (-not $AllowDemoOrders) {
     [Console]::Error.WriteLine("-AllowDemoOrders is required as explicit human confirmation.")
     exit 1
 }
-if ($NotionalUSDT -lt [decimal]10 -or $NotionalUSDT -gt [decimal]20) {
-    [Console]::Error.WriteLine("NotionalUSDT must be at least 10 and at most 20.")
+if ($null -eq $MaxNotionalUSDT -or $MaxNotionalUSDT -le [decimal]0) {
+    [Console]::Error.WriteLine("MaxNotionalUSDT must be greater than zero and is never increased automatically.")
+    exit 1
+}
+if ($MarketPriceBufferPct -lt [decimal]0 -or $MarketPriceBufferPct -gt [decimal]100) {
+    [Console]::Error.WriteLine("MarketPriceBufferPct must be between 0 and 100.")
     exit 1
 }
 
@@ -238,10 +272,10 @@ try {
     $databaseUrl = $databaseUrl -replace "@localhost:", "@127.0.0.1:"
 
     $script:RunId = "demo-canary-" + [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
-    $artifactDir = Join-Path (Get-Location) "artifacts\demo-canary\$script:RunId"
-    New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
-    $stdoutPath = Join-Path $artifactDir "uvicorn.stdout.log"
-    $stderrPath = Join-Path $artifactDir "uvicorn.stderr.log"
+    $script:ArtifactDir = Join-Path (Get-Location) "artifacts\demo-canary\$script:RunId"
+    New-Item -ItemType Directory -Path $script:ArtifactDir -Force | Out-Null
+    $stdoutPath = Join-Path $script:ArtifactDir "uvicorn.stdout.log"
+    $stderrPath = Join-Path $script:ArtifactDir "uvicorn.stderr.log"
 
     Set-IsolatedEnvironment "APP_ENV" "demo"
     Set-IsolatedEnvironment "TEST_MODE" "false"
@@ -256,6 +290,8 @@ try {
     Set-IsolatedEnvironment "BYBIT_PRIVATE_DEMO_BASE_URL" "https://api-demo.bybit.com"
     Set-IsolatedEnvironment "BYBIT_PRIVATE_DEMO_WS_URL" "wss://stream-demo.bybit.com"
     Set-IsolatedEnvironment "DEMO_LEVERAGE" "1"
+    Set-IsolatedEnvironment "DEMO_CANARY_MARKET_PRICE_BUFFER_PCT" `
+        $MarketPriceBufferPct.ToString([Globalization.CultureInfo]::InvariantCulture)
     Set-IsolatedEnvironment "DEMO_RUN_ID" $script:RunId
     Set-IsolatedEnvironment "DEMO_RUN_STARTED_AT" ([DateTimeOffset]::UtcNow.ToString("o"))
     Set-IsolatedEnvironment "NEWS_ENABLE_RSS" "false"
@@ -295,17 +331,62 @@ try {
     $initialUnrelatedOrders = [int]$demo.unrelated_open_orders
     Write-Host "DEMO ACCOUNT VERIFIED: PASS"
 
+    # Preview reads current instrument rules and price without creating a
+    # candidate, risk decision, execution reservation, or exchange order.
+    $preview = Invoke-Api -Method "POST" -Path "/demo/canary/preview" -Body @{
+        symbol = $Symbol
+        max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+    $plan = $preview.plan
+    Assert-Condition ($null -ne $plan) "Exchange minimum plan is missing"
+    Assert-Condition ($plan.symbol -eq $Symbol) "Preview returned the wrong symbol"
+    Assert-Condition ($plan.instrument_status -eq "Trading") `
+        "$Symbol is not Trading"
+    Assert-Condition ($null -ne $plan.calculated_quantity) `
+        "Calculated minimum order quantity is missing"
+    Assert-Condition ([decimal]$plan.calculated_quantity -gt [decimal]0) `
+        "Calculated minimum order quantity is invalid"
+    Assert-Condition ([decimal]$plan.buffered_required_notional -le $MaxNotionalUSDT) `
+        "Buffered required budget exceeds explicit MaxNotionalUSDT"
+
+    Write-Host "DEMO SYMBOL: $($plan.symbol)"
+    Write-Host "MIN ORDER QTY: $($plan.min_order_qty)"
+    Write-Host "QTY STEP: $($plan.qty_step)"
+    Write-Host "MIN NOTIONAL: $($plan.min_notional_value)"
+    Write-Host "REFERENCE PRICE: $($plan.reference_price)"
+    Write-Host "CALCULATED ORDER QTY: $($plan.calculated_quantity)"
+    Write-Host "ESTIMATED NOTIONAL: $($plan.estimated_notional)"
+    Write-Host "BUFFERED REQUIRED BUDGET: $($plan.buffered_required_notional)"
+    Write-Host "MAX CANARY BUDGET: $($MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture))"
+    Write-Host "EXCHANGE MINIMUM VALIDATION: PASS"
+
+    $requiredConfirmation = "SUBMIT $Symbol $($plan.calculated_quantity)"
+    $operatorConfirmation = Read-Host `
+        "Type '$requiredConfirmation' to authorize this exact Demo quantity"
+    Assert-Condition ($operatorConfirmation -ceq $requiredConfirmation) `
+        "Explicit calculated-quantity confirmation was not provided"
+
+    # Execute re-reads both instrument rules and price. The preview fingerprint
+    # makes any intervening rules change fail closed; quantity is the minimum
+    # valid quantity, never the entire maximum budget.
     $entry = Invoke-Api -Method "POST" -Path "/demo/canary/execute" -Body @{
         symbol = $Symbol
-        notional_usdt = $NotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+        max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+        expected_rules_fingerprint = [string]$plan.rules_fingerprint
     }
     Assert-Condition ($null -ne $entry.execution) "Canary did not return an execution"
-    $executionId = [string]$entry.execution.id
-    Assert-Condition ([bool]$executionId) "Canary execution ID is missing"
+    $script:ExecutionId = [string]$entry.execution.id
+    $executionId = $script:ExecutionId
+    Assert-Condition ([bool]$script:ExecutionId) "Canary execution ID is missing"
     Assert-Condition ([bool]$entry.execution.order_link_id) "orderLinkId is missing"
     Assert-Condition ([bool]$entry.execution.order_id) "Bybit did not accept an entry order ID"
+    Assert-Condition ($null -ne $entry.plan) "Final exchange minimum plan is missing"
+    Assert-Condition ([decimal]$entry.execution.requested_quantity -eq `
+        [decimal]$entry.plan.calculated_quantity) `
+        "Submitted quantity differs from the calculated exchange minimum"
     Assert-Condition ($entry.execution.state -in @(
-        "DEMO_ACCEPTED", "DEMO_PARTIALLY_FILLED", "DEMO_FILLED",
+        "DEMO_ORDER_ACKNOWLEDGED", "DEMO_ACCEPTED", "DEMO_PARTIALLY_FILLED",
+        "DEMO_FILLED", "DEMO_FULLY_FILLED",
         "DEMO_PROTECTION_PENDING", "DEMO_POSITION_OPEN"
     )) "Demo entry did not reach an accepted state"
     Assert-Condition ($null -ne $entry.execution.risk_decision_id) `
@@ -318,7 +399,7 @@ try {
         $_.order_link_id -eq $entry.execution.order_link_id
     })
     Assert-Condition ($sameOrderLink.Count -eq 1) "orderLinkId is not unique"
-    Write-Host "DEMO ENTRY ACCEPTED: PASS"
+    Write-Host "DEMO ORDER ACKNOWLEDGED: PASS"
 
     $opened = Wait-ForExecutionState -ExecutionId $executionId `
         -States @("DEMO_POSITION_OPEN")
@@ -326,7 +407,8 @@ try {
         "Exchange fill quantity is missing"
     Assert-Condition ([decimal]$opened.average_fill_price -gt 0) `
         "Average fill price is missing"
-    Write-Host "DEMO FILL CONFIRMED: PASS"
+    Write-Host "DEMO ENTRY FILL CONFIRMED: PASS"
+    Write-Host "DEMO POSITION OPEN CONFIRMED: PASS"
     Assert-Condition ($opened.protection_confirmed -eq $true) `
         "Exchange TP/SL was not confirmed"
     Assert-Condition ([decimal]$opened.take_profit -gt 0) "Take profit is missing"
@@ -382,11 +464,60 @@ try {
     Assert-Condition ($status.bybit_live_trading_enabled -eq $false) `
         "Live execution flag changed"
     Write-Host "LIVE EXECUTION BLOCKED: PASS"
+    $script:FunctionalResult = "PASS"
+    $script:SafetyCleanupResult = "PASS"
+    Write-CanaryReport -Status (Get-ExecutionStatus -ExecutionId $executionId)
+    Write-Host "CANARY FUNCTIONAL RESULT: PASS"
+    Write-Host "SAFETY CLEANUP RESULT: PASS"
     Write-Host "OVERALL: PASS"
     $script:OverallPassed = $true
 }
 catch {
-    [Console]::Error.WriteLine((Protect-Text $_.Exception.Message))
+    $failureReason = Protect-Text $_.Exception.Message
+    [Console]::Error.WriteLine($failureReason)
+    $cleanupStatus = $null
+    if ($script:ExecutionId -and $script:BaseUrl) {
+        try {
+            $persistedReason = if ($failureReason -like "*position*open*timeout*" -or
+                $failureReason -like "*Timed out waiting for Demo execution state*") {
+                "local position-open state timeout"
+            } else { $failureReason }
+            $null = Invoke-Api -Method "POST" `
+                -Path "/demo/canary/$($script:ExecutionId)/failure-cleanup" `
+                -Body @{ reason = $persistedReason }
+            $deadline = [DateTime]::UtcNow.AddSeconds(90)
+            while ([DateTime]::UtcNow -lt $deadline) {
+                $null = Invoke-Api -Method "POST" -Path "/demo/reconcile"
+                $cleanupStatus = Get-ExecutionStatus -ExecutionId $script:ExecutionId
+                if ($cleanupStatus.execution.state -eq "DEMO_CLOSED_AFTER_FAILURE" -and
+                    $null -eq $cleanupStatus.remote_position) { break }
+                Start-Sleep -Seconds 2
+            }
+            if ($cleanupStatus -and @($cleanupStatus.execution.fills).Count -gt 0) {
+                Write-Host "DEMO ENTRY FILL CONFIRMED DURING CLEANUP: PASS"
+            }
+            if ($cleanupStatus -and @($cleanupStatus.execution.close_fills).Count -gt 0) {
+                Write-Host "DEMO REDUCE-ONLY CLEANUP CLOSE: PASS"
+            }
+            $finalDemo = Invoke-Api -Path "/demo/status"
+            if ($cleanupStatus.execution.state -eq "DEMO_CLOSED_AFTER_FAILURE" -and
+                [int]$finalDemo.bot_owned_open_positions -eq 0 -and
+                [int]$finalDemo.bot_owned_open_orders -eq 0) {
+                $script:SafetyCleanupResult = "PASS"
+                Write-Host "FINAL DEMO STATE FLAT: PASS"
+            } else {
+                $script:SafetyCleanupResult = "FAIL"
+            }
+            Write-CanaryReport -Status $cleanupStatus -FailureReason $persistedReason
+        }
+        catch {
+            $script:SafetyCleanupResult = "FAIL"
+            Write-Warning (Protect-Text "Safety cleanup failed: $($_.Exception.Message)")
+        }
+    }
+    Write-Host "CANARY FUNCTIONAL RESULT: FAIL"
+    Write-Host "SAFETY CLEANUP RESULT: $($script:SafetyCleanupResult)"
+    Write-Host "OVERALL: FAIL"
     if ($stderrPath) {
         $diagnostic = Protect-Text (Safe-ReadTextFile -Path $stderrPath)
         if ($diagnostic) { Write-Warning ($diagnostic -split "`r?`n" | Select-Object -Last 20 | Out-String) }

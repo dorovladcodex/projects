@@ -29,6 +29,7 @@ from app.models import (
     ClassificationStatus,
     DemoExecutionRecord,
     DemoExecutionState,
+    DemoFill,
     ExecutionEnvironment,
     MarketConfirmation,
     MarketSnapshot,
@@ -85,6 +86,7 @@ class MemoryRepository:
         self.records = {}
         self.events: set[str] = set()
         self.kill = None
+        self.saved_events = []
 
     def load_demo_kill_switch(self):
         return self.kill
@@ -105,6 +107,7 @@ class MemoryRepository:
 
     def save_demo_execution(self, record, *, event_type):
         self.records[str(record.candidate_id)] = record.model_copy(deep=True)
+        self.saved_events.append((event_type, record.state.value))
         return True
 
     def load_demo_executions(self):
@@ -215,6 +218,35 @@ class FakeDemoClient:
             "stopLoss": str(stop_loss),
         }]
         return {"retCode": 0}
+
+
+class ImmediateFillClient(FakeDemoClient):
+    def __init__(self, source: str) -> None:
+        super().__init__()
+        self.source = source
+
+    def create_order(self, payload):
+        response = super().create_order(payload)
+        order_id = response["result"]["orderId"]
+        self.positions = [{
+            "symbol": payload["symbol"], "size": payload["qty"],
+            "avgPrice": "65000", "leverage": "1", "positionIdx": 0,
+        }]
+        if self.source == "history":
+            self.history = [{
+                "symbol": payload["symbol"], "orderId": order_id,
+                "orderLinkId": payload["orderLinkId"], "orderStatus": "Filled",
+                "cumExecQty": payload["qty"], "avgPrice": "65000",
+            }]
+        elif self.source == "execution":
+            self.executions = [{
+                "symbol": payload["symbol"], "orderId": order_id,
+                "orderLinkId": payload["orderLinkId"], "execId": "fill-1",
+                "execQty": payload["qty"], "execPrice": "65000",
+                "execFee": "0.03575", "feeCurrency": "USDT",
+                "execTime": "1784040000000",
+            }]
+        return response
 
 
 class LeveragePreparationClient(FakeDemoClient):
@@ -644,12 +676,138 @@ def test_create_acknowledgement_is_not_a_fill_and_duplicate_is_idempotent() -> N
     candidate, classification, preview, snapshot = candidate_bundle()
     record = demo.submit_candidate(candidate, preview, classification, snapshot)
     assert record is not None
-    assert record.state == DemoExecutionState.DEMO_ACCEPTED
+    assert record.state == DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
     assert record.accepted_quantity == 0
     assert record.fills == []
     duplicate = demo.submit_candidate(candidate, preview, classification, snapshot)
     assert duplicate is not None and duplicate.id == record.id
     assert len(client.orders) == 1
+
+
+def test_rest_poll_failure_after_ack_preserves_acknowledged_state() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+
+    def unavailable(*args, **kwargs):
+        raise TimeoutError("temporary REST timeout")
+
+    client.get_order_history = unavailable
+    record = demo.submit_candidate(candidate, preview, classification, snapshot)
+
+    assert record is not None
+    assert record.state == DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
+    assert len(client.orders) == 1
+    assert demo.orders_accepted == 1
+    assert demo.orders_rejected == 0
+
+
+@pytest.mark.parametrize("source", ["history", "execution", "position"])
+def test_immediate_full_fill_is_reconciled_before_first_ws_event(source: str) -> None:
+    repo = MemoryRepository()
+    client = ImmediateFillClient(source)
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+
+    record = demo.submit_candidate(candidate, preview, classification, snapshot)
+
+    assert record is not None
+    assert record.state == DemoExecutionState.DEMO_POSITION_OPEN
+    assert record.accepted_quantity == record.requested_quantity
+    assert record.average_fill_price == Decimal("65000")
+    assert record.protection_confirmed is True
+    assert ("DEMO_ORDER_ACKNOWLEDGED", "DEMO_ORDER_ACKNOWLEDGED") in repo.saved_events
+    assert any(event == "DEMO_FULLY_FILLED" for event, _ in repo.saved_events)
+    assert any(event == "DEMO_POSITION_OPEN" for event, _ in repo.saved_events)
+
+
+def test_stale_ws_position_without_protection_does_not_close_verified_position() -> None:
+    repo = MemoryRepository()
+    client = ImmediateFillClient("history")
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+    record = demo.submit_candidate(candidate, preview, classification, snapshot)
+    assert record is not None and record.state == DemoExecutionState.DEMO_POSITION_OPEN
+
+    demo.handle_private_event({
+        "topic": "position",
+        "data": [{"symbol": "BTCUSDT", "size": "0.010"}],
+    })
+
+    saved = repo.get_demo_execution(str(candidate.id))
+    assert saved.state == DemoExecutionState.DEMO_POSITION_OPEN
+    assert len(client.orders) == 1
+
+
+def test_terminal_closed_state_is_not_downgraded_by_replayed_close_history() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, classification, preview, snapshot = candidate_bundle()
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=1, run_id="test-run",
+        order_link_id="entry-link", order_id="entry-id",
+        close_order_link_id="close-link", close_order_id="close-id",
+        state=DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.010"),
+        accepted_quantity=Decimal("0.010"),
+        average_fill_price=Decimal("65000"),
+        failure_reason="local position-open state timeout",
+    )
+    repo.records[str(candidate.id)] = record
+
+    demo._apply_order_update(record, {
+        "orderId": "close-id", "orderLinkId": "close-link",
+        "orderStatus": "Filled",
+    })
+
+    assert record.state == DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+
+
+def test_timeout_cleanup_persists_fills_pnl_and_closed_after_failure() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = DemoExecutionService(
+        demo_settings(demo_canary_enabled=True), repo, client,
+        run_id="demo-test-run",
+    )
+    candidate, _, _, _ = candidate_bundle()
+    now = datetime.now(timezone.utc)
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=7, run_id="demo-test-run",
+        order_link_id="entry-link", order_id="entry-id",
+        close_order_link_id="close-link", close_order_id="close-id",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"),
+        accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("64021.8"),
+        fills=[DemoFill(
+            execution_id="entry-fill", order_id="entry-id",
+            quantity=Decimal("0.001"), price=Decimal("64021.8"),
+            fee=Decimal("0.03521199"), fee_currency="USDT", executed_at=now,
+        )],
+        close_fills=[DemoFill(
+            execution_id="close-fill", order_id="close-id",
+            quantity=Decimal("0.001"), price=Decimal("64020"),
+            fee=Decimal("0.035211"), fee_currency="USDT", executed_at=now,
+        )],
+        average_close_price=Decimal("64020"),
+        exchange_fees=Decimal("0.07042299"),
+        paper_shadow_pnl=Decimal("-0.07222299"),
+    )
+    repo.records[str(candidate.id)] = record
+
+    cleaned = demo.request_canary_failure_cleanup(
+        str(record.id), "local position-open state timeout"
+    )
+
+    assert cleaned is not None
+    assert cleaned.state == DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+    assert cleaned.failure_reason == "local position-open state timeout"
+    assert cleaned.cleanup_result == "remote position flat and bot-owned orders zero"
+    assert cleaned.realized_exchange_pnl == Decimal("-0.07222299")
+    assert len(cleaned.fills) == 1 and len(cleaned.close_fills) == 1
+    assert len(client.orders) == 0
 
 
 def test_entry_is_never_submitted_without_durable_reservation() -> None:
@@ -860,11 +1018,21 @@ def test_controlled_canary_entry_uses_production_demo_service_once(tmp_path) -> 
         liquidity_ok=True,
     )
 
+    budget = Decimal("20")
+    plan = demo.plan_canary_order(
+        Symbol.BTCUSDT, budget, Decimal(str(snapshot.ask_price))
+    )
     first = service_under_test.execute_demo_canary(
-        Symbol.BTCUSDT, 20.0, snapshot
+        Symbol.BTCUSDT,
+        budget,
+        snapshot,
+        expected_rules_fingerprint=plan.rules_fingerprint,
     )
     second = service_under_test.execute_demo_canary(
-        Symbol.BTCUSDT, 20.0, snapshot
+        Symbol.BTCUSDT,
+        budget,
+        snapshot,
+        expected_rules_fingerprint=plan.rules_fingerprint,
     )
 
     assert first.demo_execution is not None
@@ -907,10 +1075,136 @@ def test_canary_fails_before_persistence_when_exchange_minimum_exceeds_cap(
     )
 
     with pytest.raises(DemoSafetyError, match="exchange minimum"):
-        service_under_test.execute_demo_canary(Symbol.BTCUSDT, 20.0, snapshot)
+        service_under_test.execute_demo_canary(
+            Symbol.BTCUSDT,
+            Decimal("20"),
+            snapshot,
+            expected_rules_fingerprint="0" * 64,
+        )
 
     assert client.orders == []
     assert repository.load_signal_results(ExecutionEnvironment.BYBIT_DEMO) == []
+    assert repository.load_demo_executions() == []
+    restored_news, restored_classifications = repository.load_news()
+    assert restored_news == []
+    assert restored_classifications == []
+
+
+class MutableCanaryRulesClient(FakeDemoClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rules = instrument()
+
+    def get_instrument(self, symbol):
+        return self.rules
+
+
+def _canary_signal_service(tmp_path, client, *, run_id: str):
+    settings = demo_settings(demo_canary_enabled=True, demo_run_id=run_id)
+    repository = PersistenceRepository(f"sqlite:///{tmp_path / (run_id + '.db')}")
+    demo = DemoExecutionService(settings, repository, client, run_id=run_id)
+    candidate_service = SignalCandidateService(
+        settings,
+        SimpleNamespace(items=[], filtered_items=[], classifications=[]),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(equity=10_000),
+        repository,
+        demo,
+    )
+    return candidate_service, demo, repository
+
+
+def _canary_snapshot(price: float) -> MarketSnapshot:
+    return MarketSnapshot(
+        symbol=Symbol.BTCUSDT,
+        timestamp=datetime.now(timezone.utc),
+        last_price=price,
+        bid_price=price - 0.1,
+        ask_price=price,
+        price_change_1m_pct=0.2,
+        simple_trend=SimpleTrend.BULLISH,
+        trend_score=0.5,
+        volatility_pct=0.1,
+        liquidity_ok=True,
+    )
+
+
+def _assert_no_canary_side_effects(repository, client) -> None:
+    assert client.orders == []
+    assert repository.load_demo_executions() == []
+    assert repository.load_signal_results(ExecutionEnvironment.BYBIT_DEMO) == []
+    news, classifications = repository.load_news()
+    assert news == []
+    assert classifications == []
+
+
+def test_canary_rule_change_is_rejected_before_durable_side_effects(tmp_path) -> None:
+    client = MutableCanaryRulesClient()
+    candidate_service, demo, repository = _canary_signal_service(
+        tmp_path, client, run_id="canary-rule-race"
+    )
+    initial = demo.plan_canary_order(
+        Symbol.BTCUSDT, Decimal("75"), Decimal("62800")
+    )
+    client.rules = InstrumentRules(
+        **{
+            **client.rules.__dict__,
+            "tick_size": Decimal("0.01"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="instrument rules changed"):
+        candidate_service.execute_demo_canary(
+            Symbol.BTCUSDT,
+            Decimal("75"),
+            _canary_snapshot(62800),
+            expected_rules_fingerprint=initial.rules_fingerprint,
+        )
+
+    _assert_no_canary_side_effects(repository, client)
+
+
+def test_canary_price_change_beyond_budget_has_no_durable_side_effects(tmp_path) -> None:
+    client = MutableCanaryRulesClient()
+    candidate_service, demo, repository = _canary_signal_service(
+        tmp_path, client, run_id="canary-price-race"
+    )
+    initial = demo.plan_canary_order(
+        Symbol.BTCUSDT, Decimal("75"), Decimal("62800")
+    )
+
+    with pytest.raises(DemoSafetyError, match="maximum canary budget"):
+        candidate_service.execute_demo_canary(
+            Symbol.BTCUSDT,
+            Decimal("75"),
+            _canary_snapshot(72000),
+            expected_rules_fingerprint=initial.rules_fingerprint,
+        )
+
+    _assert_no_canary_side_effects(repository, client)
+
+
+def test_canary_submits_exact_minimum_quantity_not_budget_quantity(tmp_path) -> None:
+    client = MutableCanaryRulesClient()
+    candidate_service, demo, _ = _canary_signal_service(
+        tmp_path, client, run_id="canary-exact-minimum"
+    )
+    initial = demo.plan_canary_order(
+        Symbol.BTCUSDT, Decimal("75"), Decimal("62800")
+    )
+
+    result = candidate_service.execute_demo_canary(
+        Symbol.BTCUSDT,
+        Decimal("75"),
+        _canary_snapshot(62800),
+        expected_rules_fingerprint=initial.rules_fingerprint,
+    )
+
+    assert result.execution_attempted is True
+    assert len(client.orders) == 1
+    assert client.orders[0]["qty"] == "0.001"
+    assert Decimal(client.orders[0]["qty"]) * Decimal("62800") < Decimal("75")
 
 
 def test_reconciliation_fails_closed_on_remote_quantity_mismatch() -> None:
@@ -975,5 +1269,5 @@ def test_demo_execution_and_kill_switch_survive_repository_restart(tmp_path) -> 
     restored = PersistenceRepository(url)
     loaded = restored.get_demo_execution(str(candidate.id))
     assert loaded is not None and loaded.id == record.id
-    assert loaded.state == DemoExecutionState.DEMO_ACCEPTED
+    assert loaded.state == DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
     assert restored.load_demo_kill_switch()["reasons"] == ["test incident"]

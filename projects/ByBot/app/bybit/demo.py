@@ -35,6 +35,11 @@ from app.models import (
 DEMO_REST_URL = "https://api-demo.bybit.com"
 DEMO_PRIVATE_WS_URL = "wss://stream-demo.bybit.com"
 BOT_ORDER_PURPOSES = {"entry", "close", "emergency"}
+TERMINAL_DEMO_STATES = {
+    DemoExecutionState.DEMO_CLOSED,
+    DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+    DemoExecutionState.DEMO_FAILED,
+}
 
 
 class DemoSafetyError(RuntimeError):
@@ -56,6 +61,161 @@ class InstrumentRules:
     min_leverage: Decimal
     max_leverage: Decimal
     leverage_step: Decimal
+
+
+@dataclass(frozen=True)
+class CanaryMinimumOrderPlan:
+    """Exchange-minimum order plan bounded by an explicit canary budget.
+
+    All values remain ``Decimal`` so an exchange quantity is never made valid
+    through a lossy float conversion.  ``max_notional_usdt`` is a hard ceiling,
+    not a target position size.
+    """
+
+    symbol: Symbol
+    instrument_status: str
+    min_order_qty: Decimal
+    qty_step: Decimal
+    min_notional_value: Decimal
+    reference_price: Decimal
+    calculated_order_qty: Decimal
+    estimated_notional: Decimal
+    safety_buffer_pct: Decimal
+    buffered_required_notional: Decimal
+    max_notional_usdt: Decimal
+    rules_fingerprint: str
+
+
+def calculate_minimum_valid_canary_order(
+    rules: InstrumentRules,
+    reference_price: Decimal,
+    max_notional_usdt: Decimal,
+    *,
+    safety_buffer_pct: Decimal = Decimal("5"),
+) -> CanaryMinimumOrderPlan:
+    """Calculate the smallest exchange-valid quantity within a hard budget.
+
+    The minimum-notional-derived quantity and the exchange minimum quantity
+    are both rounded *up* to ``qtyStep``.  The market-price buffer is used only
+    for budget validation; it never increases the submitted quantity.
+    """
+
+    if not all(
+        isinstance(value, Decimal)
+        for value in (reference_price, max_notional_usdt, safety_buffer_pct)
+    ):
+        raise TypeError("canary financial inputs must use Decimal")
+    if rules.status != "Trading":
+        raise DemoSafetyError(f"{rules.symbol.value} is not Trading")
+    if reference_price <= 0:
+        raise DemoSafetyError("canary reference price is unavailable")
+    if max_notional_usdt <= 0:
+        raise DemoSafetyError("maximum canary budget must be positive")
+    if safety_buffer_pct < 0:
+        raise DemoSafetyError("canary safety buffer cannot be negative")
+    if rules.qty_step <= 0 or rules.min_order_qty <= 0:
+        raise DemoSafetyError("invalid exchange quantity rules")
+    if rules.min_notional_value < 0:
+        raise DemoSafetyError("invalid exchange minimum notional")
+
+    quantity_for_notional = _step_round(
+        rules.min_notional_value / reference_price,
+        rules.qty_step,
+        ROUND_UP,
+    )
+    required_quantity = _step_round(
+        max(rules.min_order_qty, quantity_for_notional),
+        rules.qty_step,
+        ROUND_UP,
+    )
+    estimated_notional = required_quantity * reference_price
+    buffered_required_notional = estimated_notional * (
+        Decimal("1") + safety_buffer_pct / Decimal("100")
+    )
+    if buffered_required_notional > max_notional_usdt:
+        raise DemoSafetyError(
+            f"{rules.symbol.value} buffered exchange minimum exceeds the explicit "
+            "maximum canary budget"
+        )
+
+    return CanaryMinimumOrderPlan(
+        symbol=rules.symbol,
+        instrument_status=rules.status,
+        min_order_qty=rules.min_order_qty,
+        qty_step=rules.qty_step,
+        min_notional_value=rules.min_notional_value,
+        reference_price=reference_price,
+        calculated_order_qty=required_quantity,
+        estimated_notional=estimated_notional,
+        safety_buffer_pct=safety_buffer_pct,
+        buffered_required_notional=buffered_required_notional,
+        max_notional_usdt=max_notional_usdt,
+        rules_fingerprint=canary_rules_fingerprint(rules),
+    )
+
+
+def canary_rules_fingerprint(rules: InstrumentRules) -> str:
+    """Return a stable, non-secret fingerprint for race-safe rule validation."""
+
+    payload = "|".join(
+        (
+            rules.symbol.value,
+            rules.status,
+            _format_decimal(rules.min_order_qty),
+            _format_decimal(rules.qty_step),
+            _format_decimal(rules.min_notional_value),
+            _format_decimal(rules.tick_size),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def canary_plan_payload(plan: CanaryMinimumOrderPlan) -> dict[str, str]:
+    return {
+        "symbol": plan.symbol.value,
+        "instrument_status": plan.instrument_status,
+        "min_order_qty": _format_decimal(plan.min_order_qty),
+        "qty_step": _format_decimal(plan.qty_step),
+        "min_notional_value": _format_decimal(plan.min_notional_value),
+        "reference_price": _format_decimal(plan.reference_price),
+        "calculated_quantity": _format_decimal(plan.calculated_order_qty),
+        "estimated_notional": _format_decimal(plan.estimated_notional),
+        "market_price_buffer_pct": _format_decimal(plan.safety_buffer_pct),
+        "buffered_required_notional": _format_decimal(
+            plan.buffered_required_notional
+        ),
+        "max_notional_usdt": _format_decimal(plan.max_notional_usdt),
+        "rules_fingerprint": plan.rules_fingerprint,
+    }
+
+
+def revalidate_canary_order_plan(
+    plan: CanaryMinimumOrderPlan,
+    current_rules: InstrumentRules,
+    current_reference_price: Decimal,
+) -> CanaryMinimumOrderPlan:
+    """Revalidate rules and price immediately before an exchange submission."""
+
+    if current_rules.symbol != plan.symbol or (
+        current_rules.status,
+        current_rules.min_order_qty,
+        current_rules.qty_step,
+        current_rules.min_notional_value,
+    ) != (
+        "Trading",
+        plan.min_order_qty,
+        plan.qty_step,
+        plan.min_notional_value,
+    ):
+        raise DemoSafetyError("exchange instrument rules changed before submission")
+    if canary_rules_fingerprint(current_rules) != plan.rules_fingerprint:
+        raise DemoSafetyError("exchange instrument rules changed before submission")
+    return calculate_minimum_valid_canary_order(
+        current_rules,
+        current_reference_price,
+        plan.max_notional_usdt,
+        safety_buffer_pct=plan.safety_buffer_pct,
+    )
 
 
 class DemoExchangeClient(Protocol):
@@ -668,6 +828,8 @@ class DemoExecutionService:
         preview: SignalRiskPreview,
         classification: NewsClassification,
         snapshot: MarketSnapshot,
+        *,
+        canary_plan: CanaryMinimumOrderPlan | None = None,
     ) -> DemoExecutionRecord | None:
         if not self.enabled or self.client is None:
             return None
@@ -695,12 +857,21 @@ class DemoExecutionService:
         if existing is not None:
             return existing
 
-        rules = self.client.get_instrument(candidate.symbol)
-        quantity = normalize_quantity(Decimal(str(preview.capped_size)), rules)
         entry_reference = Decimal(str(
             snapshot.ask_price
             if candidate.final_action == NewsSignalAction.BUY else snapshot.bid_price
         ))
+        rules = self.client.get_instrument(candidate.symbol)
+        if canary_plan is not None:
+            # This is the final exchange-rules read before the durable reservation.
+            # Recalculate at the latest executable reference price and submit only
+            # the exchange-minimum valid quantity, never the whole budget.
+            final_plan = revalidate_canary_order_plan(
+                canary_plan, rules, entry_reference
+            )
+            quantity = final_plan.calculated_order_qty
+        else:
+            quantity = normalize_quantity(Decimal(str(preview.capped_size)), rules)
         validate_order_notional(quantity, entry_reference, rules)
         self._validate_remote_entry_state(candidate.symbol)
         self._ensure_symbol_leverage(candidate.symbol)
@@ -739,12 +910,14 @@ class DemoExecutionService:
             })
             result = response.get("result") or {}
             record.order_id = str(result.get("orderId") or "") or None
-            record.state = DemoExecutionState.DEMO_ACCEPTED
+            record.state = DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
+            record.exchange_order_status = "Acknowledged"
             record.updated_at = datetime.now(timezone.utc)
-            self.repository.save_demo_execution(record, event_type="CREATE_ACK")
+            self.repository.save_demo_execution(
+                record, event_type="DEMO_ORDER_ACKNOWLEDGED"
+            )
             self.orders_submitted += 1
             self.orders_accepted += 1
-            return record
         except Exception as exc:
             record.state = DemoExecutionState.DEMO_RECONCILIATION_REQUIRED
             record.last_error = _sanitized_error(exc)
@@ -754,6 +927,20 @@ class DemoExecutionService:
             self.last_error = record.last_error
             self._activate_kill_switch("entry submission outcome is uncertain")
             return record
+        # Market orders can fill before the first private WebSocket event.
+        # Query every authoritative REST surface immediately, by the stable
+        # order identifiers, so the durable state never depends on WS timing.
+        try:
+            return self._reconcile_execution_rest(record)
+        except Exception as exc:
+            record.last_error = _sanitized_error(exc)
+            record.last_reconciliation_at = datetime.now(timezone.utc)
+            record.updated_at = record.last_reconciliation_at
+            self.repository.save_demo_execution(
+                record, event_type="REST_RECONCILIATION_PENDING"
+            )
+            self.last_error = record.last_error
+            return record
 
     def validate_canary_notional(
         self, symbol: Symbol, notional_usdt: Decimal, reference_price: Decimal
@@ -762,21 +949,33 @@ class DemoExecutionService:
         if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
             raise DemoSafetyError("Demo canary execution is unavailable")
         require_demo_execution(self.settings)
-        if notional_usdt > Decimal("20"):
-            raise DemoSafetyError("Demo canary notional exceeds the 20 USDT cap")
+        plan = self.plan_canary_order(symbol, notional_usdt, reference_price)
+        return plan.calculated_order_qty
+
+    def plan_canary_order(
+        self,
+        symbol: Symbol,
+        max_notional_usdt: Decimal,
+        reference_price: Decimal,
+        *,
+        safety_buffer_pct: Decimal | None = None,
+    ) -> CanaryMinimumOrderPlan:
+        """Read current instrument rules and build a side-effect-free plan."""
+
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            raise DemoSafetyError("Demo canary execution is unavailable")
+        require_demo_execution(self.settings)
         rules = self.client.get_instrument(symbol)
-        quantity = _floor_to_step(notional_usdt / reference_price, rules.qty_step)
-        minimum_notional = max(
-            rules.min_order_qty * reference_price,
-            rules.min_notional_value,
+        return calculate_minimum_valid_canary_order(
+            rules,
+            reference_price,
+            max_notional_usdt,
+            safety_buffer_pct=(
+                safety_buffer_pct
+                if safety_buffer_pct is not None
+                else self.settings.demo_canary_market_price_buffer_pct
+            ),
         )
-        if quantity < rules.min_order_qty or quantity * reference_price < rules.min_notional_value:
-            raise DemoSafetyError(
-                f"{symbol.value} exchange minimum is approximately "
-                f"{_format_decimal(minimum_notional)} USDT, above the canary cap; "
-                "no Demo order was submitted"
-            )
-        return quantity
 
     def handle_private_event(self, event: dict[str, Any]) -> None:
         topic = str(event.get("topic") or "")
@@ -816,6 +1015,74 @@ class DemoExecutionService:
             elif topic == "position":
                 self._apply_position_update(record, item)
 
+    def _reconcile_execution_rest(
+        self, record: DemoExecutionRecord
+    ) -> DemoExecutionRecord:
+        """Reconcile one execution from all authoritative symbol-scoped REST data."""
+        if self.client is None:
+            return record
+        realtime = self.client.get_open_orders(symbol=record.symbol)
+        history = self.client.get_order_history(symbol=record.symbol)
+        executions = self.client.get_executions(symbol=record.symbol)
+        positions = self.client.get_positions(symbol=record.symbol)
+
+        def matches(item: dict[str, Any], *, close: bool = False) -> bool:
+            ids = (
+                (record.close_order_id, record.close_order_link_id)
+                if close else (record.order_id, record.order_link_id)
+            )
+            return bool(
+                (ids[0] and str(item.get("orderId") or "") == ids[0])
+                or (ids[1] and str(item.get("orderLinkId") or "") == ids[1])
+            )
+
+        for order in [*realtime, *history]:
+            if matches(order) or matches(order, close=True):
+                self._apply_order_update(record, order)
+        for execution in executions:
+            if matches(execution):
+                self._apply_fill(record, execution)
+            elif matches(execution, close=True):
+                self._apply_fill(record, execution, force_close=True)
+
+        position = next(
+            (
+                item for item in positions
+                if str(item.get("symbol") or "") == record.symbol.value
+                and _decimal(item.get("size"), default="0") > 0
+            ),
+            None,
+        )
+        if position is not None and record.state not in TERMINAL_DEMO_STATES:
+            remote_size = _decimal(position.get("size"), default="0")
+            if record.accepted_quantity == 0:
+                record.accepted_quantity = remote_size
+            remote_average = _decimal(position.get("avgPrice"), default="0")
+            if record.average_fill_price is None and remote_average > 0:
+                record.average_fill_price = remote_average
+            if (
+                record.accepted_quantity >= record.requested_quantity
+                and record.average_fill_price is not None
+                and record.state in {
+                    DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED,
+                    DemoExecutionState.DEMO_ACCEPTED,
+                    DemoExecutionState.DEMO_PARTIALLY_FILLED,
+                    DemoExecutionState.DEMO_FILLED,
+                    DemoExecutionState.DEMO_FULLY_FILLED,
+                }
+            ):
+                record.state = DemoExecutionState.DEMO_FULLY_FILLED
+                record.exchange_order_status = "Filled"
+                record.updated_at = datetime.now(timezone.utc)
+                self.repository.save_demo_execution(
+                    record, event_type="DEMO_FULLY_FILLED"
+                )
+                self._install_protection(record)
+        record.last_reconciliation_at = datetime.now(timezone.utc)
+        record.updated_at = record.last_reconciliation_at
+        self.repository.save_demo_execution(record, event_type="REST_ORDER_RECONCILED")
+        return record
+
     def reconcile(self) -> dict[str, Any]:
         if not self.enabled or self.client is None:
             return {"status": "DISABLED"}
@@ -824,6 +1091,14 @@ class DemoExecutionService:
         executions = self.client.get_executions(settle_coin="USDT")
         closed_pnl = self.client.get_closed_pnl(settle_coin="USDT")
         self.last_reconciliation_at = datetime.now(timezone.utc)
+        local = self.repository.load_demo_executions()
+        for record in list(local):
+            if record.state in TERMINAL_DEMO_STATES:
+                continue
+            try:
+                self._reconcile_execution_rest(record)
+            except Exception as exc:
+                self.last_error = _sanitized_error(exc)
         local = self.repository.load_demo_executions()
         local_links = {
             link: item
@@ -869,6 +1144,7 @@ class DemoExecutionService:
                 record.state in {
                     DemoExecutionState.DEMO_SUBMITTING,
                     DemoExecutionState.DEMO_ACCEPTED,
+                    DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED,
                 }
                 and record.order_link_id not in remote_by_link
                 and now - _aware(record.updated_at) > timedelta(
@@ -886,7 +1162,7 @@ class DemoExecutionService:
         active_owned_symbols = {
             item.symbol.value for item in local
             if item.state not in {
-                DemoExecutionState.DEMO_CLOSED, DemoExecutionState.DEMO_FAILED
+                *TERMINAL_DEMO_STATES,
             }
         }
         self.bot_owned_open_positions = sum(
@@ -897,7 +1173,7 @@ class DemoExecutionService:
             symbol = str(position.get("symbol") or "")
             owned = next(
                 (item for item in local if item.symbol.value == symbol and item.state not in {
-                    DemoExecutionState.DEMO_CLOSED, DemoExecutionState.DEMO_FAILED
+                    *TERMINAL_DEMO_STATES,
                 }), None,
             )
             if owned is None:
@@ -935,14 +1211,35 @@ class DemoExecutionService:
                     None,
                 )
                 if pnl_item is None:
-                    record.state = DemoExecutionState.DEMO_RECONCILIATION_REQUIRED
-                    record.last_error = "locally open position is flat remotely without closed PnL"
+                    if record.close_fills and record.paper_shadow_pnl is not None:
+                        record.realized_exchange_pnl = record.paper_shadow_pnl
+                        record.state = (
+                            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+                            if record.failure_reason
+                            else DemoExecutionState.DEMO_CLOSED
+                        )
+                    else:
+                        record.state = DemoExecutionState.DEMO_RECONCILIATION_REQUIRED
+                        record.last_error = "locally open position is flat remotely without closed PnL"
                 else:
                     record.realized_exchange_pnl = _decimal(
                         pnl_item.get("closedPnl"), default="0"
                     )
-                    record.state = DemoExecutionState.DEMO_CLOSED
+                    record.state = (
+                        DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+                        if record.failure_reason
+                        else DemoExecutionState.DEMO_CLOSED
+                    )
                     record.close_reason = record.close_reason or "exchange_close"
+                if record.state in {
+                    DemoExecutionState.DEMO_CLOSED,
+                    DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+                }:
+                    record.cleanup_result = (
+                        "remote position flat and bot-owned orders zero"
+                        if self.bot_owned_open_orders == 0
+                        else "remote position flat; bot-owned orders remain"
+                    )
                 record.updated_at = datetime.now(timezone.utc)
                 self.repository.save_demo_execution(record, event_type="REST_POSITION_RECONCILED")
         return {
@@ -1014,6 +1311,33 @@ class DemoExecutionService:
             if _decimal(item.get("size"), default="0") > 0
         ]
         remote_position = positions[0] if len(positions) == 1 else None
+        order_history = self.client.get_order_history(symbol=record.symbol)
+        executions = self.client.get_executions(symbol=record.symbol)
+        entry_orders = [
+            _order_audit(item) for item in order_history
+            if _matches_exchange_identity(
+                item, record.order_id, record.order_link_id
+            )
+        ]
+        close_orders = [
+            _order_audit(item) for item in order_history
+            if _matches_exchange_identity(
+                item, record.close_order_id, record.close_order_link_id
+            )
+        ]
+        entry_executions = [
+            _execution_audit(item) for item in executions
+            if _matches_exchange_identity(
+                item, record.order_id, record.order_link_id
+            )
+        ]
+        close_executions = [
+            _execution_audit(item) for item in executions
+            if _matches_exchange_identity(
+                item, record.close_order_id, record.close_order_link_id
+            )
+        ]
+        load_events = getattr(self.repository, "load_demo_execution_events", None)
         return {
             "execution": record.model_dump(mode="json"),
             "remote_position": (
@@ -1027,7 +1351,82 @@ class DemoExecutionService:
                 }
                 if remote_position else None
             ),
+            "entry_order_history": entry_orders,
+            "entry_executions": entry_executions,
+            "close_order_history": close_orders,
+            "close_executions": close_executions,
+            "remote_position_observations": [
+                {
+                    "symbol": str(item.get("symbol") or ""),
+                    "size": str(item.get("size") or "0"),
+                    "average_price": str(item.get("avgPrice") or ""),
+                    "take_profit": str(item.get("takeProfit") or ""),
+                    "stop_loss": str(item.get("stopLoss") or ""),
+                }
+                for item in positions
+            ],
+            "durable_state_transitions": (
+                load_events(str(record.id)) if callable(load_events) else []
+            ),
+            "functional_result": (
+                "FAIL"
+                if record.failure_reason
+                else (
+                    "PASS"
+                    if record.state == DemoExecutionState.DEMO_CLOSED
+                    else "IN_PROGRESS"
+                )
+            ),
+            "safety_cleanup_result": (
+                "PASS"
+                if record.state == DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+                and record.cleanup_result
+                else (
+                    "NOT_REQUIRED"
+                    if not record.failure_reason
+                    else "IN_PROGRESS"
+                )
+            ),
         }
+
+    def request_canary_failure_cleanup(
+        self, execution_id: str, reason: str
+    ) -> DemoExecutionRecord | None:
+        """Persist functional failure and make a best-effort idempotent flat close."""
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            return None
+        require_demo_execution(self.settings)
+        record = next(
+            (
+                item for item in self.repository.load_demo_executions()
+                if str(item.id) == execution_id and item.run_id == self.run_id
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        record.failure_reason = reason[:250]
+        record.last_error = record.failure_reason
+        record.updated_at = datetime.now(timezone.utc)
+        self.repository.save_demo_execution(
+            record, event_type="CANARY_FUNCTIONAL_FAILURE"
+        )
+        positions = [
+            item for item in self.client.get_positions(symbol=record.symbol)
+            if _decimal(item.get("size"), default="0") > 0
+        ]
+        if len(positions) == 1:
+            self._submit_reduce_only_close(
+                record,
+                _decimal(positions[0].get("size")),
+                "failure_cleanup",
+            )
+        self.reconcile()
+        refreshed = self.repository.find_demo_execution(
+            record.close_order_link_id or record.order_link_id,
+            record.close_order_id or record.order_id or "",
+        )
+        return refreshed or record
 
     def request_canary_close(self, execution_id: str) -> DemoExecutionRecord | None:
         """Submit one idempotent reduce-only close for a current-run canary."""
@@ -1116,7 +1515,9 @@ class DemoExecutionService:
             or (record.close_order_link_id and order_link == record.close_order_link_id)
         )
         if is_close:
-            if status == "Filled":
+            if order_id and not record.close_order_id:
+                record.close_order_id = order_id
+            if status == "Filled" and record.state not in TERMINAL_DEMO_STATES:
                 record.state = DemoExecutionState.DEMO_CLOSING
             elif status in {"Rejected", "Cancelled", "Deactivated"}:
                 record.state = DemoExecutionState.DEMO_RECONCILIATION_REQUIRED
@@ -1124,17 +1525,24 @@ class DemoExecutionService:
             record.updated_at = datetime.now(timezone.utc)
             self.repository.save_demo_execution(record, event_type=f"CLOSE_{status or 'UNKNOWN'}")
             return
-        if record.protection_confirmed and record.state in {
+        record.exchange_order_status = status or record.exchange_order_status
+        if record.state in {
+            DemoExecutionState.DEMO_FULLY_FILLED,
+            DemoExecutionState.DEMO_PROTECTION_PENDING,
+            *TERMINAL_DEMO_STATES,
+        } or (
+            record.protection_confirmed and record.state in {
             DemoExecutionState.DEMO_POSITION_OPEN,
             DemoExecutionState.DEMO_CLOSING,
             DemoExecutionState.DEMO_CLOSED,
-        }:
+            }
+        ):
             return
         if status == "PartiallyFilled":
             record.state = DemoExecutionState.DEMO_PARTIALLY_FILLED
             self.partial_fills += 1
         elif status == "Filled":
-            record.state = DemoExecutionState.DEMO_FILLED
+            record.state = DemoExecutionState.DEMO_FULLY_FILLED
             record.accepted_quantity = _decimal(item.get("cumExecQty"), default=str(record.requested_quantity))
             avg = _decimal(item.get("avgPrice"), default="0")
             if avg > 0:
@@ -1148,8 +1556,16 @@ class DemoExecutionService:
                 record.state = DemoExecutionState.DEMO_FAILED
                 record.last_error = f"entry order ended with status {status}"
         record.updated_at = datetime.now(timezone.utc)
-        self.repository.save_demo_execution(record, event_type=f"ORDER_{status or 'UNKNOWN'}")
-        if record.state == DemoExecutionState.DEMO_FILLED:
+        event_type = (
+            "DEMO_FULLY_FILLED"
+            if record.state == DemoExecutionState.DEMO_FULLY_FILLED
+            else f"ORDER_{status or 'UNKNOWN'}"
+        )
+        self.repository.save_demo_execution(record, event_type=event_type)
+        if record.state in {
+            DemoExecutionState.DEMO_FILLED,
+            DemoExecutionState.DEMO_FULLY_FILLED,
+        }:
             self._install_protection(record)
 
     def _apply_position_update(
@@ -1164,8 +1580,13 @@ class DemoExecutionService:
             record.updated_at = datetime.now(timezone.utc)
             self.repository.save_demo_execution(record, event_type="POSITION_FLAT_PENDING_PNL")
         elif size > 0 and record.state == DemoExecutionState.DEMO_POSITION_OPEN:
-            if not _protection_present(item):
-                self._emergency_close(record, "position update has no TP/SL")
+            # Private position events may lag the REST response used to verify
+            # TP/SL and can omit protection fields. Never close on one stale WS
+            # event; the symbol-scoped REST reconciler is authoritative.
+            record.updated_at = datetime.now(timezone.utc)
+            self.repository.save_demo_execution(
+                record, event_type="POSITION_WS_OBSERVED"
+            )
 
     def _apply_fill(
         self,
@@ -1197,8 +1618,9 @@ class DemoExecutionService:
                 and str(item.get("orderLinkId") or "") == record.close_order_link_id
             )
         )
-        state_before_fill = record.state
         if is_close_fill:
+            if fill.order_id and not record.close_order_id:
+                record.close_order_id = fill.order_id
             record.close_fills.append(fill)
             close_qty = sum((entry.quantity for entry in record.close_fills), Decimal("0"))
             close_value = sum(
@@ -1206,6 +1628,7 @@ class DemoExecutionService:
             )
             if close_qty > 0 and record.average_fill_price is not None:
                 close_average = close_value / close_qty
+                record.average_close_price = close_average
                 reference = record.take_profit or record.stop_loss or close_average
                 record.exit_slippage = (
                     close_average - reference
@@ -1228,6 +1651,14 @@ class DemoExecutionService:
             total_value = sum((entry.quantity * entry.price for entry in record.fills), Decimal("0"))
             record.accepted_quantity = total_qty
             record.average_fill_price = total_value / total_qty
+            if total_qty >= record.requested_quantity and record.state not in {
+                DemoExecutionState.DEMO_PROTECTION_PENDING,
+                DemoExecutionState.DEMO_POSITION_OPEN,
+                DemoExecutionState.DEMO_CLOSING,
+                *TERMINAL_DEMO_STATES,
+            }:
+                record.state = DemoExecutionState.DEMO_FULLY_FILLED
+                record.exchange_order_status = "Filled"
             if record.reference_entry_price is not None:
                 record.entry_slippage = (
                     record.average_fill_price - record.reference_entry_price
@@ -1248,16 +1679,22 @@ class DemoExecutionService:
                 (close_average - record.average_fill_price)
                 * close_qty * direction - record.exchange_fees
             )
+            record.realized_exchange_pnl = record.paper_shadow_pnl
         record.updated_at = datetime.now(timezone.utc)
-        self.repository.save_demo_execution(record, event_type="EXECUTION_FILL")
+        self.repository.save_demo_execution(
+            record,
+            event_type=(
+                "DEMO_FULLY_FILLED"
+                if not is_close_fill
+                and record.state == DemoExecutionState.DEMO_FULLY_FILLED
+                else "EXECUTION_FILL"
+            ),
+        )
         if (
             not is_close_fill
-            and state_before_fill in {
-                DemoExecutionState.DEMO_FAILED,
-                DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
-            }
+            and record.state == DemoExecutionState.DEMO_FULLY_FILLED
+            and not record.protection_confirmed
         ):
-            record.state = DemoExecutionState.DEMO_FILLED
             self._install_protection(record)
 
     def _install_protection(self, record: DemoExecutionRecord) -> None:
@@ -1289,7 +1726,9 @@ class DemoExecutionService:
             record.sl_identifier = str(position.get("stopLoss") or stop_loss)
             record.state = DemoExecutionState.DEMO_POSITION_OPEN
             record.updated_at = datetime.now(timezone.utc)
-            self.repository.save_demo_execution(record, event_type="PROTECTION_CONFIRMED")
+            self.repository.save_demo_execution(
+                record, event_type="DEMO_POSITION_OPEN"
+            )
         except Exception as exc:
             self._emergency_close(record, _sanitized_error(exc))
 
@@ -1477,6 +1916,47 @@ def _decimal(value: object, *, default: str | None = None) -> Decimal:
 
 def _format_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _matches_exchange_identity(
+    item: dict[str, Any], order_id: str | None, order_link_id: str | None
+) -> bool:
+    return bool(
+        (order_id and str(item.get("orderId") or "") == order_id)
+        or (
+            order_link_id
+            and str(item.get("orderLinkId") or "") == order_link_id
+        )
+    )
+
+
+def _order_audit(item: dict[str, Any]) -> dict[str, str]:
+    return {
+        "order_id": str(item.get("orderId") or ""),
+        "order_link_id": str(item.get("orderLinkId") or ""),
+        "symbol": str(item.get("symbol") or ""),
+        "side": str(item.get("side") or ""),
+        "status": str(item.get("orderStatus") or ""),
+        "quantity": str(item.get("qty") or ""),
+        "cumulative_executed_quantity": str(item.get("cumExecQty") or ""),
+        "average_price": str(item.get("avgPrice") or ""),
+        "updated_time": str(item.get("updatedTime") or ""),
+    }
+
+
+def _execution_audit(item: dict[str, Any]) -> dict[str, str]:
+    return {
+        "execution_id": str(item.get("execId") or ""),
+        "order_id": str(item.get("orderId") or ""),
+        "order_link_id": str(item.get("orderLinkId") or ""),
+        "symbol": str(item.get("symbol") or ""),
+        "side": str(item.get("side") or ""),
+        "quantity": str(item.get("execQty") or ""),
+        "price": str(item.get("execPrice") or ""),
+        "fee": str(item.get("execFee") or ""),
+        "fee_currency": str(item.get("feeCurrency") or ""),
+        "executed_at": str(item.get("execTime") or ""),
+    }
 
 
 def _sanitized_margin_mode(value: object) -> str:

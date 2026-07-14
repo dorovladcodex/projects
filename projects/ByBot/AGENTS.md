@@ -75,8 +75,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\paper_soak.ps1 -Hours 1
 - `bybit_demo_soak.ps1`: real 12-hour Bybit Demo execution soak. It can submit
   Demo orders and therefore requires explicit `-AllowDemoOrders`; Codex must
   never launch it autonomously.
-- `bybit_demo_canary.ps1`: one operator-authorized, maximum-20-USDT real Demo
-  canary using the production Demo service; it also requires
+- `bybit_demo_canary.ps1`: one operator-authorized real Demo canary bounded by
+  an explicit `-MaxNotionalUSDT`; it dynamically submits only the exchange
+  minimum quantity and also requires
   `-AllowDemoOrders` and Codex must never launch it autonomously.
 
 Run targeted tests while editing, the full suite once at the end, then all

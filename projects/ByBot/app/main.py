@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 import asyncio
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import FastAPI, HTTPException
@@ -15,12 +16,15 @@ from app.bybit.demo import (
     BybitDemoRestClient,
     DemoExecutionService,
     DemoSafetyError,
+    canary_plan_payload,
     require_demo_execution,
 )
 from app.config import BotMode, ExecutionMode, get_settings
 from app.models import (
     MarketSnapshot,
     DemoCanaryExecuteRequest,
+    DemoCanaryFailureCleanupRequest,
+    DemoCanaryPreviewRequest,
     ClassifierTestRequest,
     NewsItem,
     PaperTestSignalRequest,
@@ -711,16 +715,19 @@ def _require_demo_canary() -> None:
 @app.post("/demo/canary/execute")
 def demo_canary_execute(request: DemoCanaryExecuteRequest) -> dict[str, object]:
     _require_demo_canary()
-    market_data_service.refresh_all()
-    snapshot = market_data_service.latest_snapshot(request.symbol)
-    if snapshot is None:
-        raise HTTPException(status_code=503, detail="fresh Demo market data is unavailable")
-    age = datetime.now(timezone.utc) - snapshot.timestamp
-    if age > timedelta(seconds=settings.signal_confirmation_window_seconds):
-        raise HTTPException(status_code=503, detail="Demo market data is stale")
+    snapshot = _fresh_canary_snapshot(request.symbol)
+    buffer_pct = (
+        request.market_price_buffer_pct
+        if request.market_price_buffer_pct is not None
+        else settings.demo_canary_market_price_buffer_pct
+    )
     try:
         result = signal_candidate_service.execute_demo_canary(
-            request.symbol, float(request.notional_usdt), snapshot
+            request.symbol,
+            request.max_notional_usdt,
+            snapshot,
+            expected_rules_fingerprint=request.expected_rules_fingerprint,
+            safety_buffer_pct=buffer_pct,
         )
     except (DemoSafetyError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -732,8 +739,48 @@ def demo_canary_execute(request: DemoCanaryExecuteRequest) -> dict[str, object]:
     return {
         "execution": result.demo_execution,
         "risk_preview": result.risk_preview.model_dump(mode="json"),
+        "plan": result.canary_plan,
         "live_execution_blocked": True,
     }
+
+
+@app.post("/demo/canary/preview")
+def demo_canary_preview(request: DemoCanaryPreviewRequest) -> dict[str, object]:
+    """Build a side-effect-free exchange-minimum plan for operator review."""
+
+    _require_demo_canary()
+    snapshot = _fresh_canary_snapshot(request.symbol)
+    buffer_pct = (
+        request.market_price_buffer_pct
+        if request.market_price_buffer_pct is not None
+        else settings.demo_canary_market_price_buffer_pct
+    )
+    try:
+        plan = demo_execution_service.plan_canary_order(
+            request.symbol,
+            request.max_notional_usdt,
+            Decimal(str(snapshot.ask_price)),
+            safety_buffer_pct=buffer_pct,
+        )
+    except (DemoSafetyError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "plan": canary_plan_payload(plan),
+        "side_effects_created": False,
+        "live_execution_blocked": True,
+    }
+
+
+def _fresh_canary_snapshot(symbol: Symbol) -> MarketSnapshot:
+    previous = market_data_service.latest_snapshot(symbol)
+    market_data_service.refresh_all()
+    snapshot = market_data_service.latest_snapshot(symbol)
+    if snapshot is None or snapshot is previous:
+        raise HTTPException(status_code=503, detail="fresh Demo market data is unavailable")
+    age = datetime.now(timezone.utc) - snapshot.timestamp
+    if age > timedelta(seconds=settings.signal_confirmation_window_seconds):
+        raise HTTPException(status_code=503, detail="Demo market data is stale")
+    return snapshot
 
 
 @app.get("/demo/canary/{execution_id}")
@@ -758,6 +805,31 @@ def demo_canary_close(execution_id: str) -> dict[str, object]:
     return {
         "execution": record.model_dump(mode="json"),
         "reduce_only": True,
+        "live_execution_blocked": True,
+    }
+
+
+@app.post("/demo/canary/{execution_id}/failure-cleanup")
+def demo_canary_failure_cleanup(
+    execution_id: str, request: DemoCanaryFailureCleanupRequest
+) -> dict[str, object]:
+    _require_demo_canary()
+    try:
+        record = demo_execution_service.request_canary_failure_cleanup(
+            execution_id, request.reason
+        )
+    except DemoSafetyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Demo canary execution not found")
+    return {
+        "execution": record.model_dump(mode="json"),
+        "functional_result": "FAIL",
+        "safety_cleanup_result": (
+            "PASS"
+            if record.state.value == "DEMO_CLOSED_AFTER_FAILURE"
+            else "IN_PROGRESS"
+        ),
         "live_execution_blocked": True,
     }
 

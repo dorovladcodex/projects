@@ -7,6 +7,7 @@ from threading import RLock
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from app.bybit.market_data import MarketDataService
+from app.bybit.demo import canary_plan_payload
 from app.bybit.private import BybitAccountService
 from app.config import BotMode, ExecutionMode, Settings
 from app.models import (
@@ -695,8 +696,11 @@ class SignalCandidateService:
     def execute_demo_canary(
         self,
         symbol: Symbol,
-        notional_usdt: float,
+        max_notional_usdt: Decimal,
         snapshot: MarketSnapshot,
+        *,
+        expected_rules_fingerprint: str,
+        safety_buffer_pct: Decimal | None = None,
     ) -> SignalDryRunResult:
         """Create one deterministic, durably risk-approved candidate for a Demo canary."""
         if (
@@ -710,11 +714,14 @@ class SignalCandidateService:
         run_id = str(getattr(self.demo_execution, "run_id", ""))
         if not run_id:
             raise ValueError("Demo canary run ID is unavailable")
-        self.demo_execution.validate_canary_notional(
+        plan = self.demo_execution.plan_canary_order(
             symbol,
-            Decimal(str(notional_usdt)),
+            max_notional_usdt,
             Decimal(str(snapshot.ask_price)),
+            safety_buffer_pct=safety_buffer_pct,
         )
+        if plan.rules_fingerprint != expected_rules_fingerprint:
+            raise ValueError("exchange instrument rules changed before submission")
         candidate_id = uuid5(NAMESPACE_URL, f"bybot-demo-canary:{run_id}:{symbol.value}")
         existing = self.repository.get_demo_execution(str(candidate_id))
         if existing is not None:
@@ -796,7 +803,11 @@ class SignalCandidateService:
             created_at=now,
             expires_at=now + timedelta(seconds=self.settings.signal_ttl_seconds),
         )
-        result = SignalDryRunResult(candidate=candidate, risk_preview=SignalRiskPreview())
+        result = SignalDryRunResult(
+            candidate=candidate,
+            risk_preview=SignalRiskPreview(),
+            canary_plan=canary_plan_payload(plan),
+        )
         if not self.repository.save_news(news):
             # A deterministic retry may encounter the already persisted news row.
             if not any(item.id == news.id for item in self.repository.load_news()[0]):
@@ -812,7 +823,7 @@ class SignalCandidateService:
         rules = replace(
             _risk_rules(self.settings),
             max_position_notional_usdt=min(
-                float(notional_usdt), self.settings.max_position_notional_usdt
+                float(max_notional_usdt), self.settings.max_position_notional_usdt
             ),
         )
         signal = TradeSignal(
@@ -858,7 +869,11 @@ class SignalCandidateService:
             result.execution_block_reason = "Demo canary risk decision was not approved"
             return result
         record = self.demo_execution.submit_candidate(
-            candidate, result.risk_preview, classification, snapshot
+            candidate,
+            result.risk_preview,
+            classification,
+            snapshot,
+            canary_plan=plan,
         )
         if record is None:
             result.execution_block_reason = (

@@ -93,26 +93,32 @@ class CandidateLifecycleState(str, Enum):
     PAPER_CLOSED = "PAPER_CLOSED"
     EXECUTION_BLOCKED = "EXECUTION_BLOCKED"
     DEMO_SUBMITTING = "DEMO_SUBMITTING"
+    DEMO_ORDER_ACKNOWLEDGED = "DEMO_ORDER_ACKNOWLEDGED"
     DEMO_ACCEPTED = "DEMO_ACCEPTED"
     DEMO_PARTIALLY_FILLED = "DEMO_PARTIALLY_FILLED"
     DEMO_FILLED = "DEMO_FILLED"
+    DEMO_FULLY_FILLED = "DEMO_FULLY_FILLED"
     DEMO_PROTECTION_PENDING = "DEMO_PROTECTION_PENDING"
     DEMO_POSITION_OPEN = "DEMO_POSITION_OPEN"
     DEMO_CLOSING = "DEMO_CLOSING"
     DEMO_CLOSED = "DEMO_CLOSED"
+    DEMO_CLOSED_AFTER_FAILURE = "DEMO_CLOSED_AFTER_FAILURE"
     DEMO_FAILED = "DEMO_FAILED"
     DEMO_RECONCILIATION_REQUIRED = "DEMO_RECONCILIATION_REQUIRED"
 
 
 class DemoExecutionState(str, Enum):
     DEMO_SUBMITTING = "DEMO_SUBMITTING"
+    DEMO_ORDER_ACKNOWLEDGED = "DEMO_ORDER_ACKNOWLEDGED"
     DEMO_ACCEPTED = "DEMO_ACCEPTED"
     DEMO_PARTIALLY_FILLED = "DEMO_PARTIALLY_FILLED"
     DEMO_FILLED = "DEMO_FILLED"
+    DEMO_FULLY_FILLED = "DEMO_FULLY_FILLED"
     DEMO_PROTECTION_PENDING = "DEMO_PROTECTION_PENDING"
     DEMO_POSITION_OPEN = "DEMO_POSITION_OPEN"
     DEMO_CLOSING = "DEMO_CLOSING"
     DEMO_CLOSED = "DEMO_CLOSED"
+    DEMO_CLOSED_AFTER_FAILURE = "DEMO_CLOSED_AFTER_FAILURE"
     DEMO_FAILED = "DEMO_FAILED"
     DEMO_RECONCILIATION_REQUIRED = "DEMO_RECONCILIATION_REQUIRED"
 
@@ -141,6 +147,7 @@ class DemoExecutionRecord(BaseModel):
     reference_entry_price: Decimal | None = Field(default=None, gt=0)
     accepted_quantity: Decimal = Field(default=Decimal("0"), ge=0)
     average_fill_price: Decimal | None = Field(default=None, gt=0)
+    exchange_order_status: str | None = None
     order_id: str | None = None
     fills: list[DemoFill] = Field(default_factory=list)
     exchange_fees: Decimal = Decimal("0")
@@ -152,11 +159,15 @@ class DemoExecutionRecord(BaseModel):
     close_order_link_id: str | None = None
     close_order_id: str | None = None
     close_fills: list[DemoFill] = Field(default_factory=list)
+    average_close_price: Decimal | None = Field(default=None, gt=0)
     realized_exchange_pnl: Decimal = Decimal("0")
     entry_slippage: Decimal | None = None
     exit_slippage: Decimal | None = None
     paper_shadow_pnl: Decimal | None = None
     close_reason: str | None = None
+    failure_reason: str | None = None
+    cleanup_result: str | None = None
+    last_reconciliation_at: datetime | None = None
     last_error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -306,9 +317,21 @@ class SignalTestFromNewsRequest(BaseModel):
     reprocess: bool = False
 
 
-class DemoCanaryExecuteRequest(BaseModel):
+class DemoCanaryPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     symbol: Symbol = Symbol.BTCUSDT
-    notional_usdt: Decimal = Field(default=Decimal("20"), ge=Decimal("10"), le=Decimal("20"))
+    max_notional_usdt: Decimal = Field(gt=0)
+    market_price_buffer_pct: Decimal | None = Field(default=None, ge=0, le=100)
+
+
+class DemoCanaryExecuteRequest(DemoCanaryPreviewRequest):
+    expected_rules_fingerprint: str = Field(min_length=64, max_length=64)
+
+
+class DemoCanaryFailureCleanupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=1, max_length=250)
 
 
 class TestMarketSnapshotRequest(BaseModel):
@@ -437,6 +460,7 @@ class SignalDryRunResult(BaseModel):
     execution_error_code: str | None = None
     execution_retryable: bool = False
     demo_execution: dict[str, object] | None = None
+    canary_plan: dict[str, str] | None = None
 
 
 class PaperOrder(BaseModel):

@@ -590,18 +590,29 @@ powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_soak.ps1 -Hours 12
 The explicit `-AllowDemoOrders` switch is mandatory. Never point this command
 at mainnet or testnet credentials/domains.
 
-For a single controlled BTCUSDT Demo canary capped at 20 USDT, use:
+For a single controlled BTCUSDT Demo canary with an explicit maximum budget,
+use:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_canary.ps1 -AllowDemoOrders -Symbol BTCUSDT -NotionalUSDT 20
+powershell -ExecutionPolicy Bypass `
+  -File .\scripts\bybit_demo_canary.ps1 `
+  -Symbol BTCUSDT `
+  -MaxNotionalUSDT 75 `
+  -AllowDemoOrders
 ```
 
 The canary uses the normal durable Demo execution service, verifies exchange
 fill and TP/SL, restarts and reconciles FastAPI, then closes via a reduce-only
 Demo order. Omitting `-AllowDemoOrders` performs no setup or exchange action.
-It also fails before persistence/order submission when the selected symbol's
-exchange `minOrderQty` would exceed the 20 USDT cap; use another supported
-symbol only after checking its current Demo instrument rules.
+Immediately before persistence or order submission, the canary reads the
+current instrument rules and price, rounds the minimum valid quantity upward,
+and requires that quantity plus the configured 5% price buffer to fit inside
+`MaxNotionalUSDT`. The maximum is never increased and the script submits the
+calculated minimum quantity, not the full budget.
+After printing that plan, it requires a second typed confirmation for the
+exact calculated Demo quantity before calling the execution endpoint.
+Its JSON report separates normal canary functionality from safety cleanup, so
+a recovered flat account cannot hide a failed fill/open/restart workflow.
 
 ## Repair historical NewsItem payloads
 
