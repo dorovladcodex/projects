@@ -194,3 +194,25 @@ close order history, executions, remote position observations, durable state
 transitions, fees, realized PnL, and separate `functional_result` and
 `safety_cleanup_result`. A functional timeout remains a failure even when the
 idempotent reduce-only safety cleanup successfully leaves the Demo account flat.
+
+## Read-only Demo kill-switch diagnostics
+
+These commands do not start FastAPI and the diagnostics client implements only
+signed GET requests:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\demo_kill_switch_diagnostics.py
+
+# Guard validation only; no database change:
+.\.venv\Scripts\python.exe .\scripts\demo_kill_switch_reset.py `
+  --execution-id 0033f5c9-7b97-4832-92f1-6853e1e4d95f
+
+# Apply only after reviewing a passing dry run:
+.\.venv\Scripts\python.exe .\scripts\demo_kill_switch_reset.py `
+  --execution-id 0033f5c9-7b97-4832-92f1-6853e1e4d95f `
+  --confirm-reset
+```
+
+The reset preserves activation reasons and appends `KILL_SWITCH_RESET`. It
+refuses active positions/orders, unresolved executions, unknown exchange state,
+and daily/weekly/drawdown reasons.

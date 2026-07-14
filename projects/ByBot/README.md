@@ -614,6 +614,15 @@ exact calculated Demo quantity before calling the execution endpoint.
 Its JSON report separates normal canary functionality from safety cleanup, so
 a recovered flat account cannot hide a failed fill/open/restart workflow.
 
+Inspect a Demo kill-switch without enabling Demo trading or starting FastAPI:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\demo_kill_switch_diagnostics.py
+```
+
+See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the guarded dry-run and explicit
+reset commands.
+
 ## Repair historical NewsItem payloads
 
 Apply migrations first, inspect without writes, then apply the transactional

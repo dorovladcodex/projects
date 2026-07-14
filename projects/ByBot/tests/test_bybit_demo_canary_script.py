@@ -117,6 +117,20 @@ def test_demo_canary_reports_functional_and_cleanup_results_separately() -> None
     assert stop_index > finally_index
 
 
+def test_demo_canary_early_failure_report_has_no_side_effect_fields() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    for field in (
+        "started_at", "failure_stage", "failure_reason",
+        "kill_switch_active", "kill_switch_reasons",
+        "no_candidate_created", "no_reservation_created", "no_order_submitted",
+    ):
+        assert field in text
+    assert "$script:NoCandidateCreated = $true" in text
+    assert "$script:NoReservationCreated = $true" in text
+    assert "$script:NoOrderSubmitted = $true" in text
+    assert "if (-not $script:ReportWritten)" in text
+
+
 def test_demo_canary_script_parses_in_windows_powershell() -> None:
     command = (
         "$errors=$null; [void][System.Management.Automation.Language.Parser]::"

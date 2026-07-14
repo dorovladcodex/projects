@@ -18,6 +18,12 @@ $script:FunctionalResult = "FAIL"
 $script:SafetyCleanupResult = "NOT_REQUIRED"
 $script:ExecutionId = $null
 $script:ArtifactDir = $null
+$script:StartedAt = [DateTimeOffset]::UtcNow.ToString("o")
+$script:FailureStage = "startup"
+$script:NoCandidateCreated = $true
+$script:NoReservationCreated = $true
+$script:NoOrderSubmitted = $true
+$script:ReportWritten = $false
 
 function Assert-Condition {
     param([bool]$Condition, [string]$Message)
@@ -192,14 +198,21 @@ function Get-ExecutionStatus {
 }
 
 function Write-CanaryReport {
-    param($Status, [string]$FailureReason = $null)
+    param($Status, [string]$FailureReason = $null, $DemoStatus = $null)
     if (-not $script:ArtifactDir) { return }
     $report = [ordered]@{
         run_id = $script:RunId
+        started_at = $script:StartedAt
         execution_id = $script:ExecutionId
         functional_result = $script:FunctionalResult
         safety_cleanup_result = $script:SafetyCleanupResult
+        failure_stage = $script:FailureStage
         failure_reason = $FailureReason
+        kill_switch_active = if ($DemoStatus) { [bool]$DemoStatus.kill_switch_active } else { $null }
+        kill_switch_reasons = if ($DemoStatus) { @($DemoStatus.kill_switch_reasons) } else { @() }
+        no_candidate_created = $script:NoCandidateCreated
+        no_reservation_created = $script:NoReservationCreated
+        no_order_submitted = $script:NoOrderSubmitted
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
         execution_report = $Status
     }
@@ -208,6 +221,7 @@ function Write-CanaryReport {
         $path, ($report | ConvertTo-Json -Depth 30),
         (New-Object Text.UTF8Encoding($false))
     )
+    $script:ReportWritten = $true
     Write-Host "CANARY REPORT: $path"
 }
 
@@ -321,6 +335,7 @@ try {
     Start-Uvicorn $python $port $stdoutPath $stderrPath
     Wait-ForApi
 
+    $script:FailureStage = "local_preflight"
     $demo = Assert-DemoSafety
     $reconcile = Invoke-Api -Method "POST" -Path "/demo/reconcile"
     Assert-Condition ($reconcile.status -eq "OK") "Demo reconciliation failed"
@@ -333,6 +348,7 @@ try {
 
     # Preview reads current instrument rules and price without creating a
     # candidate, risk decision, execution reservation, or exchange order.
+    $script:FailureStage = "exchange_minimum_preview"
     $preview = Invoke-Api -Method "POST" -Path "/demo/canary/preview" -Body @{
         symbol = $Symbol
         max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
@@ -369,6 +385,7 @@ try {
     # Execute re-reads both instrument rules and price. The preview fingerprint
     # makes any intervening rules change fail closed; quantity is the minimum
     # valid quantity, never the entire maximum budget.
+    $script:FailureStage = "entry_submission"
     $entry = Invoke-Api -Method "POST" -Path "/demo/canary/execute" -Body @{
         symbol = $Symbol
         max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
@@ -376,6 +393,9 @@ try {
     }
     Assert-Condition ($null -ne $entry.execution) "Canary did not return an execution"
     $script:ExecutionId = [string]$entry.execution.id
+    $script:NoCandidateCreated = $false
+    $script:NoReservationCreated = $false
+    $script:NoOrderSubmitted = $false
     $executionId = $script:ExecutionId
     Assert-Condition ([bool]$script:ExecutionId) "Canary execution ID is missing"
     Assert-Condition ([bool]$entry.execution.order_link_id) "orderLinkId is missing"
@@ -401,6 +421,7 @@ try {
     Assert-Condition ($sameOrderLink.Count -eq 1) "orderLinkId is not unique"
     Write-Host "DEMO ORDER ACKNOWLEDGED: PASS"
 
+    $script:FailureStage = "position_open_confirmation"
     $opened = Wait-ForExecutionState -ExecutionId $executionId `
         -States @("DEMO_POSITION_OPEN")
     Assert-Condition ([decimal]$opened.accepted_quantity -gt 0) `
@@ -415,6 +436,7 @@ try {
     Assert-Condition ([decimal]$opened.stop_loss -gt 0) "Stop loss is missing"
     Write-Host "DEMO TP/SL VERIFIED: PASS"
 
+    $script:FailureStage = "restart_reconciliation"
     Stop-Uvicorn
     Start-Uvicorn $python $port $stdoutPath $stderrPath
     Wait-ForApi
@@ -437,6 +459,7 @@ try {
     }
     Write-Host "IDEMPOTENCY: PASS"
 
+    $script:FailureStage = "planned_close"
     $close = Invoke-Api -Method "POST" `
         -Path "/demo/canary/$executionId/close"
     Assert-Condition ($close.reduce_only -eq $true) `
@@ -466,7 +489,9 @@ try {
     Write-Host "LIVE EXECUTION BLOCKED: PASS"
     $script:FunctionalResult = "PASS"
     $script:SafetyCleanupResult = "PASS"
-    Write-CanaryReport -Status (Get-ExecutionStatus -ExecutionId $executionId)
+    $script:FailureStage = $null
+    Write-CanaryReport -Status (Get-ExecutionStatus -ExecutionId $executionId) `
+        -DemoStatus (Invoke-Api -Path "/demo/status")
     Write-Host "CANARY FUNCTIONAL RESULT: PASS"
     Write-Host "SAFETY CLEANUP RESULT: PASS"
     Write-Host "OVERALL: PASS"
@@ -476,6 +501,10 @@ catch {
     $failureReason = Protect-Text $_.Exception.Message
     [Console]::Error.WriteLine($failureReason)
     $cleanupStatus = $null
+    $earlyDemoStatus = $null
+    if ($script:BaseUrl) {
+        try { $earlyDemoStatus = Invoke-Api -Path "/demo/status" } catch { }
+    }
     if ($script:ExecutionId -and $script:BaseUrl) {
         try {
             $persistedReason = if ($failureReason -like "*position*open*timeout*" -or
@@ -508,12 +537,17 @@ catch {
             } else {
                 $script:SafetyCleanupResult = "FAIL"
             }
-            Write-CanaryReport -Status $cleanupStatus -FailureReason $persistedReason
+            Write-CanaryReport -Status $cleanupStatus -FailureReason $persistedReason `
+                -DemoStatus $finalDemo
         }
         catch {
             $script:SafetyCleanupResult = "FAIL"
             Write-Warning (Protect-Text "Safety cleanup failed: $($_.Exception.Message)")
         }
+    }
+    if (-not $script:ReportWritten) {
+        Write-CanaryReport -Status $null -FailureReason $failureReason `
+            -DemoStatus $earlyDemoStatus
     }
     Write-Host "CANARY FUNCTIONAL RESULT: FAIL"
     Write-Host "SAFETY CLEANUP RESULT: $($script:SafetyCleanupResult)"

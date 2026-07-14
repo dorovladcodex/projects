@@ -23,7 +23,7 @@ soak without the user's explicit `-AllowDemoOrders` confirmation.
 - `app/risk/manager.py`: deterministic sizing and risk preview.
 - `app/portfolio/paper_trading.py`: paper positions, accounting, cooldowns, kill switch.
 - `app/db/persistence.py`: SQLAlchemy rows and atomic persistence operations.
-- `alembic/versions/`: migrations; current head is `20260714_0010`.
+- `alembic/versions/`: migrations; current head is `20260714_0011`.
 - `scripts/repair_news_payloads.py`: transactional historical NewsItem audit,
   deterministic repair, and quarantine (`--dry-run` before `--apply`).
 - `tests/`: unit/API tests plus optional PostgreSQL regression tests.
@@ -79,6 +79,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\paper_soak.ps1 -Hours 1
   an explicit `-MaxNotionalUSDT`; it dynamically submits only the exchange
   minimum quantity and also requires
   `-AllowDemoOrders` and Codex must never launch it autonomously.
+- `demo_kill_switch_diagnostics.py`: standalone GET-only Demo/DB diagnostics;
+  it does not load FastAPI settings and has no exchange mutation methods.
+- `demo_kill_switch_reset.py`: dry-run-by-default latch recovery; applying a
+  reset requires the exact terminal execution ID and `--confirm-reset`.
 
 Run targeted tests while editing, the full suite once at the end, then all
 smokes. Preserve unrelated user changes and keep `.env` untracked.

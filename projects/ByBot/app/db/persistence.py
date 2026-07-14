@@ -266,6 +266,19 @@ class DemoKillSwitchRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class DemoKillSwitchEventRow(Base):
+    __tablename__ = "demo_kill_switch_events"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    execution_id: Mapped[str | None] = mapped_column(
+        ForeignKey("demo_executions.id"), nullable=True
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class DemoSoakRunRow(Base):
     __tablename__ = "demo_soak_runs"
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -1512,10 +1525,37 @@ class PersistenceRepository:
                 row = session.get(DemoKillSwitchRow, 1)
                 if row is None:
                     return None
+                events = session.scalars(
+                    select(DemoKillSwitchEventRow).order_by(
+                        DemoKillSwitchEventRow.created_at
+                    )
+                ).all()
+                activation_events = [
+                    event for event in events
+                    if event.event_type in {
+                        "KILL_SWITCH_ACTIVATED", "LEGACY_ACTIVATION"
+                    }
+                ]
                 return {
                     "active": row.active,
                     "reasons": list(row.reasons),
                     "updated_at": row.updated_at,
+                    "activated_at": (
+                        activation_events[-1].created_at
+                        if activation_events else row.updated_at
+                    ),
+                    "activation_count": len(activation_events) or int(row.active),
+                    "events": [
+                        {
+                            "id": event.id,
+                            "event_type": event.event_type,
+                            "active": event.active,
+                            "reasons": list(event.reasons),
+                            "execution_id": event.execution_id,
+                            "created_at": event.created_at,
+                        }
+                        for event in events
+                    ],
                 }
         except SQLAlchemyError as exc:
             self._failed(exc)
@@ -1525,12 +1565,55 @@ class PersistenceRepository:
         if not self.available:
             return False
         try:
-            with Session(self.engine) as session:
+            with Session(self.engine) as session, session.begin():
+                now = datetime.now(timezone.utc)
+                existing = session.get(DemoKillSwitchRow, 1)
+                old_active = bool(existing.active) if existing else False
+                old_reasons = list(existing.reasons) if existing else []
                 session.merge(DemoKillSwitchRow(
-                    id=1, active=active, reasons=list(reasons),
-                    updated_at=datetime.now(timezone.utc),
+                    id=1, active=active, reasons=list(reasons), updated_at=now,
                 ))
-                session.commit()
+                event_type = None
+                if active and not old_active:
+                    event_type = "KILL_SWITCH_ACTIVATED"
+                elif active and list(reasons) != old_reasons:
+                    event_type = "KILL_SWITCH_REASON_ADDED"
+                elif not active and old_active:
+                    event_type = "KILL_SWITCH_CLEARED"
+                if event_type:
+                    session.add(DemoKillSwitchEventRow(
+                        id=str(uuid4()), event_type=event_type, active=active,
+                        reasons=list(reasons), execution_id=None,
+                        payload={}, created_at=now,
+                    ))
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def reset_demo_kill_switch(
+        self, execution_id: str, *, reason: str
+    ) -> bool:
+        """Clear only the Demo latch and preserve an immutable audit event."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(DemoKillSwitchRow, 1)
+                execution = session.get(DemoExecutionRow, execution_id)
+                if row is None or not row.active or execution is None:
+                    return False
+                now = datetime.now(timezone.utc)
+                preserved_reasons = list(row.reasons)
+                row.active = False
+                row.updated_at = now
+                session.add(DemoKillSwitchEventRow(
+                    id=str(uuid4()), event_type="KILL_SWITCH_RESET",
+                    active=False, reasons=preserved_reasons,
+                    execution_id=execution_id,
+                    payload={"reset_reason": reason[:250]}, created_at=now,
+                ))
+                session.flush()
             return True
         except SQLAlchemyError as exc:
             self._failed(exc)
