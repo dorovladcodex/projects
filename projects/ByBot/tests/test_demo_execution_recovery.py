@@ -7,19 +7,20 @@ from app.bybit.demo_execution_recovery import (
     apply_demo_execution_repair,
     diagnose_demo_execution,
 )
-from app.models import DemoExecutionRecord, DemoExecutionState, Side, Symbol
+from app.models import DemoExecutionRecord, DemoExecutionState, DemoFill, Side, Symbol
 from tests.test_bybit_demo_execution import candidate_bundle
 
 
 class Repo:
     available = True
 
-    def __init__(self, record):
+    def __init__(self, record, others=None):
         self.record = record
+        self.others = list(others or [])
         self.repaired = None
 
     def load_demo_executions(self):
-        return [self.record]
+        return [self.record, *self.others]
 
     def load_demo_execution_events(self, execution_id):
         return []
@@ -155,3 +156,42 @@ def test_remote_exposure_blocks_flat_repair() -> None:
     )
     assert diagnosis.proposed_state is None
     assert "remote position is not flat" in diagnosis.blockers
+
+
+def test_historical_close_before_entry_is_rejected_and_real_close_is_used() -> None:
+    item = record().model_copy(update={
+        "close_order_id": "historical-close",
+        "close_fills": [DemoFill(
+            execution_id="historical-exec", order_id="historical-close",
+            quantity=Decimal("0.001"), price=Decimal("90"), fee=Decimal("0.01"),
+            executed_at=datetime.fromtimestamp(0.5, tz=timezone.utc),
+        )],
+    })
+
+    class TemporalClient(ReadClient):
+        def get_order_history(self, symbol):
+            rows = super().get_order_history(symbol)
+            rows.append({
+                "orderId": "historical-close", "orderLinkId": "",
+                "orderStatus": "Filled", "side": "Sell", "qty": "0.001",
+                "cumExecQty": "0.001", "avgPrice": "90", "reduceOnly": True,
+                "createdTime": "500", "updatedTime": "500",
+            })
+            return rows
+
+        def get_executions(self, symbol):
+            rows = super().get_executions(symbol)
+            rows.append({
+                "execId": "historical-exec", "orderId": "historical-close",
+                "side": "Sell", "execQty": "0.001", "execPrice": "90",
+                "execFee": "0.01", "execTime": "500",
+            })
+            return rows
+
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=Repo(item), client=TemporalClient()
+    )
+    assert diagnosis.rejected_close_order_ids == ["historical-close"]
+    assert diagnosis.rejected_close_execution_ids == ["historical-exec"]
+    assert diagnosis.close_executions[0]["execId"] == "close-fill"
+    assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY

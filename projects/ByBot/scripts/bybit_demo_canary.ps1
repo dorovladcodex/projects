@@ -188,13 +188,13 @@ function Get-RunExecutions {
 
 function Get-Execution {
     param([string]$ExecutionId)
-    $response = Invoke-Api -Path "/demo/canary/$ExecutionId"
+    $response = Invoke-Api -Path "/demo/canary/$ExecutionId" -TimeoutSec 3
     return $response.execution
 }
 
 function Get-ExecutionStatus {
     param([string]$ExecutionId)
-    return Invoke-Api -Path "/demo/canary/$ExecutionId"
+    return Invoke-Api -Path "/demo/canary/$ExecutionId" -TimeoutSec 3
 }
 
 function Write-CanaryReport {
@@ -229,8 +229,18 @@ function Wait-ForExecutionState {
     param([string]$ExecutionId, [string[]]$States, [int]$TimeoutSeconds = 120)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        $null = Invoke-Api -Method "POST" -Path "/demo/reconcile"
-        $execution = Get-Execution -ExecutionId $ExecutionId
+        $execution = $null
+        try {
+            $execution = Get-Execution -ExecutionId $ExecutionId
+        }
+        catch {
+            if ($script:Child -and $script:Child.HasExited) {
+                throw "FastAPI exited while polling Demo execution"
+            }
+            try { $null = Invoke-Api -Path "/health" -TimeoutSec 2 } catch { }
+            Start-Sleep -Seconds 2
+            continue
+        }
         if ($null -ne $execution -and $States -contains [string]$execution.state) {
             return $execution
         }
@@ -552,17 +562,26 @@ catch {
             if ($cleanupStatus -and @($cleanupStatus.execution.fills).Count -gt 0) {
                 Write-Host "DEMO ENTRY FILL CONFIRMED DURING CLEANUP: PASS"
             }
-            if ($cleanupStatus -and @($cleanupStatus.execution.close_fills).Count -gt 0) {
-                Write-Host "DEMO REDUCE-ONLY CLEANUP CLOSE: PASS"
-            }
             $finalDemo = Invoke-Api -Path "/demo/status"
-            if ($cleanupStatus.execution.state -eq "DEMO_CLOSED_AFTER_FAILURE" -and
+            $ownCloseFilled = $cleanupStatus -and
+                [bool]$cleanupStatus.execution.close_order_id -and
+                @($cleanupStatus.execution.close_fills | Where-Object {
+                    $_.order_id -eq $cleanupStatus.execution.close_order_id
+                }).Count -gt 0
+            $terminalCleanup = $cleanupStatus.execution.state -in @(
+                "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE",
+                "DEMO_CLOSED_AFTER_INTERRUPTION", "DEMO_CLOSED_EXTERNALLY",
+                "DEMO_FAILED_FLAT_VERIFIED"
+            )
+            if ($ownCloseFilled -and $terminalCleanup -and
                 [int]$finalDemo.bot_owned_open_positions -eq 0 -and
                 [int]$finalDemo.bot_owned_open_orders -eq 0) {
                 $script:SafetyCleanupResult = "PASS"
+                Write-Host "DEMO REDUCE-ONLY CLEANUP CLOSE: PASS"
                 Write-Host "FINAL DEMO STATE FLAT: PASS"
             } else {
-                $script:SafetyCleanupResult = "FAIL"
+                $script:SafetyCleanupResult = "IN_PROGRESS"
+                Write-Host "DEMO REDUCE-ONLY CLEANUP CLOSE: IN_PROGRESS"
             }
             Write-CanaryReport -Status $cleanupStatus -FailureReason $persistedReason `
                 -DemoStatus $finalDemo

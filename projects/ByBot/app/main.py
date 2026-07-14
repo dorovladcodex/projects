@@ -844,8 +844,7 @@ def _fresh_canary_snapshot(symbol: Symbol) -> MarketSnapshot:
 @app.get("/demo/canary/{execution_id}")
 def demo_canary_status(execution_id: str) -> dict[str, object]:
     _require_demo_canary()
-    demo_execution_service.reconcile()
-    status = demo_execution_service.canary_execution_status(execution_id)
+    status = demo_execution_service.canary_cached_status(execution_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Demo canary execution not found")
     return {**status, "live_execution_blocked": True}
@@ -896,7 +895,11 @@ def demo_canary_failure_cleanup(
 def demo_reconcile() -> dict[str, object]:
     if settings.execution_mode != ExecutionMode.BYBIT_DEMO:
         raise HTTPException(status_code=404, detail="Demo execution is disabled")
-    return demo_execution_service.reconcile()
+    demo_execution_service.reconciliation_in_progress = True
+    try:
+        return demo_execution_service.reconcile()
+    finally:
+        demo_execution_service.reconciliation_in_progress = False
 
 
 @app.post("/demo/cleanup")
@@ -941,5 +944,9 @@ async def demo_private_stream_loop() -> None:
 async def demo_reconciliation_loop() -> None:
     while True:
         await asyncio.sleep(settings.demo_reconciliation_interval_seconds)
-        await asyncio.to_thread(demo_execution_service.reconcile)
+        demo_execution_service.reconciliation_in_progress = True
+        try:
+            await asyncio.to_thread(demo_execution_service.reconcile)
+        finally:
+            demo_execution_service.reconciliation_in_progress = False
         signal_candidate_service.sync_demo_states()

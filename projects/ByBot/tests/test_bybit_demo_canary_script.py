@@ -117,6 +117,29 @@ def test_demo_canary_reports_functional_and_cleanup_results_separately() -> None
     assert stop_index > finally_index
 
 
+def test_demo_canary_retries_transient_short_poll_timeouts() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'TimeoutSec 3' in text
+    wait_start = text.index("function Wait-ForExecutionState")
+    wait_end = text.index("\nfunction ", wait_start + 1)
+    wait_body = text[wait_start:wait_end]
+    assert 'Invoke-Api -Path "/health" -TimeoutSec 2' in wait_body
+    assert "continue" in wait_body
+    assert "FastAPI exited while polling" in wait_body
+
+
+def test_demo_canary_cleanup_pass_requires_authoritative_flat_terminal_state() -> None:
+    text = SCRIPT.read_text(encoding="utf-8")
+    cleanup_index = text.index("DEMO REDUCE-ONLY CLEANUP CLOSE: PASS")
+    condition_index = text.rfind("$ownCloseFilled", 0, cleanup_index)
+    report_pass_index = text.find('$script:SafetyCleanupResult = "PASS"', cleanup_index)
+    assert condition_index >= 0
+    assert "$terminalCleanup" in text[condition_index:cleanup_index]
+    assert "bot_owned_open_positions" in text[condition_index:cleanup_index]
+    assert "bot_owned_open_orders" in text[condition_index:cleanup_index]
+    assert report_pass_index > cleanup_index
+
+
 def test_demo_canary_early_failure_report_has_no_side_effect_fields() -> None:
     text = SCRIPT.read_text(encoding="utf-8")
     for field in (

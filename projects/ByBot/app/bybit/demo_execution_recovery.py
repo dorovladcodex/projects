@@ -41,6 +41,8 @@ class DemoExecutionDiagnosis:
     close_fees: Decimal
     close_source: str | None
     repeated_remote_flat: bool
+    rejected_close_order_ids: list[str]
+    rejected_close_execution_ids: list[str]
 
     @property
     def repairable(self) -> bool:
@@ -59,8 +61,9 @@ def diagnose_demo_execution(
     repo = repository or PersistenceRepository(config.database_url, create_schema=False)
     if not repo.available:
         raise DemoDiagnosticsError("database persistence is unavailable")
+    all_records = repo.load_demo_executions()
     record = next(
-        (item for item in repo.load_demo_executions() if str(item.id) == execution_id),
+        (item for item in all_records if str(item.id) == execution_id),
         None,
     )
     if record is None:
@@ -83,7 +86,7 @@ def diagnose_demo_execution(
         item for item in history
         if _matches(item, record.order_id, record.order_link_id)
     ]
-    close_history = [
+    raw_close_history = [
         item for item in history
         if _matches(item, record.close_order_id, record.close_order_link_id)
     ]
@@ -91,7 +94,7 @@ def diagnose_demo_execution(
         item for item in executions
         if _matches(item, record.order_id, record.order_link_id)
     ]
-    close_fills = [
+    raw_close_fills = [
         item for item in executions
         if _matches(item, record.close_order_id, record.close_order_link_id)
     ]
@@ -102,6 +105,49 @@ def diagnose_demo_execution(
         (int(str(item.get("execTime") or "0")) for item in entry_fills),
         default=0,
     )
+    used_order_ids = {
+        value
+        for other in all_records if str(other.id) != execution_id
+        for value in [
+            other.order_id, other.close_order_id,
+            *(fill.order_id for fill in [*other.fills, *other.close_fills]),
+        ]
+        if value
+    }
+    used_exec_ids = {
+        fill.execution_id
+        for other in all_records if str(other.id) != execution_id
+        for fill in [*other.fills, *other.close_fills]
+    }
+    position_watermark = max(
+        (int(str(item.get("updatedTime") or "0")) for item in positions),
+        default=0,
+    )
+    close_history = [
+        item for item in raw_close_history
+        if _valid_close_order(
+            item, entry_time, entry_qty_for_match, used_order_ids,
+            position_watermark,
+        )
+    ]
+    allowed_close_order_ids = {
+        str(item.get("orderId") or "") for item in close_history
+    }
+    close_fills = [
+        item for item in raw_close_fills
+        if _valid_close_execution(
+            item, entry_time, entry_qty_for_match, used_exec_ids,
+            allowed_close_order_ids, position_watermark,
+        )
+    ]
+    rejected_close_order_ids = [
+        str(item.get("orderId") or "") for item in raw_close_history
+        if item not in close_history and item.get("orderId")
+    ]
+    rejected_close_execution_ids = [
+        str(item.get("execId") or "") for item in raw_close_fills
+        if item not in close_fills and item.get("execId")
+    ]
     transaction_log = [
         item for item in transaction_log
         if int(str(item.get("transactionTime") or item.get("createdTime") or "0"))
@@ -117,8 +163,12 @@ def diagnose_demo_execution(
         and str(item.get("side") or "").lower() == expected_close_side
         and str(item.get("orderStatus") or "") == "Filled"
         and str(item.get("reduceOnly") or "").lower() == "true"
-        and _decimal(item.get("cumExecQty") or item.get("qty"))
-        == entry_qty_for_match
+        and Decimal("0") < _decimal(item.get("cumExecQty") or item.get("qty"))
+        <= entry_qty_for_match
+        and str(item.get("orderId") or "") not in used_order_ids
+        and (not position_watermark or int(str(
+            item.get("updatedTime") or item.get("createdTime") or "0"
+        )) <= position_watermark)
     ]
     external_ids = {
         str(item.get("orderId") or "") for item in external_close_orders
@@ -127,6 +177,8 @@ def diagnose_demo_execution(
         item for item in executions
         if str(item.get("orderId") or "") in external_ids
         and str(item.get("side") or "").lower() == expected_close_side
+        and str(item.get("execId") or "") not in used_exec_ids
+        and int(str(item.get("execTime") or "0")) >= entry_time
     ]
     external_closed_pnl = [
         item for item in closed_pnl
@@ -260,6 +312,8 @@ def diagnose_demo_execution(
         close_fees=close_fees,
         close_source=close_source,
         repeated_remote_flat=repeated_remote_flat,
+        rejected_close_order_ids=rejected_close_order_ids,
+        rejected_close_execution_ids=rejected_close_execution_ids,
     )
 
 
@@ -329,8 +383,14 @@ def apply_demo_execution_repair(
         ],
         "final_position": _json_safe(diagnosis.remote_positions),
         "final_open_order_count": len(diagnosis.remote_open_orders),
+        "close_source": diagnosis.close_source,
+        "rejected_close_order_ids": diagnosis.rejected_close_order_ids,
+        "rejected_close_execution_ids": diagnosis.rejected_close_execution_ids,
     }
-    event_types = [
+    event_types = []
+    if diagnosis.rejected_close_order_ids or diagnosis.rejected_close_execution_ids:
+        event_types.append("HISTORICAL_CLOSE_ATTRIBUTION_REJECTED")
+    event_types += [
         "REMOTE_POSITION_FLAT_VERIFIED",
         "CLOSE_ATTRIBUTION_UNAVAILABLE",
         "EXECUTION_FINALIZED_FLAT_VERIFIED",
@@ -360,10 +420,10 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
             str(diagnosis.entry_order_history[0].get("orderId") or "")
             if diagnosis.entry_order_history else None
         ),
-        "close_order_id": record.close_order_id or (
+        "close_order_id": (
             str(diagnosis.close_order_history[0].get("orderId") or "")
             if diagnosis.close_order_history else None
-        ),
+        ) or record.close_order_id,
         "durable_state": record.state.value,
         "durable_transitions": diagnosis.durable_events,
         "quantity_requested": str(record.requested_quantity),
@@ -374,6 +434,8 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
         "close_fees": str(diagnosis.close_fees),
         "close_source": diagnosis.close_source,
         "repeated_remote_flat": diagnosis.repeated_remote_flat,
+        "rejected_close_order_ids": diagnosis.rejected_close_order_ids,
+        "rejected_close_execution_ids": diagnosis.rejected_close_execution_ids,
         "gross_realized_pnl": str(diagnosis.gross_realized_pnl),
         "net_realized_pnl": str(diagnosis.net_realized_pnl),
         "tp_sl_attempts": [event for event in diagnosis.durable_events if event["event_type"] in {"PROTECTION_PENDING", "DEMO_POSITION_OPEN"}],
@@ -397,6 +459,37 @@ def _matches(item: dict[str, Any], order_id: str | None, link_id: str | None) ->
     return bool(
         (order_id and str(item.get("orderId") or "") == order_id)
         or (link_id and str(item.get("orderLinkId") or "") == link_id)
+    )
+
+
+def _valid_close_order(
+    item: dict[str, Any], entry_time: int, owned_quantity: Decimal,
+    used_order_ids: set[str], position_watermark: int,
+) -> bool:
+    timestamp = int(str(item.get("updatedTime") or item.get("createdTime") or "0"))
+    quantity = _decimal(item.get("cumExecQty") or item.get("qty"))
+    return bool(
+        entry_time and timestamp >= entry_time
+        and (not position_watermark or timestamp <= position_watermark)
+        and str(item.get("orderId") or "") not in used_order_ids
+        and str(item.get("reduceOnly") or "").lower() == "true"
+        and Decimal("0") < quantity <= owned_quantity
+    )
+
+
+def _valid_close_execution(
+    item: dict[str, Any], entry_time: int, owned_quantity: Decimal,
+    used_exec_ids: set[str], allowed_order_ids: set[str],
+    position_watermark: int,
+) -> bool:
+    timestamp = int(str(item.get("execTime") or "0"))
+    quantity = _decimal(item.get("execQty"))
+    return bool(
+        entry_time and timestamp >= entry_time
+        and (not position_watermark or timestamp <= position_watermark)
+        and str(item.get("execId") or "") not in used_exec_ids
+        and str(item.get("orderId") or "") in allowed_order_ids
+        and Decimal("0") < quantity <= owned_quantity
     )
 
 

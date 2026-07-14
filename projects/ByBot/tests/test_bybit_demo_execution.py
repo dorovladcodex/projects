@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+import time
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
@@ -420,6 +421,91 @@ def test_demo_startup_allows_known_persisted_bot_order() -> None:
     restarted = service(client, repo)
     assert restarted.verify_account_and_environment() is True
     assert restarted.as_status()["open_orders_by_symbol"]["BTCUSDT"] == 1
+
+
+def _protected_restart_fixture():
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, _, _, _ = candidate_bundle()
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=1, run_id=demo.run_id,
+        order_link_id="entry-link", order_id="entry-id",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("65000"), take_profit=Decimal("65650"),
+        stop_loss=Decimal("64675"), protection_confirmed=True,
+    )
+    repo.records[str(candidate.id)] = record
+    client.positions = [
+        {
+            "symbol": "BTCUSDT", "size": "0.001", "side": "Buy",
+            "takeProfit": "65650", "stopLoss": "64675", "leverage": "1",
+            "positionIdx": 0,
+        },
+        {
+            "symbol": "ETHUSDT", "size": "0", "side": "", "leverage": "1",
+            "positionIdx": 0,
+        },
+    ]
+    client.open_orders = [
+        {
+            "symbol": "BTCUSDT", "orderId": "tp", "orderLinkId": "",
+            "side": "Sell", "qty": "0.001", "reduceOnly": True,
+            "closeOnTrigger": True, "stopOrderType": "TakeProfit",
+            "triggerPrice": "65650",
+        },
+        {
+            "symbol": "BTCUSDT", "orderId": "sl", "orderLinkId": "",
+            "side": "Sell", "qty": "0.001", "reduceOnly": True,
+            "closeOnTrigger": True, "stopOrderType": "StopLoss",
+            "triggerPrice": "64675",
+        },
+    ]
+    return demo, repo, client, record
+
+
+def test_restart_accepts_bybit_protection_with_empty_order_link_id() -> None:
+    demo, _, client, record = _protected_restart_fixture()
+
+    assert demo.verify_account_and_environment() is True
+    assert demo.kill_switch_active is False
+    assert record.state == DemoExecutionState.DEMO_POSITION_OPEN
+    assert client.orders == []
+
+
+def test_restart_with_protection_still_blocks_unrelated_manual_order() -> None:
+    demo, _, client, _ = _protected_restart_fixture()
+    client.open_orders.append({
+        "symbol": "BTCUSDT", "orderId": "manual", "orderLinkId": "manual",
+        "side": "Sell", "qty": "0.001", "reduceOnly": False,
+        "closeOnTrigger": False, "stopOrderType": "", "triggerPrice": "",
+    })
+
+    with pytest.raises(DemoSafetyError, match="unrelated active Demo order"):
+        demo.verify_account_and_environment()
+    assert demo.kill_switch_active is True
+    assert client.orders == []
+
+
+def test_restart_reconciliation_keeps_protected_state_monotonic() -> None:
+    demo, repo, client, record = _protected_restart_fixture()
+    client.history = [{
+        "symbol": "BTCUSDT", "orderId": record.order_id,
+        "orderLinkId": record.order_link_id, "orderStatus": "Filled",
+        "cumExecQty": "0.001", "avgPrice": "65000",
+    }]
+
+    assert demo.verify_account_and_environment() is True
+    demo.reconcile()
+
+    saved = repo.get_demo_execution(str(record.candidate_id))
+    assert saved.state == DemoExecutionState.DEMO_POSITION_OPEN
+    assert saved.protection_confirmed is True
+    assert not any(
+        state in {"DEMO_FULLY_FILLED", "DEMO_PROTECTION_PENDING"}
+        for _, state in repo.saved_events[-3:]
+    )
 
 
 def test_demo_startup_rejects_unattributed_active_order() -> None:
@@ -1301,6 +1387,80 @@ def test_entry_replay_after_close_started_cannot_regress_state() -> None:
 
     assert record.state == DemoExecutionState.DEMO_CLOSING
     assert record.close_order_link_id == "bybot-close-existing"
+
+
+def test_close_attribution_rejects_pre_entry_and_globally_used_identity() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, _, _, _ = candidate_bundle()
+    entry_at = datetime.now(timezone.utc)
+    current = DemoExecutionRecord(
+        candidate_id=candidate.id, run_id=demo.run_id, order_link_id="new-entry",
+        state=DemoExecutionState.DEMO_POSITION_OPEN, symbol=Symbol.BTCUSDT,
+        side=Side.BUY, requested_quantity=Decimal("0.001"),
+        accepted_quantity=Decimal("0.001"), average_fill_price=Decimal("100"),
+        fills=[DemoFill(
+            execution_id="new-entry-exec", order_id="new-entry-order",
+            quantity=Decimal("0.001"), price=Decimal("100"),
+            executed_at=entry_at,
+        )],
+    )
+    old = current.model_copy(deep=True, update={
+        "id": uuid4(), "candidate_id": uuid4(), "order_link_id": "old-entry",
+        "state": DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+        "close_order_id": "used-close",
+        "close_fills": [DemoFill(
+            execution_id="used-exec", order_id="used-close",
+            quantity=Decimal("0.001"), price=Decimal("101"),
+            executed_at=entry_at + timedelta(seconds=1),
+        )],
+    })
+    repo.records = {
+        str(current.candidate_id): current,
+        str(old.candidate_id): old,
+    }
+
+    before_entry = {
+        "symbol": "BTCUSDT", "side": "Sell", "orderId": "historical",
+        "execId": "historical-exec", "execQty": "0.001", "reduceOnly": True,
+        "execTime": str(int(entry_at.timestamp() * 1000) - 1),
+    }
+    already_used = {
+        "symbol": "BTCUSDT", "side": "Sell", "orderId": "used-close",
+        "execId": "used-exec", "execQty": "0.001", "reduceOnly": True,
+        "execTime": str(int(entry_at.timestamp() * 1000) + 1000),
+    }
+    valid = {
+        "symbol": "BTCUSDT", "side": "Sell", "orderId": "new-close",
+        "execId": "new-close-exec", "execQty": "0.001", "reduceOnly": True,
+        "execTime": str(int(entry_at.timestamp() * 1000) + 2000),
+    }
+
+    assert demo._attributable_close_record(before_entry) is None
+    assert demo._attributable_close_record(already_used) is None
+    assert demo._attributable_close_record(valid).id == current.id
+
+
+def test_cached_canary_polling_performs_no_exchange_io() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, _, _, _ = candidate_bundle()
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, run_id=demo.run_id, order_link_id="entry",
+        state=DemoExecutionState.DEMO_POSITION_OPEN, symbol=Symbol.BTCUSDT,
+        side=Side.BUY, requested_quantity=Decimal("0.001"),
+    )
+    repo.records[str(candidate.id)] = record
+    client.get_positions = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("polling performed exchange I/O")
+    )
+
+    started = time.perf_counter()
+    payload = demo.canary_cached_status(str(record.id))
+
+    assert time.perf_counter() - started < 0.1
+    assert payload["execution"]["id"] == str(record.id)
+    assert payload["durable_cached_state"] is True
 
 
 def test_zero_position_before_protection_never_calls_trading_stop() -> None:

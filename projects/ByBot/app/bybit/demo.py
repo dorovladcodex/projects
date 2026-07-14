@@ -661,6 +661,7 @@ class DemoExecutionService:
         self.leverage_normalized = False
         self.account_margin_mode: str | None = None
         self.last_reconciliation_at: datetime | None = None
+        self.reconciliation_in_progress = False
         self._last_reconcile_monotonic: float | None = None
         self._discard_ws_before_ms: int | None = None
         self.sleep_resume_reconciliations = 0
@@ -1053,6 +1054,7 @@ class DemoExecutionService:
         """Reconcile one execution from all authoritative symbol-scoped REST data."""
         if self.client is None:
             return record
+        starting_fingerprint = _execution_material_fingerprint(record)
         realtime = self.client.get_open_orders(symbol=record.symbol)
         history = self.client.get_order_history(symbol=record.symbol)
         executions = self.client.get_executions(symbol=record.symbol)
@@ -1120,7 +1122,8 @@ class DemoExecutionService:
                 self._install_protection(record)
         record.last_reconciliation_at = datetime.now(timezone.utc)
         record.updated_at = record.last_reconciliation_at
-        self.repository.save_demo_execution(record, event_type="REST_ORDER_RECONCILED")
+        if _execution_material_fingerprint(record) != starting_fingerprint:
+            self.repository.save_demo_execution(record, event_type="REST_ORDER_RECONCILED")
         return record
 
     def reconcile(self) -> dict[str, Any]:
@@ -1198,7 +1201,14 @@ class DemoExecutionService:
             if record:
                 self._apply_fill(record, execution)
             else:
-                close_record = self._attributable_close_record(execution, local)
+                order_meta = next((
+                    order for order in history
+                    if str(order.get("orderId") or "")
+                    == str(execution.get("orderId") or "")
+                ), {})
+                close_record = self._attributable_close_record(
+                    {**order_meta, **execution}, local
+                )
                 if close_record:
                     self._apply_fill(close_record, execution, force_close=True)
         now = datetime.now(timezone.utc)
@@ -1451,6 +1461,25 @@ class DemoExecutionService:
             ),
         }
 
+    def canary_cached_status(self, execution_id: str) -> dict[str, Any] | None:
+        """Fast durable-only polling view; never performs exchange I/O."""
+        record = next((
+            item for item in self.repository.load_demo_executions()
+            if str(item.id) == execution_id and item.run_id == self.run_id
+        ), None)
+        if record is None:
+            return None
+        return {
+            "execution": record.model_dump(mode="json"),
+            "last_reconciliation_at": (
+                (self.last_reconciliation_at or record.last_reconciliation_at).isoformat()
+                if (self.last_reconciliation_at or record.last_reconciliation_at) else None
+            ),
+            "reconciliation_in_progress": self.reconciliation_in_progress,
+            "remote_position": None,
+            "durable_cached_state": True,
+        }
+
     def request_canary_failure_cleanup(
         self, execution_id: str, reason: str
     ) -> DemoExecutionRecord | None:
@@ -1625,8 +1654,16 @@ class DemoExecutionService:
             or (record.close_order_link_id and order_link == record.close_order_link_id)
         )
         if is_close:
+            if _exchange_event_time_ms(item) < _record_entry_time_ms(record):
+                return
             if order_id and not record.close_order_id:
                 record.close_order_id = order_id
+            if (
+                status == "Filled"
+                and record.state == DemoExecutionState.DEMO_CLOSING
+                and record.close_order_id == order_id
+            ):
+                return
             if status == "Filled" and record.state not in TERMINAL_DEMO_STATES:
                 record.state = DemoExecutionState.DEMO_CLOSING
             elif status in {"Rejected", "Cancelled", "Deactivated"}:
@@ -1743,6 +1780,14 @@ class DemoExecutionService:
             )
         )
         if is_close_fill:
+            all_records = self.repository.load_demo_executions()
+            if (
+                int(fill.executed_at.timestamp() * 1000) < _record_entry_time_ms(record)
+                or _exchange_identity_used_by_other(
+                    all_records, record, fill.order_id, fill.execution_id
+                )
+            ):
+                return
             if fill.order_id and not record.close_order_id:
                 record.close_order_id = fill.order_id
             record.close_fills.append(fill)
@@ -2035,8 +2080,18 @@ class DemoExecutionService:
     ) -> DemoExecutionRecord | None:
         symbol = str(item.get("symbol") or "")
         side = str(item.get("side") or "").upper()
+        all_records = records or self.repository.load_demo_executions()
+        order_id = str(item.get("orderId") or "")
+        exec_id = str(item.get("execId") or "")
+        item_time = _exchange_event_time_ms(item)
+        quantity = _decimal(
+            item.get("execQty") or item.get("cumExecQty") or item.get("qty"),
+            default="0",
+        )
+        if str(item.get("reduceOnly") or "").lower() != "true":
+            return None
         candidates = [
-            record for record in (records or self.repository.load_demo_executions())
+            record for record in all_records
             if record.symbol.value == symbol
             and record.state in {
                 DemoExecutionState.DEMO_POSITION_OPEN,
@@ -2047,6 +2102,12 @@ class DemoExecutionService:
                 not side
                 or (record.side == Side.BUY and side == "SELL")
                 or (record.side == Side.SELL and side == "BUY")
+            )
+            and item_time >= _record_entry_time_ms(record)
+            and quantity > 0
+            and quantity <= record.accepted_quantity
+            and not _exchange_identity_used_by_other(
+                all_records, record, order_id, exec_id
             )
         ]
         return candidates[0] if len(candidates) == 1 else None
@@ -2190,6 +2251,58 @@ def _event_timestamp_ms(
     return max(parsed) if parsed else None
 
 
+def _exchange_event_time_ms(item: dict[str, Any]) -> int:
+    for field in ("execTime", "updatedTime", "createdTime", "creationTime"):
+        value = item.get(field)
+        if value not in (None, ""):
+            try:
+                return int(str(value))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
+def _record_entry_time_ms(record: DemoExecutionRecord) -> int:
+    if record.fills:
+        return min(int(_aware(fill.executed_at).timestamp() * 1000) for fill in record.fills)
+    return int(_aware(record.created_at).timestamp() * 1000)
+
+
+def _exchange_identity_used_by_other(
+    records: list[DemoExecutionRecord],
+    owner: DemoExecutionRecord,
+    order_id: str,
+    execution_id: str,
+) -> bool:
+    for record in records:
+        if record.id == owner.id:
+            continue
+        if order_id and order_id in {record.order_id, record.close_order_id}:
+            return True
+        for fill in [*record.fills, *record.close_fills]:
+            if execution_id and fill.execution_id == execution_id:
+                return True
+            if order_id and fill.order_id == order_id:
+                return True
+    return False
+
+
+def _execution_material_fingerprint(record: DemoExecutionRecord) -> tuple[Any, ...]:
+    return (
+        record.state.value,
+        record.order_id,
+        record.close_order_id,
+        record.close_order_link_id,
+        str(record.accepted_quantity),
+        str(record.average_fill_price),
+        str(record.average_close_price),
+        str(record.realized_exchange_pnl),
+        record.protection_confirmed,
+        tuple(fill.execution_id for fill in record.fills),
+        tuple(fill.execution_id for fill in record.close_fills),
+    )
+
+
 def _protection_present(position: dict[str, Any]) -> bool:
     return _decimal(position.get("takeProfit"), default="0") > 0 and _decimal(
         position.get("stopLoss"), default="0"
@@ -2231,6 +2344,8 @@ def _is_owned_bybit_protection_order(
         item for item in positions
         if str(item.get("symbol") or "") == execution.symbol.value
         and _decimal(item.get("size"), default="0") == execution.accepted_quantity
+        and str(item.get("side") or "").upper()
+        == ("BUY" if execution.side == Side.BUY else "SELL")
     ), None)
     if position is None or execution.take_profit is None or execution.stop_loss is None:
         return False

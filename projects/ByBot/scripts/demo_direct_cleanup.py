@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -37,6 +39,28 @@ def main() -> int:
         record = service.direct_cleanup_execution(
             args.execution_id, "FastAPI restart failed; direct guarded cleanup"
         )
+        deadline = time.monotonic() + 60
+        terminal = {
+            "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE",
+            "DEMO_CLOSED_AFTER_INTERRUPTION", "DEMO_CLOSED_EXTERNALLY",
+            "DEMO_FAILED_FLAT_VERIFIED",
+        }
+        while time.monotonic() < deadline:
+            service.reconcile()
+            record = next(
+                item for item in repository.load_demo_executions()
+                if str(item.id) == args.execution_id
+            )
+            positions = [
+                item for item in client.get_positions(symbol=record.symbol)
+                if Decimal(str(item.get("size") or "0")) > 0
+            ]
+            orders = client.get_open_orders(symbol=record.symbol)
+            if not positions and not orders and record.state.value in terminal:
+                break
+            time.sleep(2)
+        else:
+            raise RuntimeError("direct cleanup was not authoritatively verified flat")
         print(f"EXECUTION ID: {record.id}")
         print(f"DURABLE STATE: {record.state.value}")
         print("DIRECT DEMO CLEANUP: PASS")
