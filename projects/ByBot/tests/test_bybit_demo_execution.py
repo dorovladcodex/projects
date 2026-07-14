@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -26,7 +27,9 @@ from app.models import (
     Asset,
     CandidateLifecycleState,
     ClassificationStatus,
+    DemoExecutionRecord,
     DemoExecutionState,
+    ExecutionEnvironment,
     MarketConfirmation,
     MarketSnapshot,
     NewsClassification,
@@ -40,7 +43,7 @@ from app.models import (
     Symbol,
 )
 from app.db.persistence import PersistenceRepository
-from app.signals.service import risk_capital_for_execution
+from app.signals.service import SignalCandidateService, risk_capital_for_execution
 
 
 def demo_settings(**overrides: object) -> Settings:
@@ -273,7 +276,9 @@ class LeveragePreparationClient(FakeDemoClient):
 def candidate_bundle():
     news_id = uuid4()
     candidate = NewsSignalCandidate(
-        news_id=news_id, symbol=Symbol.BTCUSDT,
+        news_id=news_id,
+        execution_environment=ExecutionEnvironment.BYBIT_DEMO,
+        symbol=Symbol.BTCUSDT,
         state=CandidateLifecycleState.READY,
         proposed_action=NewsSignalAction.BUY,
         final_action=NewsSignalAction.BUY,
@@ -597,6 +602,8 @@ def test_test_mode_and_live_configuration_are_rejected() -> None:
         demo_settings(test_mode=True)
     with pytest.raises(ValidationError):
         demo_settings(bybit_live_trading_enabled=True)
+    with pytest.raises(ValidationError, match="DEMO_CANARY_ENABLED"):
+        Settings(demo_canary_enabled=True, execution_mode="PAPER")
 
 
 def test_demo_preflight_requires_both_leverage_sides_confirmed() -> None:
@@ -659,6 +666,17 @@ def test_entry_is_never_submitted_without_durable_risk_decision() -> None:
     candidate, classification, preview, snapshot = candidate_bundle()
     preview.risk_decision_id = None
     assert demo.submit_candidate(candidate, preview, classification, snapshot) is None
+    assert client.orders == []
+
+
+def test_historical_paper_candidate_cannot_submit_demo_order() -> None:
+    client = FakeDemoClient()
+    demo = service(client, MemoryRepository())
+    candidate, classification, preview, snapshot = candidate_bundle()
+    candidate.execution_environment = ExecutionEnvironment.PAPER
+
+    assert demo.submit_candidate(candidate, preview, classification, snapshot) is None
+    assert demo.last_error == "candidate execution environment is not BYBIT_DEMO"
     assert client.orders == []
 
 
@@ -771,6 +789,128 @@ def test_duplicate_close_submission_is_prevented() -> None:
     demo.cleanup_bot_owned()
     reduce_only = [item for item in client.orders if item.get("reduceOnly") == "true"]
     assert len(reduce_only) == 1
+
+
+def test_controlled_canary_close_uses_one_idempotent_reduce_only_order() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = DemoExecutionService(
+        demo_settings(demo_canary_enabled=True), repo, client,
+        run_id="demo-canary-test",
+    )
+    record = DemoExecutionRecord(
+        candidate_id=uuid4(),
+        risk_decision_id=1,
+        run_id="demo-canary-test",
+        order_link_id="bybot-canary-entry",
+        order_id="entry-order",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT,
+        side=Side.BUY,
+        requested_quantity=Decimal("0.010"),
+        accepted_quantity=Decimal("0.010"),
+        average_fill_price=Decimal("65000"),
+        protection_confirmed=True,
+    )
+    repo.records[str(record.candidate_id)] = record
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.010", "leverage": "1",
+        "positionIdx": 0, "takeProfit": "65650", "stopLoss": "64675",
+    }]
+
+    first = demo.request_canary_close(str(record.id))
+    second = demo.request_canary_close(str(record.id))
+
+    assert first is not None and second is not None
+    reduce_only = [item for item in client.orders if item.get("reduceOnly") == "true"]
+    assert len(reduce_only) == 1
+    assert reduce_only[0]["symbol"] == "BTCUSDT"
+    assert reduce_only[0]["qty"] == "0.01"
+    assert first.close_order_link_id == second.close_order_link_id
+
+
+def test_controlled_canary_entry_uses_production_demo_service_once(tmp_path) -> None:
+    settings = demo_settings(demo_canary_enabled=True, demo_run_id="canary-entry-test")
+    repository = PersistenceRepository(f"sqlite:///{tmp_path / 'canary.db'}")
+    client = FakeDemoClient()
+    demo = DemoExecutionService(
+        settings, repository, client, run_id="canary-entry-test"
+    )
+    news_service = SimpleNamespace(
+        items=[], filtered_items=[], classifications=[]
+    )
+    service_under_test = SignalCandidateService(
+        settings,
+        news_service,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(equity=10_000),
+        repository,
+        demo,
+    )
+    snapshot = MarketSnapshot(
+        symbol=Symbol.BTCUSDT,
+        timestamp=datetime.now(timezone.utc),
+        last_price=100,
+        bid_price=99.99,
+        ask_price=100.01,
+        price_change_1m_pct=0.2,
+        simple_trend=SimpleTrend.BULLISH,
+        trend_score=0.5,
+        volatility_pct=0.1,
+        liquidity_ok=True,
+    )
+
+    first = service_under_test.execute_demo_canary(
+        Symbol.BTCUSDT, 20.0, snapshot
+    )
+    second = service_under_test.execute_demo_canary(
+        Symbol.BTCUSDT, 20.0, snapshot
+    )
+
+    assert first.demo_execution is not None
+    assert first.demo_execution["execution_environment"] == "BYBIT_DEMO"
+    assert Decimal(str(first.demo_execution["requested_quantity"])) * Decimal(
+        str(snapshot.ask_price)
+    ) <= Decimal("20")
+    assert first.risk_preview.risk_decision_id is not None
+    assert second.demo_execution is not None
+    assert second.demo_execution["id"] == first.demo_execution["id"]
+    assert len(client.orders) == 1
+
+
+def test_canary_fails_before_persistence_when_exchange_minimum_exceeds_cap(
+    tmp_path,
+) -> None:
+    settings = demo_settings(demo_canary_enabled=True, demo_run_id="canary-min-test")
+    repository = PersistenceRepository(f"sqlite:///{tmp_path / 'minimum.db'}")
+    client = FakeDemoClient()
+    demo = DemoExecutionService(settings, repository, client, run_id="canary-min-test")
+    service_under_test = SignalCandidateService(
+        settings,
+        SimpleNamespace(items=[], filtered_items=[], classifications=[]),
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(equity=10_000),
+        repository,
+        demo,
+    )
+    snapshot = MarketSnapshot(
+        symbol=Symbol.BTCUSDT,
+        timestamp=datetime.now(timezone.utc),
+        last_price=65_000,
+        bid_price=64_999.9,
+        ask_price=65_000.1,
+        simple_trend=SimpleTrend.BULLISH,
+        trend_score=0.5,
+        volatility_pct=0.1,
+        liquidity_ok=True,
+    )
+
+    with pytest.raises(DemoSafetyError, match="exchange minimum"):
+        service_under_test.execute_demo_canary(Symbol.BTCUSDT, 20.0, snapshot)
+
+    assert client.orders == []
+    assert repository.load_signal_results(ExecutionEnvironment.BYBIT_DEMO) == []
 
 
 def test_reconciliation_fails_closed_on_remote_quantity_mismatch() -> None:

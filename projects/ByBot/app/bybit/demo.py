@@ -21,6 +21,7 @@ from app.models import (
     DemoExecutionRecord,
     DemoExecutionState,
     DemoFill,
+    ExecutionEnvironment,
     MarketSnapshot,
     NewsClassification,
     NewsSignalAction,
@@ -469,6 +470,7 @@ class DemoExecutionService:
         self.repository = repository
         self.client = client
         self.run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.run_started_at = settings.demo_run_started_at or datetime.now(timezone.utc)
         run_digest = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:6]
         self.order_prefix = f"{settings.demo_order_link_prefix[:10]}-{run_digest}"
         self.enabled = settings.execution_mode == ExecutionMode.BYBIT_DEMO
@@ -498,6 +500,12 @@ class DemoExecutionService:
             require_demo_execution(settings)
             if client is None:
                 raise DemoSafetyError("Demo exchange client is unavailable")
+            begin_run = getattr(self.repository, "begin_demo_soak_run", None)
+            if callable(begin_run):
+                persisted_run = begin_run(self.run_id, self.run_started_at)
+                if persisted_run is None:
+                    raise DemoSafetyError("Demo run boundary could not be persisted")
+                self.run_started_at = persisted_run["started_at"]
         self.restore()
 
     def restore(self) -> None:
@@ -664,6 +672,9 @@ class DemoExecutionService:
         if not self.enabled or self.client is None:
             return None
         require_demo_execution(self.settings)
+        if candidate.execution_environment != ExecutionEnvironment.BYBIT_DEMO:
+            self.last_error = "candidate execution environment is not BYBIT_DEMO"
+            return None
         if self.kill_switch_active:
             self.last_error = "Demo execution kill switch is active"
             return None
@@ -743,6 +754,29 @@ class DemoExecutionService:
             self.last_error = record.last_error
             self._activate_kill_switch("entry submission outcome is uncertain")
             return record
+
+    def validate_canary_notional(
+        self, symbol: Symbol, notional_usdt: Decimal, reference_price: Decimal
+    ) -> Decimal:
+        """Fail before persistence when the exchange minimum exceeds the canary cap."""
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            raise DemoSafetyError("Demo canary execution is unavailable")
+        require_demo_execution(self.settings)
+        if notional_usdt > Decimal("20"):
+            raise DemoSafetyError("Demo canary notional exceeds the 20 USDT cap")
+        rules = self.client.get_instrument(symbol)
+        quantity = _floor_to_step(notional_usdt / reference_price, rules.qty_step)
+        minimum_notional = max(
+            rules.min_order_qty * reference_price,
+            rules.min_notional_value,
+        )
+        if quantity < rules.min_order_qty or quantity * reference_price < rules.min_notional_value:
+            raise DemoSafetyError(
+                f"{symbol.value} exchange minimum is approximately "
+                f"{_format_decimal(minimum_notional)} USDT, above the canary cap; "
+                "no Demo order was submitted"
+            )
+        return quantity
 
     def handle_private_event(self, event: dict[str, Any]) -> None:
         topic = str(event.get("topic") or "")
@@ -961,6 +995,67 @@ class DemoExecutionService:
             self._submit_reduce_only_close(record, attributable_size, "runner_cleanup")
             closed += 1
         return {"orders_cancelled": cancelled, "positions_closed": closed}
+
+    def canary_execution_status(self, execution_id: str) -> dict[str, Any] | None:
+        """Return a sanitized, targeted view of one current-run Demo canary."""
+        if not self.enabled or self.client is None:
+            return None
+        record = next(
+            (
+                item for item in self.repository.load_demo_executions()
+                if str(item.id) == execution_id and item.run_id == self.run_id
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        positions = [
+            item for item in self.client.get_positions(symbol=record.symbol)
+            if _decimal(item.get("size"), default="0") > 0
+        ]
+        remote_position = positions[0] if len(positions) == 1 else None
+        return {
+            "execution": record.model_dump(mode="json"),
+            "remote_position": (
+                {
+                    "symbol": str(remote_position.get("symbol") or ""),
+                    "size": str(remote_position.get("size") or "0"),
+                    "leverage": str(remote_position.get("leverage") or ""),
+                    "take_profit": str(remote_position.get("takeProfit") or ""),
+                    "stop_loss": str(remote_position.get("stopLoss") or ""),
+                    "position_idx": int(remote_position.get("positionIdx") or 0),
+                }
+                if remote_position else None
+            ),
+        }
+
+    def request_canary_close(self, execution_id: str) -> DemoExecutionRecord | None:
+        """Submit one idempotent reduce-only close for a current-run canary."""
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            return None
+        require_demo_execution(self.settings)
+        record = next(
+            (
+                item for item in self.repository.load_demo_executions()
+                if str(item.id) == execution_id and item.run_id == self.run_id
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        if record.state == DemoExecutionState.DEMO_CLOSED:
+            return record
+        positions = [
+            item for item in self.client.get_positions(symbol=record.symbol)
+            if _decimal(item.get("size"), default="0") > 0
+        ]
+        if len(positions) != 1:
+            raise DemoSafetyError("canary close requires exactly one attributable position")
+        remote_size = _decimal(positions[0].get("size"), default="0")
+        if record.accepted_quantity <= 0 or remote_size != record.accepted_quantity:
+            raise DemoSafetyError("canary local and remote quantities do not match")
+        self._submit_reduce_only_close(record, remote_size, "canary_close")
+        return record
 
     def as_status(self) -> dict[str, Any]:
         records = self.repository.load_demo_executions() if self.repository else []

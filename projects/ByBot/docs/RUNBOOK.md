@@ -167,3 +167,18 @@ The explicit flag authorizes Demo orders. The runner uses one local worker,
 performs a controlled restart, reconciles exchange/PostgreSQL state, and cleans
 up only bot-owned state. Never use mainnet/testnet or `TEST_MODE=true`. Inspect
 `artifacts\demo-soak` before retrying any failed run.
+
+## Controlled Bybit Demo canary
+
+Run only after reviewing the Demo account and with Demo-only credentials:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_canary.ps1 -AllowDemoOrders -Symbol BTCUSDT -NotionalUSDT 20
+```
+
+The runner requires an exact `api-demo.bybit.com` configuration, a flat
+account, no active order for the selected symbol, and 1x leverage. It submits
+one capped entry through the production Demo execution service, verifies TP/SL
+and restart recovery, then performs a reduce-only close. Never use this runner
+with mainnet or testnet. The runner fails before persistence or order submission
+when current `minOrderQty` makes the selected symbol exceed the 20 USDT cap.

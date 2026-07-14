@@ -29,6 +29,11 @@ def test_demo_soak_uses_real_mode_and_has_no_test_pipeline() -> None:
     assert "/paper/test/execute-candidate" not in text
     assert "/news/restore-status" in text
     assert "Assert-NoInvalidCurrentRunCandidates" in text
+    assert 'Set-IsolatedEnvironment "DEMO_RUN_STARTED_AT"' in text
+    assert 'Invoke-Api -Path "/demo/run-report?finish=true"' in text
+    assert '"summary.json"' in text
+    assert "candidates_created_this_run" in text
+    assert "Preexisting candidates" in text
 
 
 def test_demo_soak_waits_for_readiness_and_reports_real_startup_failure() -> None:

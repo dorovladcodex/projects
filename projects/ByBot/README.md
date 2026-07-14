@@ -590,6 +590,19 @@ powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_soak.ps1 -Hours 12
 The explicit `-AllowDemoOrders` switch is mandatory. Never point this command
 at mainnet or testnet credentials/domains.
 
+For a single controlled BTCUSDT Demo canary capped at 20 USDT, use:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\bybit_demo_canary.ps1 -AllowDemoOrders -Symbol BTCUSDT -NotionalUSDT 20
+```
+
+The canary uses the normal durable Demo execution service, verifies exchange
+fill and TP/SL, restarts and reconciles FastAPI, then closes via a reduce-only
+Demo order. Omitting `-AllowDemoOrders` performs no setup or exchange action.
+It also fails before persistence/order submission when the selected symbol's
+exchange `minOrderQty` would exceed the 20 USDT cap; use another supported
+symbol only after checking its current Demo instrument rules.
+
 ## Repair historical NewsItem payloads
 
 Apply migrations first, inspect without writes, then apply the transactional

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha256
 import logging
 import re
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Numeric, String, UniqueConstraint, create_engine, event, select
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Numeric, String, UniqueConstraint, create_engine, event, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
@@ -16,6 +17,7 @@ from app.models import (
     ClassificationStatus,
     DemoExecutionRecord,
     DemoExecutionState,
+    ExecutionEnvironment,
     NewsClassification,
     NewsItem,
     PaperPosition,
@@ -103,6 +105,9 @@ class SignalCandidateRow(Base):
     __tablename__ = "signal_candidates"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     news_id: Mapped[str] = mapped_column(ForeignKey("news_items.id"), nullable=False)
+    execution_environment: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ExecutionEnvironment.PAPER.value
+    )
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     state: Mapped[str] = mapped_column(String(30), nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -110,6 +115,11 @@ class SignalCandidateRow(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     risk_preview: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     risk_decision_id: Mapped[int | None] = mapped_column(nullable=True)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
     __table_args__ = (UniqueConstraint("news_id", "symbol", "active"),)
 
 
@@ -194,6 +204,9 @@ class PaperExecutionRow(Base):
     candidate_id: Mapped[str] = mapped_column(
         ForeignKey("signal_candidates.id"), unique=True, nullable=False
     )
+    execution_environment: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ExecutionEnvironment.PAPER.value
+    )
     risk_decision_id: Mapped[int | None] = mapped_column(
         ForeignKey("risk_decisions.id"), nullable=True
     )
@@ -209,6 +222,9 @@ class DemoExecutionRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     candidate_id: Mapped[str] = mapped_column(
         ForeignKey("signal_candidates.id"), unique=True, nullable=False
+    )
+    execution_environment: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=ExecutionEnvironment.BYBIT_DEMO.value
     )
     risk_decision_id: Mapped[int | None] = mapped_column(
         ForeignKey("risk_decisions.id"), nullable=True
@@ -248,6 +264,16 @@ class DemoKillSwitchRow(Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False)
     reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DemoSoakRunRow(Base):
+    __tablename__ = "demo_soak_runs"
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    opening_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    final_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class PersistenceRepository:
@@ -365,10 +391,14 @@ class PersistenceRepository:
             with Session(self.engine) as session:
                 row = session.get(SignalCandidateRow, str(candidate.id))
                 values = dict(
-                    news_id=str(candidate.news_id), symbol=candidate.symbol.value if candidate.symbol else "NONE",
+                    news_id=str(candidate.news_id),
+                    execution_environment=candidate.execution_environment.value,
+                    symbol=candidate.symbol.value if candidate.symbol else "NONE",
                     state=candidate.state.value, active=active, expires_at=candidate.expires_at,
                     payload=candidate.model_dump(mode="json"), risk_preview=result.risk_preview.model_dump(mode="json"),
                     risk_decision_id=result.risk_preview.risk_decision_id,
+                    run_id=candidate.run_id,
+                    created_at=candidate.created_at,
                 )
                 if row:
                     for key, value in values.items():
@@ -543,6 +573,7 @@ class PersistenceRepository:
                 execution = existing_execution or PaperExecutionRow(
                     id=str(uuid4()), execution_key=execution_key,
                     candidate_id=candidate_id, risk_decision_id=risk_row.id,
+                    execution_environment=ExecutionEnvironment.PAPER.value,
                     state="EXECUTING_PAPER", position_id=None,
                     payload={"candidate_id": candidate_id},
                     created_at=datetime.now(timezone.utc),
@@ -642,6 +673,7 @@ class PersistenceRepository:
                 session.add(PaperExecutionRow(
                     id=execution_id, execution_key=execution_key,
                     candidate_id=candidate_id, risk_decision_id=risk_decision_id,
+                    execution_environment=ExecutionEnvironment.PAPER.value,
                     state="EXECUTING_PAPER", payload={"candidate_id": candidate_id},
                     created_at=now, updated_at=now,
                 ))
@@ -826,21 +858,33 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
-    def load_signal_results(self) -> list[SignalDryRunResult]:
+    def load_signal_results(
+        self, execution_environment: ExecutionEnvironment | None = None
+    ) -> list[SignalDryRunResult]:
         if not self.available:
             return []
         try:
             results: list[SignalDryRunResult] = []
             with Session(self.engine) as session, session.begin():
-                rows = session.scalars(
+                query = (
                     select(SignalCandidateRow)
                     .join(NewsItemRow, SignalCandidateRow.news_id == NewsItemRow.id)
                     .where(NewsItemRow.is_quarantined.is_(False))
-                ).all()
+                )
+                if execution_environment is not None:
+                    query = query.where(
+                        SignalCandidateRow.execution_environment
+                        == execution_environment.value
+                    )
+                rows = session.scalars(query).all()
                 for row in rows:
                     try:
+                        candidate_payload = dict(row.payload)
+                        candidate_payload["execution_environment"] = (
+                            row.execution_environment
+                        )
                         results.append(SignalDryRunResult.model_validate({
-                            "candidate": row.payload,
+                            "candidate": candidate_payload,
                             "risk_preview": row.risk_preview,
                         }))
                     except (ValidationError, ValueError, TypeError) as exc:
@@ -1148,7 +1192,8 @@ class PersistenceRepository:
                     session.add(row)
                 else:
                     for column in (
-                        "risk_decision_id", "run_id", "order_link_id", "order_id",
+                        "execution_environment", "risk_decision_id", "run_id",
+                        "order_link_id", "order_id",
                         "symbol", "side", "state", "requested_quantity",
                         "accepted_quantity", "average_fill_price", "close_order_link_id", "close_order_id",
                         "realized_exchange_pnl", "payload", "updated_at",
@@ -1226,6 +1271,191 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
+    def begin_demo_soak_run(
+        self, run_id: str, started_at: datetime
+    ) -> dict[str, Any] | None:
+        """Persist an idempotent reporting boundary before pipeline processing."""
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(DemoSoakRunRow, run_id)
+                if row is None:
+                    row = DemoSoakRunRow(
+                        run_id=run_id,
+                        started_at=started_at,
+                        status="RUNNING",
+                        opening_snapshot=self._demo_cumulative_snapshot(session),
+                    )
+                    session.add(row)
+                    session.flush()
+                return {
+                    "run_id": row.run_id,
+                    "started_at": _utc_aware(row.started_at),
+                    "status": row.status,
+                    "opening_snapshot": dict(row.opening_snapshot),
+                }
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def demo_soak_report(
+        self, run_id: str, *, finish: bool = False
+    ) -> dict[str, Any] | None:
+        """Build run and cumulative metrics exclusively from durable records."""
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session, session.begin():
+                run = session.get(DemoSoakRunRow, run_id)
+                if run is None:
+                    return None
+                candidates = session.scalars(
+                    select(SignalCandidateRow).where(
+                        SignalCandidateRow.execution_environment
+                        == ExecutionEnvironment.BYBIT_DEMO.value,
+                        SignalCandidateRow.run_id == run_id,
+                        SignalCandidateRow.created_at >= run.started_at,
+                    ).order_by(SignalCandidateRow.created_at)
+                ).all()
+                executions = session.scalars(
+                    select(DemoExecutionRow).where(
+                        DemoExecutionRow.execution_environment
+                        == ExecutionEnvironment.BYBIT_DEMO.value,
+                        DemoExecutionRow.run_id == run_id,
+                        DemoExecutionRow.created_at >= run.started_at,
+                    )
+                ).all()
+                news = session.scalars(
+                    select(NewsItemRow).where(NewsItemRow.received_at >= run.started_at)
+                ).all()
+                classifications = session.scalars(
+                    select(NewsClassificationRow).where(
+                        NewsClassificationRow.classified_at >= run.started_at
+                    )
+                ).all()
+                news_by_id = {
+                    row.id: row
+                    for row in session.scalars(select(NewsItemRow)).all()
+                }
+                execution_by_candidate = {row.candidate_id: row for row in executions}
+                candidate_ids = {row.id for row in candidates}
+                if any(row.candidate_id not in candidate_ids for row in executions):
+                    raise ValueError(
+                        "Demo order exists without a current-run durable candidate"
+                    )
+                state_counts: dict[str, int] = {}
+                details: list[dict[str, Any]] = []
+                for candidate in candidates:
+                    if candidate.state.startswith("PAPER_") or candidate.state == "EXECUTING_PAPER":
+                        raise ValueError("Demo run contains PAPER candidate state")
+                    state_counts[candidate.state] = state_counts.get(candidate.state, 0) + 1
+                    payload = dict(candidate.payload or {})
+                    preview = dict(candidate.risk_preview or {})
+                    execution = execution_by_candidate.get(candidate.id)
+                    item = news_by_id.get(candidate.news_id)
+                    execution_payload = dict(execution.payload or {}) if execution else {}
+                    candidate_reasons = list(payload.get("reasons", []))
+                    details.append({
+                        "candidate_id": candidate.id,
+                        "created_at": candidate.created_at.isoformat(),
+                        "news_title": item.title if item else None,
+                        "symbol": candidate.symbol,
+                        "final_state": candidate.state,
+                        "final_action": payload.get("final_action"),
+                        "expected_edge_bps": payload.get("expected_edge_bps"),
+                        "risk_result": {
+                            "preview_performed": preview.get("preview_performed"),
+                            "approved": preview.get("approved"),
+                            "reasons": preview.get("rejection_reasons", []),
+                        },
+                        "execution_result": execution.state if execution else "NOT_SUBMITTED",
+                        "block_or_expiry_reason": (
+                            "; ".join(candidate_reasons)
+                            or execution_payload.get("last_error")
+                            or None
+                        ),
+                    })
+                if len(candidates) != sum(state_counts.values()):
+                    raise ValueError("current-run candidate state totals are inconsistent")
+                accepted_news_ids = {row.news_id for row in classifications}
+                fees = sum(
+                    Decimal(str((row.payload or {}).get("exchange_fees", "0")))
+                    for row in executions
+                )
+                realized = sum(
+                    Decimal(str(row.realized_exchange_pnl)) for row in executions
+                )
+                final_snapshot = self._demo_cumulative_snapshot(session)
+                if finish:
+                    run.finished_at = datetime.now(timezone.utc)
+                    run.status = "COMPLETED"
+                    run.final_snapshot = final_snapshot
+                activity = {
+                    "news_seen_this_run": len(news),
+                    "news_accepted_this_run": len(accepted_news_ids),
+                    "classifications_this_run": len(classifications),
+                    "trade_eligible_classifications_this_run": sum(
+                        bool((row.payload or {}).get("trade_eligible"))
+                        for row in classifications
+                    ),
+                    "candidates_created_this_run": len(candidates),
+                    "candidate_final_states_this_run": state_counts,
+                    "orders_submitted_this_run": len(executions),
+                    "orders_accepted_this_run": sum(bool(row.order_id) for row in executions),
+                    "orders_rejected_this_run": sum(
+                        row.state == DemoExecutionState.DEMO_FAILED.value
+                        for row in executions
+                    ),
+                    "fills_this_run": sum(
+                        len((row.payload or {}).get("fills", []))
+                        + len((row.payload or {}).get("close_fills", []))
+                        for row in executions
+                    ),
+                    "positions_opened_this_run": sum(
+                        bool((row.payload or {}).get("protection_confirmed"))
+                        for row in executions
+                    ),
+                    "positions_closed_this_run": sum(
+                        row.state == DemoExecutionState.DEMO_CLOSED.value
+                        for row in executions
+                    ),
+                    "exchange_fees_this_run": str(fees),
+                    "realized_pnl_this_run": str(realized),
+                }
+                return {
+                    "run_id": run.run_id,
+                    "started_at": _utc_aware(run.started_at).isoformat(),
+                    "finished_at": _utc_aware(run.finished_at).isoformat() if run.finished_at else None,
+                    "status": run.status,
+                    "opening_state": dict(run.opening_snapshot),
+                    "activity_this_run": activity,
+                    "current_run_candidates": details,
+                    "final_cumulative_state": final_snapshot,
+                }
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    @staticmethod
+    def _demo_cumulative_snapshot(session: Session) -> dict[str, int]:
+        candidate_count = int(
+            session.scalar(select(func.count()).select_from(SignalCandidateRow)) or 0
+        )
+        return {
+            "preexisting_candidates": candidate_count,
+            "cumulative_candidates": candidate_count,
+            "cumulative_demo_executions": int(
+                session.scalar(select(func.count()).select_from(DemoExecutionRow)) or 0
+            ),
+            "cumulative_news": int(
+                session.scalar(select(func.count()).select_from(NewsItemRow)) or 0
+            ),
+            "cumulative_classifications": int(
+                session.scalar(select(func.count()).select_from(NewsClassificationRow)) or 0
+            ),
+        }
+
     def record_demo_event(
         self, event_key: str, event_type: str, payload: dict[str, Any]
     ) -> bool:
@@ -1294,6 +1524,7 @@ def _demo_execution_row(record: DemoExecutionRecord) -> DemoExecutionRow:
     return DemoExecutionRow(
         id=str(record.id),
         candidate_id=str(record.candidate_id),
+        execution_environment=record.execution_environment.value,
         risk_decision_id=record.risk_decision_id,
         run_id=record.run_id,
         order_link_id=record.order_link_id,
@@ -1316,8 +1547,10 @@ def _demo_execution_row(record: DemoExecutionRecord) -> DemoExecutionRow:
 def _set_candidate_demo_state(
     candidate: SignalCandidateRow, state: DemoExecutionState
 ) -> None:
+    candidate.execution_environment = ExecutionEnvironment.BYBIT_DEMO.value
     candidate.state = state.value
     payload = dict(candidate.payload)
+    payload["execution_environment"] = ExecutionEnvironment.BYBIT_DEMO.value
     payload["state"] = state.value
     candidate.payload = payload
 
@@ -1333,6 +1566,10 @@ def news_content_hash(item: NewsItem) -> str:
 
 def classifier_cache_key(item: NewsItem) -> str:
     return news_content_hash(item)
+
+
+def _utc_aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 def _paper_execution_payload(position: PaperPosition) -> dict[str, Any]:

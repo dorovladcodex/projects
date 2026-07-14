@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from threading import RLock
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from app.bybit.market_data import MarketDataService
 from app.bybit.private import BybitAccountService
@@ -11,12 +13,14 @@ from app.models import (
     Asset,
     CandidateLifecycleState,
     ClassificationStatus,
+    ExecutionEnvironment,
     MarketConfirmation,
     MarketSnapshot,
     NewsClassification,
     NewsItem,
     NewsSignalAction,
     NewsSignalCandidate,
+    RiskDecision,
     RiskContext,
     Sentiment,
     Side,
@@ -68,7 +72,12 @@ class SignalCandidateService:
         if not self.repository or not self.repository.available:
             return
         now = now or datetime.now(timezone.utc)
-        self.results = self.repository.load_signal_results()
+        environment = (
+            ExecutionEnvironment.BYBIT_DEMO
+            if self.settings.execution_mode == ExecutionMode.BYBIT_DEMO
+            else ExecutionEnvironment.PAPER
+        )
+        self.results = self.repository.load_signal_results(environment)
         self.processed_news_ids = {result.candidate.news_id for result in self.results}
         for result in self.results:
             self._candidate_locks[result.candidate.id] = RLock()
@@ -294,6 +303,16 @@ class SignalCandidateService:
         proposed_action = _proposed_action(classification.sentiment)
         candidate = NewsSignalCandidate(
             news_id=news.id,
+            execution_environment=(
+                ExecutionEnvironment.BYBIT_DEMO
+                if self.settings.execution_mode == ExecutionMode.BYBIT_DEMO
+                else ExecutionEnvironment.PAPER
+            ),
+            run_id=(
+                self.settings.demo_run_id
+                if self.settings.execution_mode == ExecutionMode.BYBIT_DEMO
+                else None
+            ),
             symbol=symbol,
             state=CandidateLifecycleState.PENDING_CONFIRMATION,
             proposed_action=proposed_action,
@@ -673,6 +692,192 @@ class SignalCandidateService:
             if result.candidate.state == CandidateLifecycleState.READY:
                 self.execute_ready_candidate(result.candidate.id)
 
+    def execute_demo_canary(
+        self,
+        symbol: Symbol,
+        notional_usdt: float,
+        snapshot: MarketSnapshot,
+    ) -> SignalDryRunResult:
+        """Create one deterministic, durably risk-approved candidate for a Demo canary."""
+        if (
+            self.settings.execution_mode != ExecutionMode.BYBIT_DEMO
+            or not self.settings.demo_canary_enabled
+            or self.demo_execution is None
+            or self.repository is None
+            or not self.repository.available
+        ):
+            raise ValueError("Demo canary execution is unavailable")
+        run_id = str(getattr(self.demo_execution, "run_id", ""))
+        if not run_id:
+            raise ValueError("Demo canary run ID is unavailable")
+        self.demo_execution.validate_canary_notional(
+            symbol,
+            Decimal(str(notional_usdt)),
+            Decimal(str(snapshot.ask_price)),
+        )
+        candidate_id = uuid5(NAMESPACE_URL, f"bybot-demo-canary:{run_id}:{symbol.value}")
+        existing = self.repository.get_demo_execution(str(candidate_id))
+        if existing is not None:
+            result = next(
+                (item for item in self.results if item.candidate.id == candidate_id),
+                None,
+            )
+            if result is None:
+                result = next(
+                    (
+                        item for item in self.repository.load_signal_results()
+                        if item.candidate.id == candidate_id
+                    ),
+                    None,
+                )
+            if result is None:
+                raise ValueError("durable Demo canary candidate is unavailable")
+            result.demo_execution = existing.model_dump(mode="json")
+            result.execution_attempted = True
+            return result
+
+        now = datetime.now(timezone.utc)
+        news = NewsItem(
+            id=uuid5(NAMESPACE_URL, f"bybot-demo-canary-news:{run_id}:{symbol.value}"),
+            title=f"Controlled ByBot Demo canary {run_id} {symbol.value}",
+            summary="Operator-authorized Demo-only execution canary; not a market signal.",
+            source="bybot-demo-canary",
+            published_at=now,
+            received_at=now,
+            asset_hint=Asset.BTC if symbol == Symbol.BTCUSDT else Asset.ETH,
+            importance=1.0,
+        )
+        classification = NewsClassification(
+            news_id=news.id,
+            asset=news.asset_hint,
+            sentiment=Sentiment.BULLISH,
+            confidence=1.0,
+            category="other",
+            urgency="normal",
+            reason="explicit operator-authorized Demo canary",
+            model_name="deterministic-demo-canary",
+            provider_name="deterministic",
+            classifier_version="demo-canary-v1",
+            classification_status=ClassificationStatus.SUCCESS,
+            trade_eligible=True,
+            classified_at=now,
+        )
+        candidate = NewsSignalCandidate(
+            id=candidate_id,
+            news_id=news.id,
+            execution_environment=ExecutionEnvironment.BYBIT_DEMO,
+            run_id=run_id,
+            symbol=symbol,
+            state=CandidateLifecycleState.READY,
+            proposed_action=NewsSignalAction.BUY,
+            final_action=NewsSignalAction.BUY,
+            sentiment=Sentiment.BULLISH,
+            classification_confidence=1.0,
+            news_importance=1.0,
+            category="other",
+            urgency="normal",
+            market_confirmation=MarketConfirmation(
+                available=True,
+                fresh=True,
+                direction_confirmed=True,
+                price_change_1m_pct=snapshot.price_change_1m_pct,
+                trend_direction=snapshot.simple_trend.value,
+                trend_score=snapshot.trend_score,
+                spread_bps=snapshot.spread_bps,
+                volatility_pct=snapshot.volatility_pct,
+                volume_24h=snapshot.volume_24h,
+                reasons=["controlled Demo canary market snapshot"],
+            ),
+            expected_edge_bps=max(25.0, self.settings.signal_min_expected_edge_bps),
+            proposed_stop_loss_pct=self.settings.signal_default_stop_loss_pct,
+            proposed_take_profit_pct=self.settings.signal_default_take_profit_pct,
+            ttl_seconds=self.settings.signal_ttl_seconds,
+            reasons=["controlled operator-authorized Demo canary"],
+            created_at=now,
+            expires_at=now + timedelta(seconds=self.settings.signal_ttl_seconds),
+        )
+        result = SignalDryRunResult(candidate=candidate, risk_preview=SignalRiskPreview())
+        if not self.repository.save_news(news):
+            # A deterministic retry may encounter the already persisted news row.
+            if not any(item.id == news.id for item in self.repository.load_news()[0]):
+                raise ValueError("Demo canary news could not be persisted")
+        self.repository.save_classification(
+            news,
+            classification,
+            "demo-canary-v1",
+            now + timedelta(days=1),
+        )
+        self.repository.save_signal_result(result)
+
+        rules = replace(
+            _risk_rules(self.settings),
+            max_position_notional_usdt=min(
+                float(notional_usdt), self.settings.max_position_notional_usdt
+            ),
+        )
+        signal = TradeSignal(
+            action=SignalAction.TRADE,
+            symbol=symbol,
+            side=Side.BUY,
+            confidence=1.0,
+            expected_edge_bps=candidate.expected_edge_bps,
+            stop_loss_pct=candidate.proposed_stop_loss_pct,
+            take_profit_pct=candidate.proposed_take_profit_pct,
+            reasons=list(candidate.reasons),
+        )
+        capital = float(self.settings.demo_risk_capital_usdt)
+        decision: RiskDecision = RiskManager(rules).assess(
+            signal,
+            snapshot,
+            RiskContext(
+                equity=capital,
+                available_balance=capital,
+                requested_risk_pct=self.settings.max_risk_per_trade_pct,
+                leverage=self.settings.demo_leverage,
+                open_positions=0,
+                daily_pnl_pct=self.settings.paper_daily_pnl_pct,
+                weekly_pnl_pct=self.settings.paper_weekly_pnl_pct,
+                consecutive_losses=self.settings.paper_consecutive_losses,
+                api_stable=snapshot.api_stable,
+            ),
+        )
+        risk_decision_id = self.repository.save_risk_decision(str(candidate.id), decision)
+        result.risk_preview = SignalRiskPreview(
+            preview_performed=True,
+            approved=decision.approved,
+            capped_size=decision.capped_size,
+            position_notional=decision.position_notional,
+            max_allowed_notional=decision.max_allowed_notional,
+            rejection_reasons=list(decision.reasons),
+            risk_decision_id=risk_decision_id,
+            estimated_fees=decision.estimated_fees,
+            estimated_slippage=decision.estimated_slippage,
+        )
+        self.repository.save_signal_result(result)
+        if not decision.approved or risk_decision_id is None:
+            result.execution_block_reason = "Demo canary risk decision was not approved"
+            return result
+        record = self.demo_execution.submit_candidate(
+            candidate, result.risk_preview, classification, snapshot
+        )
+        if record is None:
+            result.execution_block_reason = (
+                getattr(self.demo_execution, "last_error", None)
+                or "Demo canary submission was blocked"
+            )
+            return result
+        candidate.state = CandidateLifecycleState(record.state.value)
+        result.execution_attempted = True
+        result.demo_execution = record.model_dump(mode="json")
+        with self._registry_lock:
+            self.results.append(result)
+            self._candidate_locks[candidate.id] = RLock()
+        self.news_service.items.append(news)
+        self.news_service.filtered_items.append(news)
+        self.news_service.classifications.append(classification)
+        self.repository.save_signal_result(result)
+        return result
+
     def _execute_demo_result(
         self,
         result: SignalDryRunResult,
@@ -686,7 +891,8 @@ class SignalCandidateService:
         candidate = result.candidate
         now = datetime.now(timezone.utc)
         if (
-            candidate.state != CandidateLifecycleState.READY
+            candidate.execution_environment != ExecutionEnvironment.BYBIT_DEMO
+            or candidate.state != CandidateLifecycleState.READY
             or candidate.final_action not in {NewsSignalAction.BUY, NewsSignalAction.SELL}
             or not result.risk_preview.preview_performed
             or not result.risk_preview.approved
@@ -723,6 +929,8 @@ class SignalCandidateService:
         candidate = result.candidate
         now = datetime.now(timezone.utc)
         reasons: list[str] = []
+        if candidate.execution_environment != ExecutionEnvironment.PAPER:
+            reasons.append("candidate execution environment is not PAPER")
         if candidate.state != CandidateLifecycleState.READY:
             reasons.append("candidate is not READY")
         if candidate.final_action not in {NewsSignalAction.BUY, NewsSignalAction.SELL}:

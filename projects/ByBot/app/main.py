@@ -14,10 +14,13 @@ from app.bybit.demo import (
     BybitDemoPrivateWebSocket,
     BybitDemoRestClient,
     DemoExecutionService,
+    DemoSafetyError,
+    require_demo_execution,
 )
 from app.config import BotMode, ExecutionMode, get_settings
 from app.models import (
     MarketSnapshot,
+    DemoCanaryExecuteRequest,
     ClassifierTestRequest,
     NewsItem,
     PaperTestSignalRequest,
@@ -682,6 +685,79 @@ def demo_executions() -> dict[str, object]:
             item.model_dump(mode="json")
             for item in persistence.load_demo_executions()
         ],
+        "live_execution_blocked": True,
+    }
+
+
+@app.get("/demo/run-report")
+def demo_run_report(finish: bool = False) -> dict[str, object]:
+    if settings.execution_mode != ExecutionMode.BYBIT_DEMO:
+        raise HTTPException(status_code=404, detail="Demo execution is disabled")
+    report = persistence.demo_soak_report(demo_execution_service.run_id, finish=finish)
+    if report is None:
+        raise HTTPException(status_code=503, detail="Demo run report is unavailable")
+    return report
+
+
+def _require_demo_canary() -> None:
+    if not settings.demo_canary_enabled:
+        raise HTTPException(status_code=404, detail="Demo canary is disabled")
+    try:
+        require_demo_execution(settings)
+    except DemoSafetyError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
+@app.post("/demo/canary/execute")
+def demo_canary_execute(request: DemoCanaryExecuteRequest) -> dict[str, object]:
+    _require_demo_canary()
+    market_data_service.refresh_all()
+    snapshot = market_data_service.latest_snapshot(request.symbol)
+    if snapshot is None:
+        raise HTTPException(status_code=503, detail="fresh Demo market data is unavailable")
+    age = datetime.now(timezone.utc) - snapshot.timestamp
+    if age > timedelta(seconds=settings.signal_confirmation_window_seconds):
+        raise HTTPException(status_code=503, detail="Demo market data is stale")
+    try:
+        result = signal_candidate_service.execute_demo_canary(
+            request.symbol, float(request.notional_usdt), snapshot
+        )
+    except (DemoSafetyError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if result.demo_execution is None:
+        raise HTTPException(
+            status_code=409,
+            detail=result.execution_block_reason or "Demo canary execution was blocked",
+        )
+    return {
+        "execution": result.demo_execution,
+        "risk_preview": result.risk_preview.model_dump(mode="json"),
+        "live_execution_blocked": True,
+    }
+
+
+@app.get("/demo/canary/{execution_id}")
+def demo_canary_status(execution_id: str) -> dict[str, object]:
+    _require_demo_canary()
+    demo_execution_service.reconcile()
+    status = demo_execution_service.canary_execution_status(execution_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Demo canary execution not found")
+    return {**status, "live_execution_blocked": True}
+
+
+@app.post("/demo/canary/{execution_id}/close")
+def demo_canary_close(execution_id: str) -> dict[str, object]:
+    _require_demo_canary()
+    try:
+        record = demo_execution_service.request_canary_close(execution_id)
+    except DemoSafetyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Demo canary execution not found")
+    return {
+        "execution": record.model_dump(mode="json"),
+        "reduce_only": True,
         "live_execution_blocked": True,
     }
 

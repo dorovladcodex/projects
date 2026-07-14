@@ -76,6 +76,13 @@ class NewsSignalAction(str, Enum):
     NO_TRADE = "NO_TRADE"
 
 
+class ExecutionEnvironment(str, Enum):
+    """Execution venue attached to durable candidates and executions."""
+
+    PAPER = "PAPER"
+    BYBIT_DEMO = "BYBIT_DEMO"
+
+
 class CandidateLifecycleState(str, Enum):
     PENDING_CONFIRMATION = "PENDING_CONFIRMATION"
     READY = "READY"
@@ -125,6 +132,7 @@ class DemoExecutionRecord(BaseModel):
     candidate_id: UUID
     risk_decision_id: int | None = None
     run_id: str
+    execution_environment: ExecutionEnvironment = ExecutionEnvironment.BYBIT_DEMO
     order_link_id: str
     state: DemoExecutionState
     symbol: Symbol
@@ -271,6 +279,8 @@ class SignalEvaluation(BaseModel):
 class NewsSignalCandidate(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     news_id: UUID
+    execution_environment: ExecutionEnvironment = ExecutionEnvironment.PAPER
+    run_id: str | None = None
     symbol: Symbol | None = None
     state: CandidateLifecycleState
     proposed_action: NewsSignalAction
@@ -294,6 +304,11 @@ class NewsSignalCandidate(BaseModel):
 class SignalTestFromNewsRequest(BaseModel):
     news_id: UUID
     reprocess: bool = False
+
+
+class DemoCanaryExecuteRequest(BaseModel):
+    symbol: Symbol = Symbol.BTCUSDT
+    notional_usdt: Decimal = Field(default=Decimal("20"), ge=Decimal("10"), le=Decimal("20"))
 
 
 class TestMarketSnapshotRequest(BaseModel):
@@ -458,6 +473,7 @@ class Position(BaseModel):
 
 class PaperPosition(BaseModel):
     id: UUID = Field(default_factory=uuid4)
+    execution_environment: ExecutionEnvironment = ExecutionEnvironment.PAPER
     symbol: Symbol
     side: Side
     size: float = Field(gt=0)

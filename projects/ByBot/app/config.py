@@ -3,6 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from functools import lru_cache
 from decimal import Decimal
+from datetime import datetime
 
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -107,6 +108,8 @@ class Settings(BaseSettings):
     demo_leverage: int = Field(default=1, ge=1, le=1)
     demo_order_link_prefix: str = Field(default="bybot", min_length=3, max_length=20)
     demo_run_id: str | None = Field(default=None, min_length=3, max_length=64)
+    demo_run_started_at: datetime | None = None
+    demo_canary_enabled: bool = False
     demo_reconciliation_interval_seconds: int = Field(default=15, ge=5, le=300)
     demo_order_confirmation_timeout_seconds: int = Field(default=30, ge=5, le=300)
 
@@ -225,9 +228,18 @@ class Settings(BaseSettings):
             raise ValueError("Demo order link prefix must be alphanumeric or hyphenated")
         return normalized
 
+    @field_validator("demo_run_started_at")
+    @classmethod
+    def require_aware_demo_run_start(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("DEMO_RUN_STARTED_AT must include a timezone")
+        return value
+
     @model_validator(mode="after")
     def enforce_demo_execution_guard(self) -> "Settings":
         if self.execution_mode != ExecutionMode.BYBIT_DEMO:
+            if self.demo_canary_enabled:
+                raise ValueError("DEMO_CANARY_ENABLED requires BYBIT_DEMO execution mode")
             return self
         errors: list[str] = []
         if self.app_env.lower() != "demo":

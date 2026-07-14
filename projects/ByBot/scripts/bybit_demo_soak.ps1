@@ -357,10 +357,12 @@ try {
     $databaseUrl = $databaseUrl -replace "@localhost:", "@127.0.0.1:"
 
     $runId = "demo-" + [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
+    $runStartedAt = [DateTime]::UtcNow
     $artifactDir = Join-Path (Get-Location) "artifacts\demo-soak\$runId"
     New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
     $snapshotsPath = Join-Path $artifactDir "snapshots.jsonl"
     $reportPath = Join-Path $artifactDir "report.md"
+    $summaryPath = Join-Path $artifactDir "summary.json"
     $stdoutPath = Join-Path $artifactDir "uvicorn.stdout.log"
     $stderrPath = Join-Path $artifactDir "uvicorn.stderr.log"
     $script:ReportPath = $reportPath
@@ -380,6 +382,7 @@ try {
     Set-IsolatedEnvironment "DEMO_RISK_CAPITAL_USDT" "10000"
     Set-IsolatedEnvironment "DEMO_LEVERAGE" "1"
     Set-IsolatedEnvironment "DEMO_RUN_ID" $runId
+    Set-IsolatedEnvironment "DEMO_RUN_STARTED_AT" $runStartedAt.ToString("o")
     Set-IsolatedEnvironment "ACTIVE_SYMBOLS" '["BTCUSDT","ETHUSDT"]'
     Set-IsolatedEnvironment "MARKET_DATA_PROVIDER" "BYBIT_REST"
     Set-IsolatedEnvironment "NEWS_ENABLE_RSS" "true"
@@ -407,7 +410,9 @@ try {
     Write-Host "DEMO ACCOUNT VERIFIED: PASS"
     Write-Host "LIVE EXECUTION BLOCKED: PASS"
 
-    $startedAt = [DateTime]::UtcNow
+    $runBoundary = Invoke-Api -Path "/demo/run-report"
+    Assert-Condition ($runBoundary.run_id -eq $runId) "Durable Demo run ID does not match"
+    $startedAt = [DateTimeOffset]::Parse([string]$runBoundary.started_at).UtcDateTime
     $finishAt = $startedAt.AddHours($Hours)
     $restartAt = $startedAt.AddTicks([long](($finishAt - $startedAt).Ticks / 2))
     $restarted = $false
@@ -481,6 +486,16 @@ try {
     Write-Host "FINAL DEMO STATE FLAT: PASS"
 
     $status = Invoke-Api -Path "/status"
+    $runReport = Invoke-Api -Path "/demo/run-report?finish=true"
+    $runActivity = $runReport.activity_this_run
+    Assert-Condition (
+        [int]$runActivity.candidates_created_this_run -eq
+        [int](($runActivity.candidate_final_states_this_run.PSObject.Properties | Measure-Object -Property Value -Sum).Sum)
+    ) "Current-run candidate state totals are inconsistent"
+    foreach ($candidate in @($runReport.current_run_candidates)) {
+        Assert-Condition (-not ([string]$candidate.final_state).StartsWith("PAPER_")) `
+            "PAPER candidate state leaked into Demo run report"
+    }
     $executions = Invoke-Api -Path "/demo/executions"
     $runExecutions = @($executions.executions | Where-Object { $_.run_id -eq $runId })
     $submitted = $runExecutions.Count
@@ -509,8 +524,29 @@ try {
     }
     $candidateStateSummary = $stateParts -join ", "
     $finishedAt = [DateTime]::UtcNow
+    [IO.File]::WriteAllText(
+        $summaryPath,
+        ($runReport | ConvertTo-Json -Depth 20),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $candidateDetailLines = @()
+    foreach ($candidate in @($runReport.current_run_candidates)) {
+        $candidateDetailLines += (
+            "- $($candidate.candidate_id) | $($candidate.created_at) | " +
+            "$($candidate.news_title) | $($candidate.symbol) | " +
+            "$($candidate.final_state) / $($candidate.final_action) | " +
+            "edge=$($candidate.expected_edge_bps) | " +
+            "risk=$($candidate.risk_result.approved) | " +
+            "execution=$($candidate.execution_result) | " +
+            "reason=$($candidate.block_or_expiry_reason)"
+        )
+    }
+    if ($candidateDetailLines.Count -eq 0) {
+        $candidateDetailLines = @("- No Demo candidates were created during this run.")
+    }
     $lines = @(
         "# ByBot Bybit Demo soak report", "",
+        "## Run scope", "",
         "- Run ID: $runId",
         "- Started: $($startedAt.ToString('o'))",
         "- Finished: $($finishedAt.ToString('o'))",
@@ -519,21 +555,29 @@ try {
         "- REST domain: https://api-demo.bybit.com",
         "- Private WebSocket: wss://stream-demo.bybit.com",
         "- Account verified: $($finalDemo.account_verified)",
-        "- Orders submitted / accepted / rejected: $submitted / $accepted / $rejected",
+        "", "## Activity during this run", "",
+        "- News seen / accepted: $($runActivity.news_seen_this_run) / $($runActivity.news_accepted_this_run)",
+        "- Classifications / trade eligible: $($runActivity.classifications_this_run) / $($runActivity.trade_eligible_classifications_this_run)",
+        "- Demo candidates created: $($runActivity.candidates_created_this_run)",
+        "- Orders submitted / accepted / rejected: $($runActivity.orders_submitted_this_run) / $($runActivity.orders_accepted_this_run) / $($runActivity.orders_rejected_this_run)",
+        "- Fills: $($runActivity.fills_this_run)",
+        "- Positions opened / closed: $($runActivity.positions_opened_this_run) / $($runActivity.positions_closed_this_run)",
+        "- Exchange fees: $($runActivity.exchange_fees_this_run)",
+        "- Exchange realized PnL: $($runActivity.realized_pnl_this_run)",
         "- Partial / complete fills: $partial / $complete",
-        "- Positions opened / closed: $opened / $closed",
         "- TP / SL / timed closes: $tpCloses / $slCloses / $timedCloses",
-        "- Exchange fees: $exchangeFees",
-        "- Exchange realized PnL: $exchangePnl",
         "- Paper-shadow PnL: $shadowPnl",
         "- Entry/exit slippage: persisted per execution in /demo/executions",
         "- Reconciliation incidents: $($finalDemo.reconciliation_incidents)",
         "- Private WebSocket reconnects: $($finalDemo.websocket_reconnects)",
-        "- News seen / accepted: $($status.rss_items_seen) / $($status.rss_items_accepted)",
-        "- Classifications / trade eligible: $($status.items_classified_count) / $($status.classifications_trade_eligible)",
         "- Classifier mode: $($status.news_classifier_mode)",
         "- Codex CLI calls / cache hits / tokens today: $($status.codex_cli_calls_count) / $($status.codex_cli_cache_hits) / $($status.codex_cli_total_tokens_today)",
-        "- Signal candidates: $($status.signal_candidates_count)",
+        "", "## Opening state", "",
+        "- Preexisting candidates: $($runReport.opening_state.preexisting_candidates)",
+        "- Cumulative Demo executions: $($runReport.opening_state.cumulative_demo_executions)",
+        "", "## Final cumulative state", "",
+        "- Cumulative candidates: $($runReport.final_cumulative_state.cumulative_candidates)",
+        "- Cumulative Demo executions: $($runReport.final_cumulative_state.cumulative_demo_executions)",
         "- Historical news restored valid / repaired / quarantined: $($script:RestoreStatus.news_restore_valid_count) / $($script:RestoreStatus.news_restore_repaired_count) / $($script:RestoreStatus.news_restore_quarantined_count)",
         "- Run execution states: $candidateStateSummary",
         "- Persisted Demo executions: $($executions.executions.Count)",
@@ -541,8 +585,10 @@ try {
         "- Kill switch active: $($finalDemo.kill_switch_active)",
         "- Kill-switch activations: $($finalDemo.kill_switch_activations)",
         "- Controlled restart: $restarted",
-        "- Live execution blocked: $($status.live_order_placement_blocked)"
+        "- Live execution blocked: $($status.live_order_placement_blocked)",
+        "", "## Current-run candidates", ""
     )
+    $lines += $candidateDetailLines
     [IO.File]::WriteAllLines($reportPath, $lines, (New-Object Text.UTF8Encoding($false)))
     Write-Host "REPORT: $reportPath"
     Write-Host "OVERALL: PASS"

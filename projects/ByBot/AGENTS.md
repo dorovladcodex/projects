@@ -23,7 +23,7 @@ soak without the user's explicit `-AllowDemoOrders` confirmation.
 - `app/risk/manager.py`: deterministic sizing and risk preview.
 - `app/portfolio/paper_trading.py`: paper positions, accounting, cooldowns, kill switch.
 - `app/db/persistence.py`: SQLAlchemy rows and atomic persistence operations.
-- `alembic/versions/`: migrations; current head is `20260714_0008`.
+- `alembic/versions/`: migrations; current head is `20260714_0010`.
 - `scripts/repair_news_payloads.py`: transactional historical NewsItem audit,
   deterministic repair, and quarantine (`--dry-run` before `--apply`).
 - `tests/`: unit/API tests plus optional PostgreSQL regression tests.
@@ -75,6 +75,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\paper_soak.ps1 -Hours 1
 - `bybit_demo_soak.ps1`: real 12-hour Bybit Demo execution soak. It can submit
   Demo orders and therefore requires explicit `-AllowDemoOrders`; Codex must
   never launch it autonomously.
+- `bybit_demo_canary.ps1`: one operator-authorized, maximum-20-USDT real Demo
+  canary using the production Demo service; it also requires
+  `-AllowDemoOrders` and Codex must never launch it autonomously.
 
 Run targeted tests while editing, the full suite once at the end, then all
 smokes. Preserve unrelated user changes and keep `.env` untracked.
