@@ -240,7 +240,7 @@ class DemoExecutionRow(Base):
     average_fill_price: Mapped[Any | None] = mapped_column(Numeric(36, 18), nullable=True)
     close_order_link_id: Mapped[str | None] = mapped_column(String(36), unique=True, nullable=True)
     close_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    realized_exchange_pnl: Mapped[Any] = mapped_column(Numeric(36, 18), nullable=False)
+    realized_exchange_pnl: Mapped[Any | None] = mapped_column(Numeric(36, 18), nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -1496,7 +1496,7 @@ class PersistenceRepository:
                     for row in executions
                 )
                 realized = sum(
-                    Decimal(str(row.realized_exchange_pnl)) for row in executions
+                    Decimal(str(row.realized_exchange_pnl or 0)) for row in executions
                 )
                 final_snapshot = self._demo_cumulative_snapshot(session)
                 if finish:
@@ -1717,6 +1717,7 @@ class PersistenceRepository:
                             "active": event.active,
                             "reasons": list(event.reasons),
                             "execution_id": event.execution_id,
+                            "payload": dict(event.payload or {}),
                             "created_at": event.created_at,
                         }
                         for event in events
@@ -1811,6 +1812,67 @@ class PersistenceRepository:
                     execution_id=execution_id,
                     payload={"link_reason": reason[:250]},
                     created_at=datetime.now(timezone.utc),
+                ))
+                session.flush()
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def repair_demo_kill_switch_activation_link(
+        self,
+        *,
+        activation_id: str,
+        execution_id: str,
+        run_id: str,
+        evidence: dict[str, Any],
+    ) -> bool:
+        """Append an explicit activation link after exact durable verification."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                activation = session.get(DemoKillSwitchEventRow, activation_id)
+                execution = session.get(DemoExecutionRow, execution_id)
+                if activation is None or execution is None:
+                    return False
+                if activation.event_type != "KILL_SWITCH_ACTIVATED":
+                    return False
+                if activation.execution_id is not None:
+                    return activation.execution_id == execution_id
+                if execution.run_id != run_id or execution.symbol != "BTCUSDT":
+                    return False
+                if not (
+                    execution.created_at <= activation.created_at <= execution.updated_at
+                ):
+                    return False
+                if not any(
+                    "unattributed active Demo order for BTCUSDT" in str(reason)
+                    for reason in activation.reasons
+                ):
+                    return False
+                existing = session.scalar(select(DemoKillSwitchEventRow).where(
+                    DemoKillSwitchEventRow.event_type
+                    == "KILL_SWITCH_EXECUTION_LINK_REPAIRED",
+                    DemoKillSwitchEventRow.execution_id == execution_id,
+                ))
+                if existing is not None:
+                    return True
+                now = datetime.now(timezone.utc)
+                session.add(DemoKillSwitchEventRow(
+                    id=str(uuid4()),
+                    event_type="KILL_SWITCH_EXECUTION_LINK_REPAIRED",
+                    active=True,
+                    reasons=list(activation.reasons),
+                    execution_id=execution_id,
+                    payload={
+                        "activation_id": activation_id,
+                        "execution_id": execution_id,
+                        "run_id": run_id,
+                        "repair_timestamp": now.isoformat(),
+                        "evidence": evidence,
+                    },
+                    created_at=now,
                 ))
                 session.flush()
             return True

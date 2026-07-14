@@ -108,6 +108,7 @@ class CandidateLifecycleState(str, Enum):
     DEMO_NOT_SUBMITTED = "DEMO_NOT_SUBMITTED"
     DEMO_ORDER_CANCELLED = "DEMO_ORDER_CANCELLED"
     DEMO_CLOSED_AFTER_INTERRUPTION = "DEMO_CLOSED_AFTER_INTERRUPTION"
+    DEMO_CLOSED_EXTERNALLY = "DEMO_CLOSED_EXTERNALLY"
     DEMO_FAILED_FLAT_VERIFIED = "DEMO_FAILED_FLAT_VERIFIED"
 
 
@@ -128,6 +129,7 @@ class DemoExecutionState(str, Enum):
     DEMO_NOT_SUBMITTED = "DEMO_NOT_SUBMITTED"
     DEMO_ORDER_CANCELLED = "DEMO_ORDER_CANCELLED"
     DEMO_CLOSED_AFTER_INTERRUPTION = "DEMO_CLOSED_AFTER_INTERRUPTION"
+    DEMO_CLOSED_EXTERNALLY = "DEMO_CLOSED_EXTERNALLY"
     DEMO_FAILED_FLAT_VERIFIED = "DEMO_FAILED_FLAT_VERIFIED"
 
 
@@ -168,7 +170,7 @@ class DemoExecutionRecord(BaseModel):
     close_order_id: str | None = None
     close_fills: list[DemoFill] = Field(default_factory=list)
     average_close_price: Decimal | None = Field(default=None, gt=0)
-    realized_exchange_pnl: Decimal = Decimal("0")
+    realized_exchange_pnl: Decimal | None = None
     entry_slippage: Decimal | None = None
     exit_slippage: Decimal | None = None
     paper_shadow_pnl: Decimal | None = None

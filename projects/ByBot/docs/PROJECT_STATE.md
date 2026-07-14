@@ -37,7 +37,7 @@ PostgreSQL relationships:
 - `persistence_quarantine` preserves malformed historical row audits; quarantined
   `news_items` and their candidates are excluded from normal restore.
 
-Current Alembic head: `20260714_0012`. Demo canary submission is a durable
+Current Alembic head: `20260714_0013`. Demo canary submission is a durable
 background job (`demo_canary_jobs`), so a client timeout or Windows sleep does
 not imply that no exchange action occurred; recover by `run_id`/execution ID.
 

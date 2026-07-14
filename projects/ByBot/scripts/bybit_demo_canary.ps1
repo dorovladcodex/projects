@@ -570,6 +570,20 @@ catch {
         catch {
             $script:SafetyCleanupResult = "FAIL"
             Write-Warning (Protect-Text "Safety cleanup failed: $($_.Exception.Message)")
+            if ($script:ExecutionId) {
+                try {
+                    Invoke-NativeCommand $python @(
+                        "scripts/demo_direct_cleanup.py",
+                        "--execution-id", $script:ExecutionId,
+                        "--confirm-cleanup"
+                    ) "Direct guarded Demo cleanup" | Out-Null
+                    $script:SafetyCleanupResult = "PASS"
+                    Write-Host "DIRECT GUARDED DEMO CLEANUP: PASS"
+                }
+                catch {
+                    Write-Warning (Protect-Text "Direct cleanup failed: $($_.Exception.Message)")
+                }
+            }
         }
     }
     if (-not $script:ReportWritten) {

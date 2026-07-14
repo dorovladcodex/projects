@@ -316,3 +316,23 @@ def test_unknown_protection_error_is_not_recoverable() -> None:
     readiness = evaluate_demo_recovery_readiness(result, str(execution.id))
     assert readiness.reason_classification == "unknown_protection_incident"
     assert readiness.recoverable_latch is False
+
+
+def test_diagnostics_selects_newest_unresolved_before_older_terminal() -> None:
+    older = resolved_execution()
+    candidate, _, _, _ = candidate_bundle()
+    unresolved = DemoExecutionRecord(
+        candidate_id=candidate.id, run_id="new-run", order_link_id="new-entry",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("64000"),
+        created_at=datetime.now(timezone.utc), updated_at=datetime.now(timezone.utc),
+    )
+    repository = DiagnosticRepository(older)
+    repository.load_demo_executions = lambda: [older, unresolved]
+    result = run_demo_diagnostics(
+        config(), repository=repository, client=DiagnosticClient()
+    )
+    assert result.latest_execution.id == unresolved.id
+    assert result.newest_execution.id == unresolved.id

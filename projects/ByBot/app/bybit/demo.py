@@ -42,6 +42,7 @@ TERMINAL_DEMO_STATES = {
     DemoExecutionState.DEMO_NOT_SUBMITTED,
     DemoExecutionState.DEMO_ORDER_CANCELLED,
     DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+    DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
     DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
 }
 
@@ -708,9 +709,7 @@ class DemoExecutionService:
         active_local_symbols = {
             item.symbol.value for item in local
             if item.run_id == self.run_id
-            if item.state not in {
-                DemoExecutionState.DEMO_CLOSED, DemoExecutionState.DEMO_FAILED
-            }
+            if item.state not in TERMINAL_DEMO_STATES
         }
         local_order_links = {
             link
@@ -718,6 +717,7 @@ class DemoExecutionService:
             for link in (item.order_link_id, item.close_order_link_id)
             if link
         }
+        owned_protection_order_ids: set[str] = set()
         for symbol_value in self.settings.allowed_symbols:
             symbol = Symbol(symbol_value)
             self.client.get_instrument(symbol)
@@ -727,7 +727,23 @@ class DemoExecutionService:
             conflicts = [
                 order for order in open_orders
                 if str(order.get("orderLinkId") or "") not in local_order_links
+                and not any(
+                    _is_owned_bybit_protection_order(order, execution, positions)
+                    for execution in local
+                    if execution.symbol == symbol
+                    and execution.state == DemoExecutionState.DEMO_POSITION_OPEN
+                )
             ]
+            for order in open_orders:
+                if any(
+                    _is_owned_bybit_protection_order(order, execution, positions)
+                    for execution in local
+                    if execution.symbol == symbol
+                    and execution.state == DemoExecutionState.DEMO_POSITION_OPEN
+                ):
+                    order_id = str(order.get("orderId") or "")
+                    if order_id:
+                        owned_protection_order_ids.add(order_id)
             if conflicts:
                 self._activate_kill_switch(
                     f"unattributed active Demo order for {symbol.value}"
@@ -755,6 +771,7 @@ class DemoExecutionService:
         self.usdt_order_reconciliation_ok = True
         if any(
             str(order.get("orderLinkId") or "") not in local_order_links
+            and str(order.get("orderId") or "") not in owned_protection_order_ids
             for order in usdt_orders
         ):
             self._activate_kill_switch("unattributed active USDT Demo order")
@@ -1135,6 +1152,7 @@ class DemoExecutionService:
             except Exception as exc:
                 self.last_error = _sanitized_error(exc)
         local = self.repository.load_demo_executions()
+        positions = self.client.get_positions(settle_coin="USDT")
         local_links = {
             link: item
             for item in local
@@ -1142,8 +1160,18 @@ class DemoExecutionService:
             if link
         }
         bot_prefix = f"{self.settings.demo_order_link_prefix}-"
+        owned_protection_ids = {
+            str(order.get("orderId") or "")
+            for order in remote_orders
+            if any(
+                _is_owned_bybit_protection_order(order, record, positions)
+                for record in local
+                if record.state == DemoExecutionState.DEMO_POSITION_OPEN
+            )
+        }
         self.bot_owned_open_orders = sum(
             str(item.get("orderLinkId") or "").startswith(bot_prefix)
+            or str(item.get("orderId") or "") in owned_protection_ids
             for item in remote_orders
         )
         self.unrelated_open_orders = len(remote_orders) - self.bot_owned_open_orders
@@ -1192,7 +1220,6 @@ class DemoExecutionService:
                 self.repository.save_demo_execution(record, event_type="REMOTE_ORDER_MISSING")
                 self.reconciliation_incidents += 1
                 self._activate_kill_switch("local Demo order is missing remotely")
-        positions = self.client.get_positions(settle_coin="USDT")
         active_positions = [p for p in positions if _decimal(p.get("size"), default="0") > 0]
         active_owned_symbols = {
             item.symbol.value for item in local
@@ -1462,6 +1489,52 @@ class DemoExecutionService:
             record.close_order_id or record.order_id or "",
         )
         return refreshed or record
+
+    def direct_cleanup_execution(
+        self, execution_id: str, reason: str
+    ) -> DemoExecutionRecord:
+        """One-shot exact-execution cleanup for an unavailable FastAPI process."""
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            raise DemoSafetyError("direct Demo cleanup is unavailable")
+        require_demo_execution(self.settings)
+        validate_demo_domains(self.client.base_url, self.client.private_ws_url)
+        record = next((
+            item for item in self.repository.load_demo_executions()
+            if str(item.id) == execution_id
+        ), None)
+        if record is None or record.state in TERMINAL_DEMO_STATES:
+            raise DemoSafetyError("exact unresolved Demo execution was not found")
+        positions = self.client.get_positions(symbol=record.symbol)
+        active = [
+            item for item in positions if _decimal(item.get("size"), default="0") > 0
+        ]
+        if len(active) > 1:
+            raise DemoSafetyError("multiple remote positions prevent direct cleanup")
+        orders = self.client.get_open_orders(symbol=record.symbol)
+        associated = [
+            order for order in orders
+            if _is_owned_bybit_protection_order(order, record, positions)
+        ]
+        if any(order not in associated for order in orders):
+            raise DemoSafetyError("unrelated remote order prevents direct cleanup")
+        for order in associated:
+            order_id = str(order.get("orderId") or "")
+            if order_id:
+                self.client.cancel_order(record.symbol, order_id)
+        record.failure_reason = reason[:250]
+        if active:
+            remote_size = _decimal(active[0].get("size"), default="0")
+            if record.accepted_quantity <= 0 or remote_size != record.accepted_quantity:
+                raise DemoSafetyError("owned quantity mismatch prevents direct cleanup")
+            self._submit_reduce_only_close(record, remote_size, "direct_restart_cleanup")
+        self.reconcile()
+        refreshed = next((
+            item for item in self.repository.load_demo_executions()
+            if str(item.id) == execution_id
+        ), None)
+        if refreshed is None:
+            raise DemoSafetyError("direct cleanup result was not persisted")
+        return refreshed
 
     def request_canary_close(self, execution_id: str) -> DemoExecutionRecord | None:
         """Submit one idempotent reduce-only close for a current-run canary."""
@@ -2130,6 +2203,43 @@ def _protection_matches(
         _decimal(position.get("takeProfit"), default="0") == take_profit
         and _decimal(position.get("stopLoss"), default="0") == stop_loss
     )
+
+
+def _is_owned_bybit_protection_order(
+    order: dict[str, Any],
+    execution: DemoExecutionRecord,
+    positions: list[dict[str, Any]],
+) -> bool:
+    """Attribute only Bybit-generated position TP/SL with full agreement."""
+    if str(order.get("symbol") or "") != execution.symbol.value:
+        return False
+    expected_side = "SELL" if execution.side == Side.BUY else "BUY"
+    if str(order.get("side") or "").upper() != expected_side:
+        return False
+    if str(order.get("reduceOnly") or "").lower() != "true":
+        return False
+    if str(order.get("closeOnTrigger") or "").lower() != "true":
+        return False
+    stop_type = str(order.get("stopOrderType") or "")
+    if stop_type not in {"TakeProfit", "StopLoss"}:
+        return False
+    if execution.accepted_quantity <= 0 or _decimal(
+        order.get("qty"), default="0"
+    ) != execution.accepted_quantity:
+        return False
+    position = next((
+        item for item in positions
+        if str(item.get("symbol") or "") == execution.symbol.value
+        and _decimal(item.get("size"), default="0") == execution.accepted_quantity
+    ), None)
+    if position is None or execution.take_profit is None or execution.stop_loss is None:
+        return False
+    if not _protection_matches(position, execution.take_profit, execution.stop_loss):
+        return False
+    expected_trigger = (
+        execution.take_profit if stop_type == "TakeProfit" else execution.stop_loss
+    )
+    return _decimal(order.get("triggerPrice"), default="0") == expected_trigger
 
 
 def _sanitized_error(exc: Exception) -> str:

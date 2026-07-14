@@ -23,7 +23,7 @@ soak without the user's explicit `-AllowDemoOrders` confirmation.
 - `app/risk/manager.py`: deterministic sizing and risk preview.
 - `app/portfolio/paper_trading.py`: paper positions, accounting, cooldowns, kill switch.
 - `app/db/persistence.py`: SQLAlchemy rows and atomic persistence operations.
-- `alembic/versions/`: migrations; current head is `20260714_0012`.
+- `alembic/versions/`: migrations; current head is `20260714_0013`.
 - `scripts/repair_news_payloads.py`: transactional historical NewsItem audit,
   deterministic repair, and quarantine (`--dry-run` before `--apply`).
 - `tests/`: unit/API tests plus optional PostgreSQL regression tests.

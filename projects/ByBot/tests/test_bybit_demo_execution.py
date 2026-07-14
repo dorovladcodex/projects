@@ -1330,3 +1330,40 @@ def test_stale_private_event_after_resume_watermark_is_discarded() -> None:
         "data": [{"orderId": "old", "updatedTime": "1000", "orderStatus": "Filled"}],
     })
     assert repo.events == set()
+
+
+def test_direct_cleanup_cancels_only_owned_protection_and_closes_reduce_only() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = DemoExecutionService(
+        demo_settings(demo_canary_enabled=True),
+        repo, client, run_id="demo-test-run",
+    )
+    candidate, _, _, _ = candidate_bundle()
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=1, run_id=demo.run_id,
+        order_link_id="entry", order_id="entry-id",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("65000"), take_profit=Decimal("65650"),
+        stop_loss=Decimal("64675"), protection_confirmed=True,
+    )
+    repo.records[str(candidate.id)] = record
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.001", "side": "Buy",
+        "takeProfit": "65650", "stopLoss": "64675", "leverage": "1",
+        "positionIdx": 0,
+    }]
+    client.open_orders = [{
+        "symbol": "BTCUSDT", "orderId": "tp", "orderLinkId": "",
+        "side": "Sell", "qty": "0.001", "reduceOnly": True,
+        "closeOnTrigger": True, "stopOrderType": "TakeProfit",
+        "triggerPrice": "65650",
+    }]
+
+    demo.direct_cleanup_execution(str(record.id), "restart failed")
+
+    assert client.cancelled == [(Symbol.BTCUSDT, "tp")]
+    assert len(client.orders) == 1
+    assert client.orders[0]["reduceOnly"] == "true"
+    assert client.orders[0]["qty"] == "0.001"

@@ -23,6 +23,7 @@ RESOLVED_STATES = {
     DemoExecutionState.DEMO_NOT_SUBMITTED,
     DemoExecutionState.DEMO_ORDER_CANCELLED,
     DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+    DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
     DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
 }
 
@@ -136,6 +137,13 @@ class ReadOnlyBybitDemoClient:
             "orderId",
         )
 
+    def get_transaction_log(self) -> list[dict[str, Any]]:
+        return self._paginate(
+            "/v5/account/transaction-log",
+            {"accountType": "UNIFIED", "category": "linear", "currency": "USDT"},
+            "id",
+        )
+
     def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
         timestamp = str(int(time.time() * 1000))
         query = urlencode(sorted(params.items()))
@@ -199,6 +207,7 @@ class DemoDiagnosticsResult:
     failures: list[str]
     latest_order_history: list[dict[str, Any]]
     latest_execution_events: list[dict[str, Any]]
+    newest_execution: DemoExecutionRecord | None
 
     @property
     def passed(self) -> bool:
@@ -251,10 +260,15 @@ def evaluate_demo_recovery_readiness(
     }
     required_repair_audit = {
         "READ_ONLY_RECONCILIATION_COMPLETED",
-        "EXECUTION_REPAIR_APPLIED",
         "FINAL_REMOTE_STATE_FLAT",
     }
-    repair_complete = required_repair_audit.issubset(audit_types)
+    repair_complete = bool(
+        required_repair_audit.issubset(audit_types)
+        and audit_types.intersection({
+            "EXECUTION_REPAIR_APPLIED", "EXTERNAL_CLOSE_ATTRIBUTED",
+            "EXECUTION_FINALIZED_FLAT_VERIFIED",
+        })
+    )
     history = result.latest_order_history
     entry_rows = [row for row in history if latest and _matches_order(
         row, latest.order_id, latest.order_link_id
@@ -314,7 +328,8 @@ def evaluate_demo_recovery_readiness(
     )
     activation_link_valid = linked is not None or inferred_link
     linked_activation_id = (
-        str(linked.get("id")) if linked else
+        str((linked.get("payload") or {}).get("activation_id") or linked.get("id"))
+        if linked else
         ("repair-audit-inference" if inferred_link else None)
     )
 
@@ -322,8 +337,18 @@ def evaluate_demo_recovery_readiness(
     reason_classes = [_classify_kill_reason(reason) for reason in reasons]
     reason_classification = ",".join(sorted(set(reason_classes))) or "none"
     reasons_recoverable = bool(reasons) and all(
-        item == "resolved_protection_incident" for item in reason_classes
+        item in {
+            "resolved_protection_incident",
+            "restart_protection_ownership_incident",
+        }
+        for item in reason_classes
     )
+    if "restart_protection_ownership_incident" in reason_classes:
+        reasons_recoverable = bool(
+            reasons_recoverable and latest
+            and latest.state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+            and repair_complete and remote_verified and activation_link_valid
+        )
 
     safely_closed = False
     if latest and terminal and cleanup_matches:
@@ -402,10 +427,27 @@ def run_demo_diagnostics(
         "activated_at": None, "activation_count": 0, "events": [],
     }
     executions = sorted(
-        repo.load_demo_executions(), key=lambda item: item.updated_at, reverse=True
+        repo.load_demo_executions(), key=lambda item: item.created_at, reverse=True
     )
-    latest = executions[0] if executions else None
+    newest = executions[0] if executions else None
     unresolved = [item for item in executions if not _execution_is_resolved(item)]
+    linked_ids = {
+        str(event.get("execution_id") or "")
+        for event in kill_switch.get("events") or []
+        if event.get("active") and event.get("execution_id")
+    }
+    linked_unresolved = [item for item in unresolved if str(item.id) in linked_ids]
+    failed_terminal = [
+        item for item in executions
+        if _execution_is_resolved(item) and item.failure_reason
+    ]
+    terminal = [item for item in executions if _execution_is_resolved(item)]
+    latest = (
+        (linked_unresolved[0] if linked_unresolved else None)
+        or (unresolved[0] if unresolved else None)
+        or (failed_terminal[0] if failed_terminal else None)
+        or (terminal[0] if terminal else None)
+    )
 
     known_links = {
         link
@@ -466,11 +508,13 @@ def run_demo_diagnostics(
         failures=failures,
         latest_order_history=order_history,
         latest_execution_events=execution_events,
+        newest_execution=newest,
     )
 
 
 def format_demo_diagnostics(result: DemoDiagnosticsResult) -> str:
     latest = result.latest_execution
+    newest = result.newest_execution
     reasons = result.kill_switch.get("reasons") or []
     lines = [
         f"DEMO KILL SWITCH ACTIVE: {str(bool(result.kill_switch.get('active'))).lower()}",
@@ -479,8 +523,9 @@ def format_demo_diagnostics(result: DemoDiagnosticsResult) -> str:
         + _display_time(result.kill_switch.get("activated_at")),
         "DEMO KILL SWITCH ACTIVATION COUNT: "
         + str(result.kill_switch.get("activation_count") or 0),
-        "LATEST DEMO EXECUTION ID: " + (str(latest.id) if latest else "none"),
-        "LATEST DEMO EXECUTION STATE: " + (latest.state.value if latest else "none"),
+        "LATEST DEMO EXECUTION ID: " + (str(newest.id) if newest else "none"),
+        "LATEST DEMO EXECUTION STATE: " + (newest.state.value if newest else "none"),
+        "ACTIVE INCIDENT EXECUTION ID: " + (str(latest.id) if latest else "none"),
         "LATEST DEMO FAILURE REASON: " + ((latest.failure_reason or "none") if latest else "none"),
         "LATEST DEMO CLEANUP RESULT: " + ((latest.cleanup_result or "none") if latest else "none"),
         f"REMOTE BOT-OWNED OPEN ORDERS: {len(result.bot_owned_open_orders)}",
@@ -533,6 +578,7 @@ def _execution_is_resolved(record: DemoExecutionRecord) -> bool:
         DemoExecutionState.DEMO_NOT_SUBMITTED,
         DemoExecutionState.DEMO_ORDER_CANCELLED,
         DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+        DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
         DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
     }:
         return bool(record.cleanup_result)
@@ -571,6 +617,8 @@ def _classify_kill_reason(reason: str) -> str:
     if any(token in normalized for token in risk_tokens):
         return "risk_limit"
     if any(token in normalized for token in unsafe_tokens):
+        if normalized == "unattributed active demo order for btcusdt":
+            return "restart_protection_ownership_incident"
         return "unknown_exchange_state"
     protection_tokens = (
         "position update has no tp/sl",
