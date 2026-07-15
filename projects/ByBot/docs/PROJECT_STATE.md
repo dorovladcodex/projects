@@ -81,3 +81,19 @@ Run all four scripts in `scripts/` for Windows/Docker E2E validation.
   single-process and requires PostgreSQL, valid Demo credentials, network, RSS,
   public market data, and the configured classifier.
 - Live order placement remains permanently out of scope.
+
+## V2 direct-Demo milestone
+
+- Dynamic validation for 17 USDT linear symbols with durable exclusions.
+- Public ticker/trade/order-book/liquidation WebSocket ingestion and bounded REST
+  funding/open-interest/ticker fallback across seven rolling windows.
+- News Momentum V2, Volume Breakout, OI/Funding Squeeze, Liquidation Momentum and
+  Meme Trend strategies with independent feature flags.
+- Shared scoring, Decimal quantity/leverage normalization, restart-safe portfolio
+  reservations and concurrent per-symbol execution.
+- Strategy-specific volatility stops, targets, trailing/break-even metadata and
+  exact-owned position monitoring reuse V1 protection/reconciliation.
+- Run-scoped JSON/CSV analytics; migration head `20260715_0014`.
+
+The V2 soak is prepared but requires explicit operator authorization. Feature
+history is primarily in memory; selected snapshots and all decisions are durable.

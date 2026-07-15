@@ -5,7 +5,7 @@ from functools import lru_cache
 from decimal import Decimal
 from datetime import datetime
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.db.url import normalize_database_url
@@ -115,6 +115,68 @@ class Settings(BaseSettings):
     )
     demo_reconciliation_interval_seconds: int = Field(default=15, ge=5, le=300)
     demo_order_confirmation_timeout_seconds: int = Field(default=30, ge=5, le=300)
+
+    # V2 is an explicit, Demo-only runtime. Defaults never submit an order.
+    v2_enabled: bool = False
+    v2_auto_demo_execution: bool = False
+    v2_universe_symbols: tuple[str, ...] = (
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "NEARUSDT",
+        "LTCUSDT", "TONUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
+        "BONKUSDT", "FLOKIUSDT",
+    )
+    v2_universe_refresh_seconds: int = Field(default=300, ge=30, le=3600)
+    v2_market_stale_seconds: int = Field(default=15, ge=2, le=300)
+    v2_min_turnover_24h_usdt: Decimal = Field(default=Decimal("1000000"), ge=0)
+    v2_max_spread_bps: Decimal = Field(default=Decimal("15"), gt=0)
+    v2_min_orderbook_depth_usdt: Decimal = Field(default=Decimal("10000"), ge=0)
+    v2_public_ws_url: str = "wss://stream.bybit.com/v5/public/linear"
+    v2_public_rest_url: str = "https://api.bybit.com"
+    v2_ws_reconnect_max_seconds: int = Field(default=30, ge=1, le=300)
+    v2_rest_metrics_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    v2_feature_history_limit: int = Field(default=7200, ge=120, le=100000)
+
+    v2_news_momentum_enabled: bool = True
+    v2_volume_breakout_enabled: bool = True
+    v2_oi_funding_squeeze_enabled: bool = True
+    v2_liquidation_momentum_enabled: bool = True
+    v2_meme_trend_enabled: bool = True
+    v2_strategy_default_threshold: float = Field(default=0.62, ge=0, le=1)
+    v2_meme_strategy_threshold: float = Field(default=0.70, ge=0, le=1)
+    v2_min_expected_edge_bps: Decimal = Field(default=Decimal("8"), ge=0)
+
+    max_concurrent_positions: int = Field(default=8, ge=1, le=50)
+    max_positions_per_symbol: int = Field(default=1, ge=1, le=5)
+    max_meme_positions: int = Field(default=2, ge=0, le=20)
+    max_positions_per_correlation_group: int = Field(default=3, ge=1, le=20)
+    max_new_entries_per_5_minutes: int = Field(default=5, ge=1, le=100)
+    max_trades_per_day: int = Field(default=100, ge=1, le=10000)
+    v2_symbol_cooldown_seconds: int = Field(default=300, ge=0, le=86400)
+    v2_global_entry_cooldown_seconds: int = Field(default=0, ge=0, le=86400)
+
+    risk_capital_usdt: Decimal = Field(default=Decimal("2000"), gt=0)
+    max_total_notional_usdt: Decimal = Field(default=Decimal("500"), gt=0)
+    max_portfolio_risk_pct: Decimal = Field(default=Decimal("4"), gt=0, le=100)
+    v2_max_daily_loss_pct: Decimal = Field(default=Decimal("8"), gt=0, le=100)
+    v2_max_weekly_loss_pct: Decimal = Field(default=Decimal("15"), gt=0, le=100)
+    v2_max_drawdown_pct: Decimal = Field(default=Decimal("20"), gt=0, le=100)
+    core_position_notional_usdt: Decimal = Field(default=Decimal("75"), gt=0)
+    alt_position_notional_usdt: Decimal = Field(default=Decimal("50"), gt=0)
+    meme_position_notional_usdt: Decimal = Field(default=Decimal("25"), gt=0)
+    core_leverage: Decimal = Field(default=Decimal("3"), ge=1)
+    alt_leverage: Decimal = Field(default=Decimal("2"), ge=1)
+    meme_leverage: Decimal = Field(default=Decimal("2"), ge=1)
+    v2_maker_fee_bps: Decimal = Field(default=Decimal("2"), ge=0)
+    v2_taker_fee_bps: Decimal = Field(default=Decimal("6"), ge=0)
+    v2_slippage_bps: Decimal = Field(default=Decimal("3"), ge=0)
+    v2_report_directory: str = "artifacts/demo-v2"
+    v2_additional_rss_urls: tuple[str, ...] = (
+        "https://decrypt.co/feed",
+    )
+    v2_bybit_announcements_enabled: bool = True
+    v2_bybit_announcements_url: str = "https://api.bybit.com/v5/announcements/index?locale=en-US&limit=20"
+    v2_coingecko_trending_url: str = "https://api.coingecko.com/api/v3/search/trending"
+    v2_coingecko_markets_url: str = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=1"
 
     signal_min_classification_confidence: float = Field(default=0.80, ge=0, le=1)
     signal_min_news_importance: float = Field(default=0.70, ge=0, le=1)
@@ -243,6 +305,10 @@ class Settings(BaseSettings):
         if self.execution_mode != ExecutionMode.BYBIT_DEMO:
             if self.demo_canary_enabled:
                 raise ValueError("DEMO_CANARY_ENABLED requires BYBIT_DEMO execution mode")
+            if self.v2_auto_demo_execution:
+                raise ValueError(
+                    "V2_AUTO_DEMO_EXECUTION requires BYBIT_DEMO execution mode"
+                )
             return self
         errors: list[str] = []
         if self.app_env.lower() != "demo":
@@ -263,8 +329,13 @@ class Settings(BaseSettings):
             errors.append("Demo private WebSocket domain must be exactly wss://stream-demo.bybit.com")
         if self.auto_paper_execution:
             errors.append("AUTO_PAPER_EXECUTION must be false in BYBIT_DEMO mode")
-        if self.demo_leverage != 1:
+        if not self.v2_enabled and self.demo_leverage != 1:
             errors.append("Demo leverage must be exactly 1")
+        if self.v2_enabled and not self.v2_auto_demo_execution:
+            # Read-only/preflight V2 may start without automatic submissions.
+            pass
+        if self.v2_auto_demo_execution and not self.v2_enabled:
+            errors.append("V2_AUTO_DEMO_EXECUTION requires V2_ENABLED=true")
         if not self.bybit_api_key or not self.bybit_api_secret:
             errors.append("Demo API credentials are required")
         if errors:
@@ -273,15 +344,36 @@ class Settings(BaseSettings):
 
     @field_validator("allowed_symbols")
     @classmethod
-    def restrict_symbols(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def restrict_symbols(cls, value: tuple[str, ...], info: ValidationInfo) -> tuple[str, ...]:
         supported = {"BTCUSDT", "ETHUSDT"}
+        if bool(info.data.get("v2_enabled")):
+            supported = {
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+            "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "NEARUSDT",
+            "LTCUSDT", "TONUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
+            "BONKUSDT", "FLOKIUSDT",
+            }
         symbols = tuple(symbol.upper() for symbol in value)
         if not symbols:
             raise ValueError("At least one active symbol is required")
         unsupported = sorted(set(symbols) - supported)
         if unsupported:
-            raise ValueError(f"Unsupported symbols in v1: {', '.join(unsupported)}")
+            raise ValueError(f"Unsupported symbols: {', '.join(unsupported)}")
         return symbols
+
+    def v2_leverage_for_symbol(self, symbol: str) -> Decimal:
+        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}:
+            return self.core_leverage
+        if symbol in {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
+            return self.meme_leverage
+        return self.alt_leverage
+
+    def v2_target_notional_for_symbol(self, symbol: str) -> Decimal:
+        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}:
+            return self.core_position_notional_usdt
+        if symbol in {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
+            return self.meme_position_notional_usdt
+        return self.alt_position_notional_usdt
 
 
 @lru_cache

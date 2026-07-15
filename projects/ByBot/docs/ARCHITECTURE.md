@@ -109,3 +109,16 @@ instrument filters and remote conflicts, persists a unique reservation, submits
 through an exact-domain V5 adapter, then advances state only from private stream
 or REST evidence. Protection uses actual average fill price; remote state is
 authoritative during startup, periodic, restart, and cleanup reconciliation.
+
+### ByBot V2 direct-Demo extension
+
+`app/v2/` extends the V1 durable state machine in place:
+
+`17-symbol universe -> public WS/REST rolling features -> five deterministic
+strategies -> common score -> durable portfolio reservation -> guarded Demo
+execution -> verified TP/SL -> run-scoped reports`.
+
+Per-symbol locks and a unique active reservation enforce one owned position per
+symbol. Portfolio, correlation, meme, rate, daily trade, notional and loss limits
+are checked before the existing durable Demo execution path. Numeric market data
+is never sent to an LLM. Live/mainnet/testnet mutation paths remain unavailable.

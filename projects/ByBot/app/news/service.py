@@ -263,6 +263,16 @@ def detect_asset(text: str) -> Asset:
         return Asset.ETH
     if KEYWORD_MATCHER.find_matches(normalized, MARKET_KEYWORDS):
         return Asset.MARKET
+    # V2 uses its deterministic entity mapper to choose exact alt symbols. The
+    # legacy classifier schema intentionally receives MARKET, never a fabricated
+    # BTC/ETH asset, for supported alt/project news.
+    if KEYWORD_MATCHER.find_matches(normalized, (
+        "solana", "sol", "xrp", "ripple", "dogecoin", "doge", "cardano",
+        "ada", "chainlink", "link", "avalanche", "avax", "sui", "near",
+        "litecoin", "ltc", "toncoin", "ton", "pepe", "shiba inu", "shib",
+        "dogwifhat", "wif", "bonk", "floki",
+    )):
+        return Asset.MARKET
     return Asset.OTHER
 
 

@@ -116,6 +116,13 @@ class ReadOnlyBybitDemoClient:
             "positionIdx",
         )
 
+    def get_usdt_positions(self) -> list[dict[str, Any]]:
+        return self._paginate(
+            "/v5/position/list",
+            {"category": "linear", "settleCoin": "USDT"},
+            "symbol",
+        )
+
     def get_order_history(self, symbol: Symbol) -> list[dict[str, Any]]:
         return self._paginate(
             "/v5/order/history",

@@ -26,6 +26,21 @@ class LLMAsset(str, Enum):
 class Symbol(str, Enum):
     BTCUSDT = "BTCUSDT"
     ETHUSDT = "ETHUSDT"
+    SOLUSDT = "SOLUSDT"
+    XRPUSDT = "XRPUSDT"
+    DOGEUSDT = "DOGEUSDT"
+    ADAUSDT = "ADAUSDT"
+    LINKUSDT = "LINKUSDT"
+    AVAXUSDT = "AVAXUSDT"
+    SUIUSDT = "SUIUSDT"
+    NEARUSDT = "NEARUSDT"
+    LTCUSDT = "LTCUSDT"
+    TONUSDT = "TONUSDT"
+    PEPEUSDT = "PEPEUSDT"
+    SHIBUSDT = "SHIBUSDT"
+    WIFUSDT = "WIFUSDT"
+    BONKUSDT = "BONKUSDT"
+    FLOKIUSDT = "FLOKIUSDT"
 
 
 class Sentiment(str, Enum):
@@ -154,6 +169,9 @@ class DemoExecutionRecord(BaseModel):
     symbol: Symbol
     side: Side
     requested_quantity: Decimal = Field(gt=0)
+    leverage: Decimal = Field(default=Decimal("1"), ge=1)
+    strategy_name: str | None = None
+    strategy_version: str | None = None
     reference_entry_price: Decimal | None = Field(default=None, gt=0)
     accepted_quantity: Decimal = Field(default=Decimal("0"), ge=0)
     average_fill_price: Decimal | None = Field(default=None, gt=0)
@@ -163,6 +181,11 @@ class DemoExecutionRecord(BaseModel):
     exchange_fees: Decimal = Decimal("0")
     take_profit: Decimal | None = None
     stop_loss: Decimal | None = None
+    stop_loss_pct: Decimal | None = Field(default=None, gt=0)
+    take_profit_pct: Decimal | None = Field(default=None, gt=0)
+    trailing_stop_pct: Decimal | None = Field(default=None, gt=0)
+    break_even_at_r: Decimal | None = Field(default=None, gt=0)
+    maximum_holding_seconds: int | None = Field(default=None, gt=0)
     tp_identifier: str | None = None
     sl_identifier: str | None = None
     protection_confirmed: bool = False
@@ -171,6 +194,8 @@ class DemoExecutionRecord(BaseModel):
     close_fills: list[DemoFill] = Field(default_factory=list)
     average_close_price: Decimal | None = Field(default=None, gt=0)
     realized_exchange_pnl: Decimal | None = None
+    maximum_favorable_excursion: Decimal = Decimal("0")
+    maximum_adverse_excursion: Decimal = Decimal("0")
     entry_slippage: Decimal | None = None
     exit_slippage: Decimal | None = None
     paper_shadow_pnl: Decimal | None = None
@@ -179,6 +204,10 @@ class DemoExecutionRecord(BaseModel):
     cleanup_result: str | None = None
     last_reconciliation_at: datetime | None = None
     last_error: str | None = None
+    signal_created_at: datetime | None = None
+    order_submitted_at: datetime | None = None
+    first_fill_at: datetime | None = None
+    closed_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

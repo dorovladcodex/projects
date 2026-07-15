@@ -23,7 +23,9 @@ soak without the user's explicit `-AllowDemoOrders` confirmation.
 - `app/risk/manager.py`: deterministic sizing and risk preview.
 - `app/portfolio/paper_trading.py`: paper positions, accounting, cooldowns, kill switch.
 - `app/db/persistence.py`: SQLAlchemy rows and atomic persistence operations.
-- `alembic/versions/`: migrations; current head is `20260714_0013`.
+- `app/v2/`: V2 universe, rolling features, five strategies, scoring,
+  durable portfolio reservations, Demo coordinator, analytics and runtime.
+- `alembic/versions/`: migrations; current head is `20260715_0014`.
 - `scripts/repair_news_payloads.py`: transactional historical NewsItem audit,
   deterministic repair, and quarantine (`--dry-run` before `--apply`).
 - `tests/`: unit/API tests plus optional PostgreSQL regression tests.
@@ -43,8 +45,9 @@ from normal news/candidate restore; never delete or bypass this audit trail.
 - Use `Decimal` for financial assertions/calculations where practical; never
   allow missing numeric fields to silently become zero.
 - Never print `.env`, `DATABASE_URL`, API keys, authorization values, or CLI credentials.
-- Demo sizing uses `DEMO_RISK_CAPITAL_USDT=10000`, never Demo wallet equity;
-  leverage is exactly 1 and exchange precision comes from instruments-info.
+- V1 canary sizing uses `DEMO_RISK_CAPITAL_USDT=10000` and exactly 1x. V2 uses
+  dedicated `RISK_CAPITAL_USDT`, per-category leverage and live instrument
+  precision; neither path sizes from Demo wallet equity.
 
 ## Validation commands
 
@@ -83,6 +86,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\paper_soak.ps1 -Hours 1
   it does not load FastAPI settings and has no exchange mutation methods.
 - `demo_kill_switch_reset.py`: dry-run-by-default latch recovery; applying a
   reset requires the exact terminal execution ID and `--confirm-reset`.
+- `demo_v2_preflight.py`: standalone read-only V2 account, persistence and
+  17-symbol universe validation; it has no exchange mutation methods.
+- `demo_v2_soak.ps1`: operator-authorized direct-Demo V2 runner. It requires
+  `-AllowDemoOrders`; Codex must never launch it autonomously.
 
 Run targeted tests while editing, the full suite once at the end, then all
 smokes. Preserve unrelated user changes and keep `.env` untracked.

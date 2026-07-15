@@ -275,7 +275,7 @@ def require_demo_execution(settings: Settings) -> None:
         raise DemoSafetyError("Demo trading is not explicitly enabled")
     if settings.bybit_live_trading_enabled or settings.bybit_enable_trading:
         raise DemoSafetyError("Live or generic Bybit trading flags are forbidden")
-    if settings.demo_leverage != 1:
+    if not settings.v2_enabled and settings.demo_leverage != 1:
         raise DemoSafetyError("Demo leverage must be exactly 1")
 
 
@@ -756,7 +756,11 @@ class DemoExecutionService:
                 if int(position.get("positionIdx") or 0) != 0:
                     raise DemoSafetyError("hedge position mode is not supported")
             self._ensure_symbol_leverage(
-                symbol, positions=positions, open_orders=open_orders
+                symbol, positions=positions, open_orders=open_orders,
+                desired_leverage=(
+                    self.settings.v2_leverage_for_symbol(symbol.value)
+                    if self.settings.v2_enabled else Decimal("1")
+                ),
             )
             for position in positions:
                 if (
@@ -795,8 +799,9 @@ class DemoExecutionService:
         *,
         positions: list[dict[str, Any]] | None = None,
         open_orders: list[dict[str, Any]] | None = None,
+        desired_leverage: Decimal = Decimal("1"),
     ) -> None:
-        """Confirm 1x on both sides, normalizing only a completely flat Demo symbol."""
+        """Confirm target leverage, normalizing only a completely flat Demo symbol."""
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
         require_demo_execution(self.settings)
@@ -809,7 +814,13 @@ class DemoExecutionService:
             "buy": _format_decimal(buy_leverage),
             "sell": _format_decimal(sell_leverage),
         }
-        if buy_leverage == Decimal("1") and sell_leverage == Decimal("1"):
+        rules = self.client.get_instrument(symbol)
+        target = min(max(desired_leverage, rules.min_leverage), rules.max_leverage)
+        steps = ((target - rules.min_leverage) / rules.leverage_step).to_integral_value(
+            rounding=ROUND_DOWN
+        )
+        target = rules.min_leverage + steps * rules.leverage_step
+        if buy_leverage == target and sell_leverage == target:
             return
         if any(_decimal(item.get("size"), default="0") > 0 for item in current_positions):
             raise DemoSafetyError(
@@ -825,7 +836,7 @@ class DemoExecutionService:
                 f"{symbol.value} leverage is not 1x and active orders prevent normalization"
             )
         try:
-            self.client.set_leverage(symbol, Decimal("1"))
+            self.client.set_leverage(symbol, target)
             confirmed_positions = self.client.get_positions(symbol)
             confirmed_buy, confirmed_sell = _position_leverages(confirmed_positions, symbol)
         except Exception as exc:
@@ -839,7 +850,7 @@ class DemoExecutionService:
             "buy": _format_decimal(confirmed_buy),
             "sell": _format_decimal(confirmed_sell),
         }
-        if confirmed_buy != Decimal("1") or confirmed_sell != Decimal("1"):
+        if confirmed_buy != target or confirmed_sell != target:
             mode = self.account_margin_mode or "unknown"
             raise DemoSafetyError(
                 f"{symbol.value} leverage could not be confirmed as 1x "
@@ -855,6 +866,12 @@ class DemoExecutionService:
         snapshot: MarketSnapshot,
         *,
         canary_plan: CanaryMinimumOrderPlan | None = None,
+        desired_leverage: Decimal | None = None,
+        strategy_name: str | None = None,
+        strategy_version: str | None = None,
+        trailing_stop_pct: Decimal | None = None,
+        break_even_at_r: Decimal | None = None,
+        maximum_holding_seconds: int | None = None,
     ) -> DemoExecutionRecord | None:
         if not self.enabled or self.client is None:
             return None
@@ -899,8 +916,9 @@ class DemoExecutionService:
             quantity = normalize_quantity(Decimal(str(preview.capped_size)), rules)
         validate_order_notional(quantity, entry_reference, rules)
         self._validate_remote_entry_state(candidate.symbol)
-        self._ensure_symbol_leverage(candidate.symbol)
-        self._verify_leverage_and_mode(candidate.symbol)
+        leverage = desired_leverage or Decimal(str(self.settings.demo_leverage))
+        self._ensure_symbol_leverage(candidate.symbol, desired_leverage=leverage)
+        self._verify_leverage_and_mode(candidate.symbol, desired_leverage=leverage)
         side = Side.BUY if candidate.final_action == NewsSignalAction.BUY else Side.SELL
         order_link_id = deterministic_order_link_id(
             self.order_prefix, candidate.id, "entry"
@@ -915,6 +933,15 @@ class DemoExecutionService:
             side=side,
             requested_quantity=quantity,
             reference_entry_price=entry_reference,
+            leverage=leverage,
+            strategy_name=strategy_name,
+            strategy_version=strategy_version,
+            stop_loss_pct=Decimal(str(candidate.proposed_stop_loss_pct)),
+            take_profit_pct=Decimal(str(candidate.proposed_take_profit_pct)),
+            trailing_stop_pct=trailing_stop_pct,
+            break_even_at_r=break_even_at_r,
+            maximum_holding_seconds=maximum_holding_seconds,
+            signal_created_at=candidate.created_at,
         )
         reserved = self.repository.reserve_demo_execution(record)
         if reserved is None:
@@ -923,6 +950,7 @@ class DemoExecutionService:
         if reserved is not None and reserved.id != record.id:
             return reserved
         try:
+            record.order_submitted_at = datetime.now(timezone.utc)
             response = self.client.create_order({
                 "category": "linear",
                 "symbol": candidate.symbol.value,
@@ -1593,6 +1621,87 @@ class DemoExecutionService:
         self._submit_reduce_only_close(record, remote_size, "canary_close")
         return record
 
+    def monitor_strategy_position(
+        self,
+        execution_id: str,
+        last_price: Decimal,
+        *,
+        data_fresh: bool = True,
+        setup_valid: bool = True,
+        now: datetime | None = None,
+    ) -> DemoExecutionRecord | None:
+        """Manage one exact owned V2 position; unrelated positions are untouched."""
+        current = now or datetime.now(timezone.utc)
+        record = next(
+            (item for item in self.repository.load_demo_executions() if str(item.id) == execution_id),
+            None,
+        )
+        if record is None or record.state != DemoExecutionState.DEMO_POSITION_OPEN:
+            return record
+        if record.average_fill_price is None or record.accepted_quantity <= 0:
+            return record
+        direction = Decimal("1") if record.side == Side.BUY else Decimal("-1")
+        move = direction * (last_price / record.average_fill_price - Decimal("1"))
+        record.maximum_favorable_excursion = max(record.maximum_favorable_excursion, move)
+        record.maximum_adverse_excursion = min(record.maximum_adverse_excursion, move)
+        close_reason: str | None = None
+        if record.maximum_holding_seconds and (
+            current - _aware(record.created_at)
+        ).total_seconds() >= record.maximum_holding_seconds:
+            close_reason = "maximum_holding_time"
+        elif not data_fresh:
+            close_reason = "stale_signal"
+        elif not setup_valid:
+            close_reason = "invalidated_setup"
+        if close_reason:
+            self._submit_reduce_only_close(record, record.accepted_quantity, close_reason)
+            return record
+        if (
+            self.client is not None
+            and record.trailing_stop_pct is not None
+            and record.take_profit is not None
+            and record.stop_loss is not None
+            and record.protection_confirmed
+            and move > Decimal("0")
+        ):
+            positions = [
+                item for item in self.client.get_positions(record.symbol)
+                if _decimal(item.get("size"), default="0") > 0
+            ]
+            owned = next((item for item in positions if (
+                _decimal(item.get("size"), default="0") == record.accepted_quantity
+                and str(item.get("side") or "").upper() == record.side.value
+            )), None)
+            if owned is not None:
+                rules = self.client.get_instrument(record.symbol)
+                trail = record.trailing_stop_pct / Decimal("100")
+                proposed = (
+                    normalize_price(last_price * (Decimal("1") - trail), rules, round_up=False)
+                    if record.side == Side.BUY
+                    else normalize_price(last_price * (Decimal("1") + trail), rules, round_up=True)
+                )
+                break_even_trigger = (record.break_even_at_r or Decimal("1")) * (
+                    record.stop_loss_pct or Decimal("0")
+                ) / Decimal("100")
+                if move >= break_even_trigger:
+                    proposed = (
+                        max(proposed, record.average_fill_price)
+                        if record.side == Side.BUY
+                        else min(proposed, record.average_fill_price)
+                    )
+                improves = (
+                    proposed > record.stop_loss if record.side == Side.BUY
+                    else proposed < record.stop_loss
+                )
+                if improves:
+                    self.client.set_trading_stop(record.symbol, record.take_profit, proposed)
+                    record.stop_loss = proposed
+                    record.updated_at = current
+                    self.repository.save_demo_execution(record, event_type="V2_TRAILING_STOP_UPDATED")
+        record.updated_at = current
+        self.repository.save_demo_execution(record, event_type="V2_POSITION_METRICS_UPDATED")
+        return record
+
     def as_status(self) -> dict[str, Any]:
         records = self.repository.load_demo_executions() if self.repository else []
         counts: dict[str, int] = {}
@@ -1791,6 +1900,9 @@ class DemoExecutionService:
             if fill.order_id and not record.close_order_id:
                 record.close_order_id = fill.order_id
             record.close_fills.append(fill)
+            record.closed_at = max(
+                (entry.executed_at for entry in record.close_fills), default=fill.executed_at
+            )
             close_qty = sum((entry.quantity for entry in record.close_fills), Decimal("0"))
             close_value = sum(
                 (entry.quantity * entry.price for entry in record.close_fills), Decimal("0")
@@ -1824,6 +1936,8 @@ class DemoExecutionService:
             ):
                 return
             record.fills.append(fill)
+            if record.first_fill_at is None:
+                record.first_fill_at = fill.executed_at
             total_qty = sum((entry.quantity for entry in record.fills), Decimal("0"))
             total_value = sum((entry.quantity * entry.price for entry in record.fills), Decimal("0"))
             record.accepted_quantity = total_qty
@@ -1915,8 +2029,14 @@ class DemoExecutionService:
             return
         rules = self.client.get_instrument(record.symbol)
         entry = record.average_fill_price
-        tp_pct = Decimal(str(self.settings.signal_default_take_profit_pct)) / 100
-        sl_pct = Decimal(str(self.settings.signal_default_stop_loss_pct)) / 100
+        tp_pct = (
+            record.take_profit_pct
+            or Decimal(str(self.settings.signal_default_take_profit_pct))
+        ) / 100
+        sl_pct = (
+            record.stop_loss_pct
+            or Decimal(str(self.settings.signal_default_stop_loss_pct))
+        ) / 100
         if record.side == Side.BUY:
             take_profit = normalize_price(entry * (1 + tp_pct), rules, round_up=False)
             stop_loss = normalize_price(entry * (1 - sl_pct), rules, round_up=False)
@@ -2014,7 +2134,11 @@ class DemoExecutionService:
             item for item in self.client.get_positions(settle_coin="USDT")
             if _decimal(item.get("size"), default="0") > 0
         ]
-        if len(all_positions) >= self.settings.paper_max_total_open_positions:
+        max_positions = (
+            self.settings.max_concurrent_positions
+            if self.settings.v2_enabled else self.settings.paper_max_total_open_positions
+        )
+        if len(all_positions) >= max_positions:
             raise DemoSafetyError("maximum total Demo positions reached")
 
     def _enforce_risk_controls(self, symbol: Symbol) -> None:
@@ -2027,49 +2151,89 @@ class DemoExecutionService:
         if records:
             latest_entry = max(item.created_at for item in records)
             if now - _aware(latest_entry) < timedelta(
-                seconds=self.settings.paper_global_entry_cooldown_seconds
+                seconds=(
+                    self.settings.v2_global_entry_cooldown_seconds
+                    if self.settings.v2_enabled
+                    else self.settings.paper_global_entry_cooldown_seconds
+                )
             ):
                 raise DemoSafetyError("global entry cooldown is active")
         symbol_records = [item for item in completed if item.symbol == symbol]
         if symbol_records:
             latest_symbol_close = max(item.updated_at for item in symbol_records)
             if now - _aware(latest_symbol_close) < timedelta(
-                seconds=self.settings.paper_symbol_cooldown_seconds
+                seconds=(
+                    self.settings.v2_symbol_cooldown_seconds
+                    if self.settings.v2_enabled else self.settings.paper_symbol_cooldown_seconds
+                )
             ):
                 raise DemoSafetyError("symbol cooldown is active")
         closed = self.client.get_closed_pnl(settle_coin="USDT")
         daily = Decimal("0")
         weekly = Decimal("0")
+        pnl_timeline: list[tuple[datetime, Decimal]] = []
         for item in closed:
             closed_at = _timestamp(item.get("updatedTime") or item.get("createdTime"))
             pnl = _decimal(item.get("closedPnl"), default="0")
+            pnl_timeline.append((closed_at, pnl))
             age = now - closed_at
             if age <= timedelta(days=1):
                 daily += pnl
             if age <= timedelta(days=7):
                 weekly += pnl
-        capital = self.settings.demo_risk_capital_usdt
+        capital = (
+            self.settings.risk_capital_usdt
+            if self.settings.v2_enabled else self.settings.demo_risk_capital_usdt
+        )
+        equity = capital
+        peak_equity = capital
+        maximum_drawdown_pct = Decimal("0")
+        for _, pnl in sorted(pnl_timeline, key=lambda row: row[0]):
+            equity += pnl
+            peak_equity = max(peak_equity, equity)
+            if peak_equity > 0:
+                maximum_drawdown_pct = max(
+                    maximum_drawdown_pct,
+                    (peak_equity - equity) / peak_equity * Decimal("100"),
+                )
         reasons: list[str] = []
-        if daily <= -(capital * Decimal(str(self.settings.paper_max_daily_net_loss_pct)) / 100):
+        daily_limit = (
+            self.settings.v2_max_daily_loss_pct
+            if self.settings.v2_enabled
+            else Decimal(str(self.settings.paper_max_daily_net_loss_pct))
+        )
+        weekly_limit = (
+            self.settings.v2_max_weekly_loss_pct
+            if self.settings.v2_enabled
+            else Decimal(str(self.settings.paper_max_weekly_net_loss_pct))
+        )
+        drawdown_limit = (
+            self.settings.v2_max_drawdown_pct
+            if self.settings.v2_enabled
+            else Decimal(str(self.settings.paper_max_account_drawdown_pct))
+        )
+        if daily <= -(capital * daily_limit / 100):
             reasons.append("maximum daily Demo net loss reached")
-        if weekly <= -(capital * Decimal(str(self.settings.paper_max_weekly_net_loss_pct)) / 100):
+        if weekly <= -(capital * weekly_limit / 100):
             reasons.append("maximum weekly Demo net loss reached")
-        if weekly <= -(capital * Decimal(str(self.settings.paper_max_account_drawdown_pct)) / 100):
+        if maximum_drawdown_pct >= drawdown_limit:
             reasons.append("maximum Demo account drawdown reached")
         if reasons:
             for reason in reasons:
                 self._activate_kill_switch(reason)
             raise DemoSafetyError("; ".join(reasons))
 
-    def _verify_leverage_and_mode(self, symbol: Symbol) -> None:
+    def _verify_leverage_and_mode(
+        self, symbol: Symbol, *, desired_leverage: Decimal = Decimal("1")
+    ) -> None:
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
         positions = self.client.get_positions(symbol=symbol)
         for item in positions:
             leverage = _decimal(item.get("leverage"), default="1")
             position_idx = int(item.get("positionIdx") or 0)
-            if leverage != Decimal("1"):
-                raise DemoSafetyError("remote leverage is not exactly 1")
+            if leverage != desired_leverage:
+                raise DemoSafetyError("remote leverage does not match configured leverage")
             if position_idx != 0:
                 raise DemoSafetyError("hedge position mode is not supported")
 

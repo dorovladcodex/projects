@@ -50,6 +50,15 @@ from app.risk import RiskManager, RiskRules
 from app.runtime import build_status
 from app.signals import SignalCandidateService
 from app.db import PersistenceRepository
+from app.v2.execution import V2ExecutionCoordinator
+from app.v2.market import RollingFeatureEngine
+from app.v2.news import (
+    CoinGeckoSource, V2ExternalTrendService, V2NewsAggregator,
+    build_default_news_sources,
+)
+from app.v2.portfolio import PortfolioRiskService
+from app.v2.runtime import V2Runtime, v2_cycle_loop
+from app.v2.universe import BybitPublicUniverseClient, SymbolUniverseService
 
 settings = get_settings()
 persistence = PersistenceRepository(settings.database_url, create_schema=False)
@@ -110,10 +119,54 @@ paper_trading_service.restore()
 signal_candidate_service.restore()
 _demo_canary_job_lock = Lock()
 
+v2_run_id = settings.demo_run_id or datetime.now(timezone.utc).strftime(
+    "demo-v2-%Y%m%dT%H%M%SZ"
+)
+v2_universe_service = SymbolUniverseService(
+    settings,
+    BybitPublicUniverseClient(
+        settings.v2_public_rest_url,
+        timeout_seconds=settings.market_data_timeout_seconds,
+    ),
+    persistence,
+)
+v2_feature_engine = RollingFeatureEngine(settings)
+v2_portfolio_service = PortfolioRiskService(settings, persistence)
+v2_execution_coordinator = V2ExecutionCoordinator(
+    settings, persistence, v2_universe_service, v2_portfolio_service,
+    demo_execution_service, run_id=v2_run_id,
+)
+v2_runtime = V2Runtime(
+    settings, persistence, v2_universe_service, v2_feature_engine,
+    V2NewsAggregator(build_default_news_sources(
+        settings.v2_additional_rss_urls,
+        announcement_url=(
+            settings.v2_bybit_announcements_url
+            if settings.v2_bybit_announcements_enabled else None
+        ),
+    )),
+    news_service, v2_portfolio_service, v2_execution_coordinator,
+    V2ExternalTrendService(
+        CoinGeckoSource(settings.v2_coingecko_trending_url, "coingecko-trending"),
+        CoinGeckoSource(settings.v2_coingecko_markets_url, "coingecko-markets"),
+    ),
+    run_id=v2_run_id,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     demo_ws_task = None
+    v2_ws_task = None
+    v2_task = None
+    if settings.v2_enabled:
+        # Public validation precedes any private leverage/order preflight so an
+        # unavailable instrument is excluded rather than crashing the bot.
+        await asyncio.to_thread(v2_universe_service.refresh)
+        accepted = v2_universe_service.accepted_symbols
+        if not accepted:
+            raise RuntimeError("V2 symbol universe has no accepted instruments")
+        settings.allowed_symbols = tuple(symbol.value for symbol in accepted)
     if settings.execution_mode == ExecutionMode.BYBIT_DEMO:
         await asyncio.to_thread(demo_execution_service.verify_account_and_environment)
         await asyncio.to_thread(demo_execution_service.reconcile)
@@ -125,10 +178,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             demo_ws_task = asyncio.create_task(demo_private_stream_loop())
     else:
         account_service.refresh_if_stale(force=True)
-    await asyncio.to_thread(news_service.poll)
+    if not settings.v2_enabled:
+        await asyncio.to_thread(news_service.poll)
     market_data_service.refresh_all()
     signal_candidate_service.process_pending()
-    signal_candidate_service.execute_ready_candidates()
+    if not settings.v2_enabled:
+        signal_candidate_service.execute_ready_candidates()
+    if settings.v2_enabled:
+        await asyncio.to_thread(v2_runtime.start)
+        v2_ws_task = asyncio.create_task(
+            v2_runtime.websocket.run(v2_universe_service.accepted_symbols)
+        )
+        v2_task = asyncio.create_task(v2_cycle_loop(v2_runtime))
     task = asyncio.create_task(news_polling_loop())
     signal_task = asyncio.create_task(signal_recheck_loop())
     demo_reconcile_task = (
@@ -144,6 +205,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             demo_ws_task.cancel()
         if demo_reconcile_task:
             demo_reconcile_task.cancel()
+        if v2_ws_task:
+            v2_runtime.websocket.stop()
+            v2_ws_task.cancel()
+        if v2_task:
+            v2_task.cancel()
         with suppress(asyncio.CancelledError):
             await task
         with suppress(asyncio.CancelledError):
@@ -154,6 +220,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if demo_reconcile_task:
             with suppress(asyncio.CancelledError):
                 await demo_reconcile_task
+        if v2_ws_task:
+            with suppress(asyncio.CancelledError):
+                await v2_ws_task
+        if v2_task:
+            with suppress(asyncio.CancelledError):
+                await v2_task
 
 
 app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
@@ -162,6 +234,57 @@ app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/v2/status")
+def v2_status() -> dict[str, object]:
+    return v2_runtime.status()
+
+
+@app.get("/v2/universe")
+def v2_universe() -> dict[str, object]:
+    return v2_universe_service.as_payload()
+
+
+@app.get("/v2/signals")
+def v2_signals() -> dict[str, object]:
+    return {
+        "run_id": v2_run_id,
+        "count": len(v2_runtime.candidates),
+        "items": [item.model_dump(mode="json") for item in v2_runtime.candidates[-500:]],
+    }
+
+
+@app.get("/v2/preflight")
+def v2_preflight() -> dict[str, object]:
+    blockers = v2_execution_coordinator.safety_preflight(require_auto_execution=False)
+    return {
+        "ok": not blockers,
+        "execution_environment": "BYBIT_DEMO",
+        "live_execution_blocked": True,
+        "mainnet_execution_blocked": True,
+        "testnet_execution_blocked": True,
+        "blockers": blockers,
+        "universe": v2_universe_service.as_payload(),
+    }
+
+
+@app.post("/v2/report")
+def v2_report() -> dict[str, object]:
+    if not settings.v2_enabled:
+        raise HTTPException(status_code=404, detail="V2 is disabled")
+    return v2_runtime.reporter.generate(v2_run_id)
+
+
+@app.post("/v2/stop-new-entries")
+def v2_stop_new_entries() -> dict[str, object]:
+    if settings.app_env.lower() != "demo" or not settings.v2_enabled:
+        raise HTTPException(status_code=404, detail="V2 Demo runtime is disabled")
+    v2_runtime.stop_new_entries = True
+    return {
+        "run_id": v2_run_id, "new_entries_stopped": True,
+        "existing_position_management_active": True,
+    }
 
 
 @app.get("/status")
@@ -423,6 +546,8 @@ def market_symbol(symbol: str) -> dict[str, object]:
         parsed_symbol = Symbol(symbol.upper())
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="Unsupported symbol") from exc
+    if parsed_symbol.value not in settings.allowed_symbols:
+        raise HTTPException(status_code=404, detail="Unsupported symbol")
 
     market_data_service.refresh_all()
     snapshot = market_data_service.latest_snapshot(parsed_symbol)
@@ -915,10 +1040,13 @@ def demo_cleanup() -> dict[str, object]:
 async def news_polling_loop() -> None:
     while True:
         await asyncio.sleep(settings.news_poll_interval_seconds)
+        if settings.v2_enabled:
+            continue
         await asyncio.to_thread(news_service.poll)
         market_data_service.refresh_all()
         signal_candidate_service.process_pending()
-        signal_candidate_service.execute_ready_candidates()
+        if not settings.v2_enabled:
+            signal_candidate_service.execute_ready_candidates()
         monitor_paper_positions()
 
 
@@ -927,7 +1055,8 @@ async def signal_recheck_loop() -> None:
         await asyncio.sleep(settings.signal_reevaluation_interval_seconds)
         await asyncio.to_thread(market_data_service.refresh_all)
         signal_candidate_service.reevaluate_pending()
-        signal_candidate_service.execute_ready_candidates()
+        if not settings.v2_enabled:
+            signal_candidate_service.execute_ready_candidates()
         monitor_paper_positions()
 
 

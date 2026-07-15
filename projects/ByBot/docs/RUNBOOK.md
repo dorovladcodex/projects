@@ -216,3 +216,30 @@ signed GET requests:
 The reset preserves activation reasons and appends `KILL_SWITCH_RESET`. It
 refuses active positions/orders, unresolved executions, unknown exchange state,
 and daily/weekly/drawdown reasons.
+
+## V2 read-only preflight and Demo soak
+
+Windows host processes use PostgreSQL at `127.0.0.1`:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe .\scripts\demo_v2_preflight.py
+```
+
+The preflight performs only signed GET and public market requests. It does not
+load FastAPI or any exchange mutation adapter.
+
+Operator-authorized 30-minute burn-in:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\demo_v2_soak.ps1 -Hours 0.5 -AllowDemoOrders
+```
+
+Operator-authorized 24-hour soak:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\demo_v2_soak.ps1 -Hours 24 -AllowDemoOrders
+```
+
+The runner never resets a kill switch. Optional forced cleanup is explicit and
+may touch only exact bot-owned Demo executions.

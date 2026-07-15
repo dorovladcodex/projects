@@ -26,6 +26,10 @@ from app.models import (
     SignalRiskPreview,
     SignalDryRunResult,
 )
+from app.v2.models import (
+    PortfolioReservation, ReservationState, UniverseStatus, V2Incident,
+    V2SignalCandidate,
+)
 from app.db.url import normalize_database_url
 from app.db.news_repair import audit_news_row, audit_persistence_payload, inspect_or_repair_news_rows, sanitized_validation_error
 from pydantic import ValidationError
@@ -303,6 +307,107 @@ class DemoCanaryJobRow(Base):
     error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class V2UniverseStateRow(Base):
+    __tablename__ = "v2_symbol_universe"
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    state: Mapped[str] = mapped_column(String(30), nullable=False)
+    accepted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    rejection_reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class V2MarketFeatureRow(Base):
+    __tablename__ = "v2_market_feature_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    fresh: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    __table_args__ = (UniqueConstraint("symbol", "captured_at", name="uq_v2_feature_symbol_time"),)
+
+
+class V2SignalCandidateRow(Base):
+    __tablename__ = "v2_signal_candidates"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(30), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    state: Mapped[str] = mapped_column(String(40), nullable=False)
+    admitted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    final_score: Mapped[Any | None] = mapped_column(Numeric(18, 8), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        Index("ix_v2_candidate_run_created", "run_id", "created_at"),
+        UniqueConstraint("run_id", "strategy_name", "symbol", "created_at", name="uq_v2_candidate_generation"),
+    )
+
+
+class V2PortfolioReservationRow(Base):
+    __tablename__ = "v2_portfolio_reservations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_id: Mapped[str] = mapped_column(
+        ForeignKey("v2_signal_candidates.id"), unique=True, nullable=False
+    )
+    execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    active_symbol: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True)
+    correlation_group: Mapped[str] = mapped_column(String(40), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    state: Mapped[str] = mapped_column(String(30), nullable=False)
+    notional_usdt: Mapped[Any] = mapped_column(Numeric(36, 18), nullable=False)
+    risk_usdt: Mapped[Any] = mapped_column(Numeric(36, 18), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class V2PortfolioStateRow(Base):
+    __tablename__ = "v2_portfolio_state"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class V2RejectionRow(Base):
+    __tablename__ = "v2_signal_rejections"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    strategy_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class V2IncidentRow(Base):
+    __tablename__ = "v2_incidents"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    symbol: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    candidate_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class V2RunRow(Base):
+    __tablename__ = "v2_runs"
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
 
 
 class PersistenceRepository:
@@ -1879,6 +1984,293 @@ class PersistenceRepository:
         except SQLAlchemyError as exc:
             self._failed(exc)
             return False
+
+    def save_v2_universe_status(self, status: UniverseStatus) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2UniverseStateRow, status.symbol.value)
+                values = {
+                    "state": status.state.value, "accepted": status.accepted,
+                    "rejection_reasons": list(status.reasons),
+                    "payload": status.model_dump(mode="json"),
+                    "checked_at": status.checked_at,
+                }
+                if row is None:
+                    session.add(V2UniverseStateRow(symbol=status.symbol.value, **values))
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def load_v2_universe(self) -> list[UniverseStatus]:
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                return [UniverseStatus.model_validate(row.payload) for row in session.scalars(select(V2UniverseStateRow)).all()]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
+    def save_v2_market_feature(self, feature: Any) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                session.add(V2MarketFeatureRow(
+                    symbol=feature.symbol.value, captured_at=feature.timestamp,
+                    fresh=feature.fresh, payload=feature.model_dump(mode="json"),
+                ))
+            return True
+        except IntegrityError:
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def save_v2_signal_candidate(self, candidate: V2SignalCandidate) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2SignalCandidateRow, str(candidate.id))
+                values = {
+                    "run_id": candidate.run_id,
+                    "strategy_name": candidate.strategy_name.value,
+                    "strategy_version": candidate.strategy_version,
+                    "symbol": candidate.symbol.value, "side": candidate.side.value,
+                    "state": candidate.state, "admitted": candidate.admitted,
+                    "final_score": (
+                        candidate.score_components.final_score
+                        if candidate.score_components else None
+                    ),
+                    "rejection_reason": candidate.rejection_reason,
+                    "payload": candidate.model_dump(mode="json"),
+                    "created_at": candidate.created_at, "expires_at": candidate.expires_at,
+                }
+                if row is None:
+                    session.add(V2SignalCandidateRow(id=str(candidate.id), **values))
+                else:
+                    for key, value in values.items():
+                        setattr(row, key, value)
+                if candidate.rejection_reason:
+                    rejection_id = str(candidate.id)
+                    if session.get(V2RejectionRow, rejection_id) is None:
+                        session.add(V2RejectionRow(
+                            id=rejection_id, run_id=candidate.run_id,
+                            candidate_id=str(candidate.id),
+                            strategy_name=candidate.strategy_name.value,
+                            symbol=candidate.symbol.value,
+                            reason=candidate.rejection_reason,
+                            payload=candidate.model_dump(mode="json"),
+                            created_at=candidate.created_at,
+                        ))
+            return True
+        except IntegrityError:
+            return False
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def load_v2_signal_candidates(self, run_id: str | None = None) -> list[V2SignalCandidate]:
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                statement = select(V2SignalCandidateRow).order_by(V2SignalCandidateRow.created_at)
+                if run_id:
+                    statement = statement.where(V2SignalCandidateRow.run_id == run_id)
+                return [V2SignalCandidate.model_validate(row.payload) for row in session.scalars(statement).all()]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
+    def reserve_v2_portfolio(
+        self, reservation: PortfolioReservation, settings: Any,
+    ) -> PortfolioReservation | None:
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session, session.begin():
+                existing = session.scalar(select(V2PortfolioReservationRow).where(
+                    V2PortfolioReservationRow.candidate_id == str(reservation.candidate_id)
+                ).with_for_update())
+                if existing:
+                    return PortfolioReservation.model_validate(existing.payload)
+                active = session.scalars(select(V2PortfolioReservationRow).where(
+                    V2PortfolioReservationRow.active_symbol.is_not(None)
+                ).with_for_update()).all()
+                if len(active) >= settings.max_concurrent_positions:
+                    return None
+                if any(row.symbol == reservation.symbol.value for row in active):
+                    return None
+                if sum(row.correlation_group == reservation.correlation_group for row in active) >= settings.max_positions_per_correlation_group:
+                    return None
+                meme_symbols = {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}
+                if reservation.symbol.value in meme_symbols and sum(row.symbol in meme_symbols for row in active) >= settings.max_meme_positions:
+                    return None
+                if sum(Decimal(str(row.notional_usdt)) for row in active) + reservation.notional_usdt > settings.max_total_notional_usdt:
+                    return None
+                if sum(Decimal(str(row.risk_usdt)) for row in active) + reservation.risk_usdt > settings.risk_capital_usdt * settings.max_portfolio_risk_pct / Decimal("100"):
+                    return None
+                now = datetime.now(timezone.utc)
+                recent_count = session.scalar(select(func.count()).select_from(V2PortfolioReservationRow).where(
+                    V2PortfolioReservationRow.created_at >= now - timedelta(minutes=5)
+                )) or 0
+                if recent_count >= settings.max_new_entries_per_5_minutes:
+                    return None
+                day_count = session.scalar(select(func.count()).select_from(V2PortfolioReservationRow).where(
+                    V2PortfolioReservationRow.created_at >= now.replace(hour=0, minute=0, second=0, microsecond=0)
+                )) or 0
+                if day_count >= settings.max_trades_per_day:
+                    return None
+                row = V2PortfolioReservationRow(
+                    id=str(reservation.id), run_id=reservation.run_id,
+                    candidate_id=str(reservation.candidate_id), execution_id=None,
+                    symbol=reservation.symbol.value, active_symbol=reservation.symbol.value,
+                    correlation_group=reservation.correlation_group,
+                    strategy_name=reservation.strategy_name.value,
+                    state=reservation.state.value,
+                    notional_usdt=reservation.notional_usdt, risk_usdt=reservation.risk_usdt,
+                    payload=reservation.model_dump(mode="json"),
+                    created_at=reservation.created_at, released_at=None,
+                )
+                session.add(row)
+                session.flush()
+            return reservation
+        except IntegrityError:
+            return None
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def update_v2_portfolio_reservation(self, reservation: PortfolioReservation) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2PortfolioReservationRow, str(reservation.id))
+                if row is None:
+                    return False
+                row.state = reservation.state.value
+                row.execution_id = str(reservation.execution_id) if reservation.execution_id else None
+                row.active_symbol = (
+                    reservation.symbol.value
+                    if reservation.state in {ReservationState.RESERVED, ReservationState.EXECUTING, ReservationState.OPEN}
+                    else None
+                )
+                row.released_at = reservation.released_at
+                row.payload = reservation.model_dump(mode="json")
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def save_v2_portfolio_state(self, payload: dict[str, Any]) -> bool:
+        if not self.available:
+            return False
+        now = datetime.now(timezone.utc)
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2PortfolioStateRow, 1)
+                if row is None:
+                    session.add(V2PortfolioStateRow(id=1, payload=payload, updated_at=now))
+                else:
+                    row.payload = payload; row.updated_at = now
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def load_v2_portfolio_state(self) -> dict[str, Any] | None:
+        if not self.available:
+            return None
+        try:
+            with Session(self.engine) as session:
+                state = session.get(V2PortfolioStateRow, 1)
+                reservations = session.scalars(select(V2PortfolioReservationRow)).all()
+                payload = dict(state.payload) if state else {}
+                payload["reservations"] = [row.payload for row in reservations]
+                return payload
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
+    def begin_v2_run(self, run_id: str, started_at: datetime) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                if session.get(V2RunRow, run_id) is None:
+                    session.add(V2RunRow(
+                        run_id=run_id, started_at=started_at, finished_at=None,
+                        status="RUNNING", payload={"run_id": run_id},
+                    ))
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def finish_v2_run(self, run_id: str, payload: dict[str, Any]) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2RunRow, run_id)
+                if row is None:
+                    return False
+                row.finished_at = datetime.now(timezone.utc)
+                row.status = "FINISHED"
+                row.payload = payload
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def save_v2_incident(self, incident: V2Incident) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                session.add(V2IncidentRow(
+                    id=str(incident.id), run_id=incident.run_id,
+                    event_type=incident.event_type,
+                    symbol=incident.symbol.value if incident.symbol else None,
+                    execution_id=str(incident.execution_id) if incident.execution_id else None,
+                    candidate_id=str(incident.candidate_id) if incident.candidate_id else None,
+                    payload=incident.model_dump(mode="json"),
+                    occurred_at=incident.occurred_at,
+                ))
+            return True
+        except IntegrityError:
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def v2_report_rows(self, run_id: str) -> dict[str, list[dict[str, Any]]]:
+        if not self.available:
+            return {"signals": [], "rejections": [], "incidents": [], "executions": []}
+        try:
+            with Session(self.engine) as session:
+                signals = session.scalars(select(V2SignalCandidateRow).where(V2SignalCandidateRow.run_id == run_id)).all()
+                rejections = session.scalars(select(V2RejectionRow).where(V2RejectionRow.run_id == run_id)).all()
+                incidents = session.scalars(select(V2IncidentRow).where(V2IncidentRow.run_id == run_id)).all()
+                executions = session.scalars(select(DemoExecutionRow).where(DemoExecutionRow.run_id == run_id)).all()
+                return {
+                    "signals": [row.payload for row in signals],
+                    "rejections": [row.payload for row in rejections],
+                    "incidents": [row.payload for row in incidents],
+                    "executions": [row.payload for row in executions],
+                }
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return {"signals": [], "rejections": [], "incidents": [], "executions": []}
 
     def _failed(self, exc: SQLAlchemyError) -> None:
         self.available = False

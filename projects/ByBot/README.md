@@ -6,12 +6,30 @@ Lightweight, deterministic Bybit trading-bot foundation. Current builds support 
 The LLM boundary is limited to compact news classification. Strategy, market
 filters, risk decisions, and paper execution are deterministic Python code.
 
+## ByBot V2 (direct Bybit Demo only)
+
+V2 adds a dynamically validated 17-symbol universe, five deterministic
+strategies, public WebSocket/REST features, durable multi-position reservations
+and run-scoped reports. Orders can target only the exact authenticated Bybit Demo
+domain through the explicit runner. Live, mainnet and testnet execution remain
+blocked.
+
+Read-only validation (no order submission):
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe .\scripts\demo_v2_preflight.py
+```
+
+Operator-authorized commands are documented in `docs/RUNBOOK.md`; automated
+development never starts the burn-in or soak.
+
 ## Scope
 
-- Symbols: `BTCUSDT`, `ETHUSDT`
+- V1 symbols: `BTCUSDT`, `ETHUSDT`; V2 dynamically evaluates 17 configured symbols
 - Market: Bybit linear perpetuals
-- Maximum one open position
-- Leverage: 1x-2x
+- V1 maximum one open position; V2 supports independently limited positions per symbol
+- V1 leverage: 1x-2x; V2 Demo leverage: core 3x, liquid alts/memes 2x
 - Mandatory stop loss
 - No martingale or averaging down
 
