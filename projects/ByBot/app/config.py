@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     bybit_env: BybitEnvironment = BybitEnvironment.DEMO
     bybit_enable_trading: bool = False
     bybit_demo_trading_enabled: bool = False
+    demo_order_execution_authorized: bool = False
     bybit_live_trading_enabled: bool = False
     bybit_public_base_url: str = "https://api.bybit.com"
     bybit_private_demo_base_url: str = "https://api-demo.bybit.com"
@@ -302,6 +303,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def enforce_demo_execution_guard(self) -> "Settings":
+        """Validate static combinations without turning imports into mutation gates.
+
+        ``BYBIT_DEMO_TRADING_ENABLED=false`` is deliberately a valid fail-closed
+        configuration, including when an operator selects BYBIT_DEMO for
+        read-only inspection.  The credential, domain and explicit authorization
+        checks belong to the mutation guard in ``app.bybit.demo``.
+        """
         if self.execution_mode != ExecutionMode.BYBIT_DEMO:
             if self.demo_canary_enabled:
                 raise ValueError("DEMO_CANARY_ENABLED requires BYBIT_DEMO execution mode")
@@ -309,6 +317,14 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "V2_AUTO_DEMO_EXECUTION requires BYBIT_DEMO execution mode"
                 )
+            return self
+        if self.v2_auto_demo_execution and not self.v2_enabled:
+            raise ValueError("V2_AUTO_DEMO_EXECUTION requires V2_ENABLED=true")
+        if self.v2_auto_demo_execution and not self.bybit_demo_trading_enabled:
+            raise ValueError(
+                "V2_AUTO_DEMO_EXECUTION requires BYBIT_DEMO_TRADING_ENABLED=true"
+            )
+        if not self.bybit_demo_trading_enabled:
             return self
         errors: list[str] = []
         if self.app_env.lower() != "demo":
@@ -319,8 +335,6 @@ class Settings(BaseSettings):
             errors.append("BOT_MODE must be BYBIT_DEMO")
         if self.bybit_env != BybitEnvironment.DEMO:
             errors.append("BYBIT_ENV must be demo")
-        if not self.bybit_demo_trading_enabled:
-            errors.append("BYBIT_DEMO_TRADING_ENABLED must be true")
         if self.bybit_live_trading_enabled:
             errors.append("BYBIT_LIVE_TRADING_ENABLED must be false")
         if self.bybit_private_demo_base_url.rstrip("/") != "https://api-demo.bybit.com":
@@ -334,8 +348,6 @@ class Settings(BaseSettings):
         if self.v2_enabled and not self.v2_auto_demo_execution:
             # Read-only/preflight V2 may start without automatic submissions.
             pass
-        if self.v2_auto_demo_execution and not self.v2_enabled:
-            errors.append("V2_AUTO_DEMO_EXECUTION requires V2_ENABLED=true")
         if not self.bybit_api_key or not self.bybit_api_secret:
             errors.append("Demo API credentials are required")
         if errors:

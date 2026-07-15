@@ -58,6 +58,7 @@ def demo_settings(**overrides: object) -> Settings:
         "bybit_api_key": "fake-demo-key",
         "bybit_api_secret": "fake-demo-secret",
         "bybit_demo_trading_enabled": True,
+        "demo_order_execution_authorized": True,
         "bybit_live_trading_enabled": False,
         "bybit_enable_trading": False,
         "auto_paper_execution": False,

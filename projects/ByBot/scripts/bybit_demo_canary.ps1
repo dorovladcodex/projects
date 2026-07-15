@@ -307,6 +307,7 @@ try {
     Set-IsolatedEnvironment "EXECUTION_MODE" "BYBIT_DEMO"
     Set-IsolatedEnvironment "BYBIT_ENV" "demo"
     Set-IsolatedEnvironment "BYBIT_DEMO_TRADING_ENABLED" "true"
+    Set-IsolatedEnvironment "DEMO_ORDER_EXECUTION_AUTHORIZED" "true"
     Set-IsolatedEnvironment "BYBIT_LIVE_TRADING_ENABLED" "false"
     Set-IsolatedEnvironment "BYBIT_ENABLE_TRADING" "false"
     Set-IsolatedEnvironment "AUTO_PAPER_EXECUTION" "false"

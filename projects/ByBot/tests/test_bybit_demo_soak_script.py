@@ -23,6 +23,7 @@ def test_demo_soak_uses_real_mode_and_has_no_test_pipeline() -> None:
     assert 'Set-IsolatedEnvironment "TEST_MODE" "false"' in text
     assert 'Set-IsolatedEnvironment "EXECUTION_MODE" "BYBIT_DEMO"' in text
     assert 'Set-IsolatedEnvironment "BYBIT_LIVE_TRADING_ENABLED" "false"' in text
+    assert 'Set-IsolatedEnvironment "DEMO_ORDER_EXECUTION_AUTHORIZED" "true"' in text
     assert 'Set-IsolatedEnvironment "AUTO_PAPER_EXECUTION" "false"' in text
     assert "/signals/test-from-news" not in text
     assert "/test-market-snapshot" not in text

@@ -262,21 +262,35 @@ def validate_demo_domains(rest_url: str, private_ws_url: str) -> None:
         )
 
 
-def require_demo_execution(settings: Settings) -> None:
+def validate_demo_order_execution_enabled(settings: Settings) -> None:
+    """Fail closed unless the process has explicit Demo mutation authority."""
+
     validate_demo_domains(
         settings.bybit_private_demo_base_url,
         settings.bybit_private_demo_ws_url,
     )
     if settings.execution_mode != ExecutionMode.BYBIT_DEMO:
         raise DemoSafetyError("Execution mode is not BYBIT_DEMO")
-    if settings.app_env.lower() != "demo" or settings.test_mode:
-        raise DemoSafetyError("Demo execution requires APP_ENV=demo and TEST_MODE=false")
     if not settings.bybit_demo_trading_enabled:
         raise DemoSafetyError("Demo trading is not explicitly enabled")
+    if not settings.demo_order_execution_authorized:
+        raise DemoSafetyError("explicit Demo order authorization is required")
+    if settings.app_env.lower() != "demo" or settings.test_mode:
+        raise DemoSafetyError("Demo execution requires APP_ENV=demo and TEST_MODE=false")
     if settings.bybit_live_trading_enabled or settings.bybit_enable_trading:
         raise DemoSafetyError("Live or generic Bybit trading flags are forbidden")
+    if settings.bybit_env.value != "demo":
+        raise DemoSafetyError("Authenticated Bybit environment is not Demo")
+    if not settings.bybit_api_key or not settings.bybit_api_secret:
+        raise DemoSafetyError("Demo API credentials are required")
     if not settings.v2_enabled and settings.demo_leverage != 1:
         raise DemoSafetyError("Demo leverage must be exactly 1")
+
+
+def require_demo_execution(settings: Settings) -> None:
+    """Backward-compatible name for the explicit mutation guard."""
+
+    validate_demo_order_execution_enabled(settings)
 
 
 def normalize_quantity(quantity: Decimal, rules: InstrumentRules) -> Decimal:
@@ -638,7 +652,11 @@ class DemoExecutionService:
         self.run_started_at = settings.demo_run_started_at or datetime.now(timezone.utc)
         run_digest = hashlib.sha256(self.run_id.encode("utf-8")).hexdigest()[:6]
         self.order_prefix = f"{settings.demo_order_link_prefix[:10]}-{run_digest}"
-        self.enabled = settings.execution_mode == ExecutionMode.BYBIT_DEMO
+        self.enabled = bool(
+            settings.execution_mode == ExecutionMode.BYBIT_DEMO
+            and settings.bybit_demo_trading_enabled
+            and settings.demo_order_execution_authorized
+        )
         self.kill_switch_active = False
         self.kill_switch_reasons: list[str] = []
         self.last_error: str | None = None

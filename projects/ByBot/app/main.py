@@ -73,7 +73,11 @@ demo_client = (
         recv_window_ms=settings.bybit_private_recv_window_ms,
         timeout_seconds=settings.bybit_private_timeout_seconds,
     )
-    if settings.execution_mode == ExecutionMode.BYBIT_DEMO else None
+    if (
+        settings.execution_mode == ExecutionMode.BYBIT_DEMO
+        and settings.bybit_demo_trading_enabled
+        and settings.demo_order_execution_authorized
+    ) else None
 )
 demo_execution_service = DemoExecutionService(
     settings, persistence, demo_client, run_id=settings.demo_run_id
@@ -167,7 +171,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not accepted:
             raise RuntimeError("V2 symbol universe has no accepted instruments")
         settings.allowed_symbols = tuple(symbol.value for symbol in accepted)
-    if settings.execution_mode == ExecutionMode.BYBIT_DEMO:
+    if demo_execution_service.enabled:
         await asyncio.to_thread(demo_execution_service.verify_account_and_environment)
         await asyncio.to_thread(demo_execution_service.reconcile)
         for job in persistence.recoverable_demo_canary_jobs():

@@ -268,6 +268,7 @@ def test_soak_runner_is_explicit_demo_only_and_not_self_executing() -> None:
     assert "AllowDemoOrders" in text
     assert "BYBIT_ENABLE_TRADING' 'false" in text
     assert "BYBIT_LIVE_TRADING_ENABLED' 'false" in text
+    assert "DEMO_ORDER_EXECUTION_AUTHORIZED' 'true" in text
     assert "V2_AUTO_DEMO_EXECUTION' 'true" in text
     assert "demo_v2_preflight.py" in text
 

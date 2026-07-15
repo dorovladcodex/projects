@@ -36,6 +36,7 @@ def test_demo_canary_uses_production_demo_service_contract() -> None:
     assert 'Set-IsolatedEnvironment "EXECUTION_MODE" "BYBIT_DEMO"' in text
     assert 'Set-IsolatedEnvironment "BYBIT_ENABLE_TRADING" "false"' in text
     assert 'Set-IsolatedEnvironment "BYBIT_LIVE_TRADING_ENABLED" "false"' in text
+    assert 'Set-IsolatedEnvironment "DEMO_ORDER_EXECUTION_AUTHORIZED" "true"' in text
     assert 'Set-IsolatedEnvironment "DEMO_CANARY_ENABLED" "true"' in text
     assert '"https://api-demo.bybit.com"' in text
     assert 'Path "/demo/canary/preview"' in text

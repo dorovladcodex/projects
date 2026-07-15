@@ -26,6 +26,7 @@ def demo_settings() -> Settings:
         app_env="demo", test_mode=False, bot_mode="BYBIT_DEMO",
         execution_mode="BYBIT_DEMO", bybit_env="demo",
         bybit_demo_trading_enabled=True, bybit_live_trading_enabled=False,
+        demo_order_execution_authorized=True,
         bybit_enable_trading=False, bybit_api_key="fake", bybit_api_secret="fake",
         v2_enabled=True, v2_auto_demo_execution=True,
         allowed_symbols=tuple(symbol.value for symbol in Symbol),

@@ -91,6 +91,7 @@ def build_status(
     demo_orders_enabled = bool(
         settings.execution_mode == ExecutionMode.BYBIT_DEMO
         and settings.bybit_demo_trading_enabled
+        and settings.demo_order_execution_authorized
         and demo_status.get("account_verified")
         and not demo_status.get("kill_switch_active")
     )

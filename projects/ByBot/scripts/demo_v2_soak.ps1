@@ -84,6 +84,7 @@ try {
     Set-ChildEnvironment 'BYBIT_ENABLE_TRADING' 'false'
     Set-ChildEnvironment 'BYBIT_LIVE_TRADING_ENABLED' 'false'
     Set-ChildEnvironment 'BYBIT_DEMO_TRADING_ENABLED' 'true'
+    Set-ChildEnvironment 'DEMO_ORDER_EXECUTION_AUTHORIZED' 'true'
     Set-ChildEnvironment 'V2_ENABLED' 'true'
     Set-ChildEnvironment 'V2_AUTO_DEMO_EXECUTION' 'true'
     Set-ChildEnvironment 'DEMO_CANARY_ENABLED' 'false'
