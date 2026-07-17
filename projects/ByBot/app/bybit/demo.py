@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
@@ -9,6 +10,7 @@ import hashlib
 import hmac
 import json
 import time
+from time import perf_counter
 from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -45,6 +47,67 @@ TERMINAL_DEMO_STATES = {
     DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
     DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
 }
+CANONICAL_EXIT_ATTRIBUTIONS = {
+    "take_profit", "stop_loss", "strategy_exit", "stale_signal",
+    "maximum_holding_time", "reconciliation_close", "external_close",
+    "exchange_generated_tp", "exchange_generated_sl", "forced_cleanup",
+    "unattributed_external_close",
+}
+
+
+def canonical_exit_attribution(reason: str | None) -> str:
+    normalized = str(reason or "").strip().casefold()
+    aliases = {
+        "invalidated_setup": "strategy_exit",
+        "runner_cleanup": "forced_cleanup",
+        "protection_failure": "forced_cleanup",
+        "emergency_close": "forced_cleanup",
+        "exchange_close": "reconciliation_close",
+    }
+    value = aliases.get(normalized, normalized)
+    return value if value in CANONICAL_EXIT_ATTRIBUTIONS else "unattributed_external_close"
+
+
+def attribute_exchange_close(
+    record: DemoExecutionRecord, item: dict[str, Any], *, source: str,
+) -> str:
+    """Set canonical exit attribution from exchange metadata, never price alone."""
+    existing = canonical_exit_attribution(record.exit_attribution or record.close_reason)
+    has_precise_existing = bool(record.exit_attribution or record.close_reason)
+    stop_type = str(item.get("stopOrderType") or "").casefold()
+    create_type = str(item.get("createType") or "").casefold()
+    if stop_type == "stoploss" or create_type == "createbystoploss":
+        attribution = "exchange_generated_sl"
+    elif stop_type == "takeprofit" or create_type == "createbytakeprofit":
+        attribution = "exchange_generated_tp"
+    elif has_precise_existing:
+        attribution = existing
+    elif bool(item.get("reduceOnly")) or _decimal(item.get("closedSize"), default="0") > 0:
+        attribution = "external_close"
+    else:
+        attribution = "unattributed_external_close"
+    evidence = {
+        "source": source,
+        "order_id": str(item.get("orderId") or record.close_order_id or "") or None,
+        "execution_id": str(item.get("execId") or "") or None,
+        "order_link_id": str(item.get("orderLinkId") or "") or None,
+        "stop_order_type": str(item.get("stopOrderType") or "") or None,
+        "create_type": str(item.get("createType") or "") or None,
+        "reduce_only": bool(item.get("reduceOnly")),
+        "close_on_trigger": bool(item.get("closeOnTrigger")),
+        "trigger_price": str(item.get("triggerPrice") or "") or None,
+        "side": str(item.get("side") or "") or None,
+        "position_idx": item.get("positionIdx"),
+        "owned_quantity": str(record.accepted_quantity),
+    }
+    record.exit_attribution = attribution
+    record.close_reason = attribution
+    record.exit_attribution_evidence = evidence
+    record.attribution_failure_reason = (
+        "exchange close metadata did not identify an owned strategy or TP/SL close"
+        if attribution == "unattributed_external_close" else None
+    )
+    return attribution
 
 
 class DemoSafetyError(RuntimeError):
@@ -672,6 +735,7 @@ class DemoExecutionService:
         self.unrelated_open_orders = 0
         self.bot_owned_open_positions = 0
         self.account_verified = False
+        self.account_verified_at: datetime | None = None
         self.symbol_leverage: dict[str, dict[str, str]] = {}
         self.symbol_open_order_counts: dict[str, int] = {}
         self.usdt_order_reconciliation_ok = False
@@ -683,6 +747,8 @@ class DemoExecutionService:
         self._last_reconcile_monotonic: float | None = None
         self._discard_ws_before_ms: int | None = None
         self.sleep_resume_reconciliations = 0
+        self._submit_started_monotonic: dict[UUID, float] = {}
+        self._ack_received_monotonic: dict[UUID, float] = {}
         if self.enabled:
             require_demo_execution(settings)
             if client is None:
@@ -716,6 +782,7 @@ class DemoExecutionService:
         self.account_verified = self.client.verify_credentials()
         if not self.account_verified:
             raise DemoSafetyError("Demo API credentials could not be verified")
+        self.account_verified_at = datetime.now(timezone.utc)
         account_info_loader = getattr(self.client, "get_account_info", None)
         if callable(account_info_loader):
             account_info = account_info_loader()
@@ -811,6 +878,26 @@ class DemoExecutionService:
         self.leverage_normalized = True
         return self.account_verified
 
+    def _verify_execution_environment_cached(self) -> None:
+        """Refresh only authenticated identity when the startup proof is stale."""
+        if self.client is None:
+            raise DemoSafetyError("Demo client unavailable")
+        require_demo_execution(self.settings)
+        validate_demo_domains(self.client.base_url, self.client.private_ws_url)
+        now = datetime.now(timezone.utc)
+        ttl = timedelta(seconds=self.settings.v2_demo_account_verification_ttl_seconds)
+        if (
+            self.account_verified
+            and self.account_verified_at is not None
+            and now - self.account_verified_at <= ttl
+        ):
+            return
+        if not self.client.verify_credentials():
+            self.account_verified = False
+            raise DemoSafetyError("Demo API credentials could not be verified")
+        self.account_verified = True
+        self.account_verified_at = now
+
     def _ensure_symbol_leverage(
         self,
         symbol: Symbol,
@@ -818,7 +905,9 @@ class DemoExecutionService:
         positions: list[dict[str, Any]] | None = None,
         open_orders: list[dict[str, Any]] | None = None,
         desired_leverage: Decimal = Decimal("1"),
-    ) -> None:
+        rules: InstrumentRules | None = None,
+        allow_mutation: bool = True,
+    ) -> list[dict[str, Any]]:
         """Confirm target leverage, normalizing only a completely flat Demo symbol."""
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
@@ -832,14 +921,21 @@ class DemoExecutionService:
             "buy": _format_decimal(buy_leverage),
             "sell": _format_decimal(sell_leverage),
         }
-        rules = self.client.get_instrument(symbol)
-        target = min(max(desired_leverage, rules.min_leverage), rules.max_leverage)
-        steps = ((target - rules.min_leverage) / rules.leverage_step).to_integral_value(
+        current_rules = rules or self.client.get_instrument(symbol)
+        target = min(
+            max(desired_leverage, current_rules.min_leverage),
+            current_rules.max_leverage,
+        )
+        steps = ((target - current_rules.min_leverage) / current_rules.leverage_step).to_integral_value(
             rounding=ROUND_DOWN
         )
-        target = rules.min_leverage + steps * rules.leverage_step
+        target = current_rules.min_leverage + steps * current_rules.leverage_step
         if buy_leverage == target and sell_leverage == target:
-            return
+            return current_positions
+        if not allow_mutation:
+            raise DemoSafetyError(
+                f"{symbol.value} leverage is not preconfigured to the required value"
+            )
         if any(_decimal(item.get("size"), default="0") > 0 for item in current_positions):
             raise DemoSafetyError(
                 f"{symbol.value} leverage is not 1x and an open position prevents normalization"
@@ -875,6 +971,7 @@ class DemoExecutionService:
                 f"(buy={_format_decimal(confirmed_buy)}, "
                 f"sell={_format_decimal(confirmed_sell)}, margin_mode={mode})"
             )
+        return confirmed_positions
 
     def submit_candidate(
         self,
@@ -890,6 +987,8 @@ class DemoExecutionService:
         trailing_stop_pct: Decimal | None = None,
         break_even_at_r: Decimal | None = None,
         maximum_holding_seconds: int | None = None,
+        latency_timeline: dict[str, datetime | None] | None = None,
+        instrument_rules: InstrumentRules | None = None,
     ) -> DemoExecutionRecord | None:
         if not self.enabled or self.client is None:
             return None
@@ -912,8 +1011,22 @@ class DemoExecutionService:
         if candidate.symbol is None or candidate.final_action == NewsSignalAction.NO_TRADE:
             self.last_error = "candidate has no executable direction"
             return None
-        self._enforce_risk_controls(candidate.symbol)
+
+        timeline: dict[str, Any] = dict(latency_timeline or {})
+        durations: dict[str, float] = {}
+
+        def start(stage: str) -> float:
+            timeline[f"{stage}_started_at"] = datetime.now(timezone.utc)
+            return perf_counter()
+
+        def complete(stage: str, started: float) -> None:
+            timeline[f"{stage}_completed_at"] = datetime.now(timezone.utc)
+            durations[stage] = (perf_counter() - started) * 1000
+
+        timeline.setdefault("execution_task_received_at", datetime.now(timezone.utc))
+        ownership_started = start("ownership_check")
         existing = self.repository.get_demo_execution(str(candidate.id))
+        complete("ownership_check", ownership_started)
         if existing is not None:
             return existing
 
@@ -921,7 +1034,21 @@ class DemoExecutionService:
             snapshot.ask_price
             if candidate.final_action == NewsSignalAction.BUY else snapshot.bid_price
         ))
-        rules = self.client.get_instrument(candidate.symbol)
+        account_started = start("account_verification")
+        self._verify_execution_environment_cached()
+        complete("account_verification", account_started)
+
+        instrument_started = start("instrument_metadata")
+        # The validated universe owns immutable normal-strategy rules. Canary
+        # execution deliberately keeps its final just-in-time exchange refresh.
+        rules = (
+            self.client.get_instrument(candidate.symbol)
+            if canary_plan is not None or instrument_rules is None
+            else instrument_rules
+        )
+        complete("instrument_metadata", instrument_started)
+
+        quantity_started = start("quantity_normalization")
         if canary_plan is not None:
             # This is the final exchange-rules read before the durable reservation.
             # Recalculate at the latest executable reference price and submit only
@@ -933,10 +1060,88 @@ class DemoExecutionService:
         else:
             quantity = normalize_quantity(Decimal(str(preview.capped_size)), rules)
         validate_order_notional(quantity, entry_reference, rules)
-        self._validate_remote_entry_state(candidate.symbol)
+        complete("quantity_normalization", quantity_started)
+
+        protection_started = start("protection_plan")
+        if candidate.proposed_stop_loss_pct <= 0 or candidate.proposed_take_profit_pct <= 0:
+            raise DemoSafetyError("protection plan requires positive TP and SL")
+        complete("protection_plan", protection_started)
+
+        def measured_read(stage: str, loader: Callable[[], Any]) -> tuple[Any, datetime, datetime, float]:
+            started_at = datetime.now(timezone.utc)
+            started_perf = perf_counter()
+            value = loader()
+            return (
+                value,
+                started_at,
+                datetime.now(timezone.utc),
+                (perf_counter() - started_perf) * 1000,
+            )
+
+        # Independent signed GETs run concurrently. They retain every remote
+        # conflict/loss check while avoiding three sequential position reads.
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="demo-entry-read") as pool:
+            reads = {
+                "position_symbol": pool.submit(
+                    measured_read,
+                    "position_symbol",
+                    lambda: self.client.get_positions(symbol=candidate.symbol),
+                ),
+                "open_orders": pool.submit(
+                    measured_read,
+                    "open_orders",
+                    lambda: self.client.get_open_orders(symbol=candidate.symbol),
+                ),
+                "position_account": pool.submit(
+                    measured_read,
+                    "position_account",
+                    lambda: self.client.get_positions(settle_coin="USDT"),
+                ),
+                "reconciliation_check": pool.submit(
+                    measured_read,
+                    "reconciliation_check",
+                    lambda: self.client.get_closed_pnl(settle_coin="USDT"),
+                ),
+            }
+            read_results = {name: future.result() for name, future in reads.items()}
+
+        symbol_positions, symbol_started, symbol_completed, symbol_ms = read_results["position_symbol"]
+        account_positions, account_pos_started, account_pos_completed, account_pos_ms = read_results["position_account"]
+        open_orders, orders_started, orders_completed, orders_ms = read_results["open_orders"]
+        closed_pnl, reconcile_started, reconcile_completed, reconcile_ms = read_results["reconciliation_check"]
+        timeline["position_query_started_at"] = min(symbol_started, account_pos_started)
+        timeline["position_query_completed_at"] = max(symbol_completed, account_pos_completed)
+        durations["position_query"] = max(symbol_ms, account_pos_ms)
+        timeline["open_orders_query_started_at"] = orders_started
+        timeline["open_orders_query_completed_at"] = orders_completed
+        durations["open_orders_query"] = orders_ms
+        timeline["reconciliation_check_started_at"] = reconcile_started
+        timeline["reconciliation_check_completed_at"] = reconcile_completed
+        durations["reconciliation_check"] = reconcile_ms
+
+        self._enforce_risk_controls(candidate.symbol, closed_pnl=closed_pnl)
+        self._validate_remote_entry_state(
+            candidate.symbol,
+            positions=symbol_positions,
+            open_orders=open_orders,
+            all_positions=account_positions,
+        )
         leverage = desired_leverage or Decimal(str(self.settings.demo_leverage))
-        self._ensure_symbol_leverage(candidate.symbol, desired_leverage=leverage)
-        self._verify_leverage_and_mode(candidate.symbol, desired_leverage=leverage)
+        leverage_started = start("leverage_setup")
+        verified_positions = self._ensure_symbol_leverage(
+            candidate.symbol,
+            positions=symbol_positions,
+            open_orders=open_orders,
+            desired_leverage=leverage,
+            rules=rules,
+            allow_mutation=False,
+        )
+        self._verify_leverage_and_mode(
+            candidate.symbol,
+            desired_leverage=leverage,
+            positions=verified_positions,
+        )
+        complete("leverage_setup", leverage_started)
         side = Side.BUY if candidate.final_action == NewsSignalAction.BUY else Side.SELL
         order_link_id = deterministic_order_link_id(
             self.order_prefix, candidate.id, "entry"
@@ -960,15 +1165,53 @@ class DemoExecutionService:
             break_even_at_r=break_even_at_r,
             maximum_holding_seconds=maximum_holding_seconds,
             signal_created_at=candidate.created_at,
+            candidate_persisted_at=(latency_timeline or {}).get("candidate_persisted_at"),
+            reservation_requested_at=(latency_timeline or {}).get("reservation_requested_at"),
+            reservation_created_at=(latency_timeline or {}).get("reservation_created_at"),
+            risk_evaluation_started_at=(latency_timeline or {}).get("risk_evaluation_started_at"),
+            risk_approved_at=(latency_timeline or {}).get("risk_approved_at"),
+            execution_dispatched_at=(latency_timeline or {}).get("execution_dispatched_at"),
+            execution_task_received_at=timeline.get("execution_task_received_at"),
+            ownership_check_started_at=timeline.get("ownership_check_started_at"),
+            ownership_check_completed_at=timeline.get("ownership_check_completed_at"),
+            reconciliation_check_started_at=timeline.get("reconciliation_check_started_at"),
+            reconciliation_check_completed_at=timeline.get("reconciliation_check_completed_at"),
+            account_verification_started_at=timeline.get("account_verification_started_at"),
+            account_verification_completed_at=timeline.get("account_verification_completed_at"),
+            position_query_started_at=timeline.get("position_query_started_at"),
+            position_query_completed_at=timeline.get("position_query_completed_at"),
+            open_orders_query_started_at=timeline.get("open_orders_query_started_at"),
+            open_orders_query_completed_at=timeline.get("open_orders_query_completed_at"),
+            instrument_metadata_started_at=timeline.get("instrument_metadata_started_at"),
+            instrument_metadata_completed_at=timeline.get("instrument_metadata_completed_at"),
+            leverage_setup_started_at=timeline.get("leverage_setup_started_at"),
+            leverage_setup_completed_at=timeline.get("leverage_setup_completed_at"),
+            quantity_normalization_started_at=timeline.get("quantity_normalization_started_at"),
+            quantity_normalization_completed_at=timeline.get("quantity_normalization_completed_at"),
+            protection_plan_started_at=timeline.get("protection_plan_started_at"),
+            protection_plan_completed_at=timeline.get("protection_plan_completed_at"),
+            execution_stage_durations_ms=durations,
         )
+        database_started = start("database_execution_state")
+        record.database_execution_state_started_at = timeline["database_execution_state_started_at"]
         reserved = self.repository.reserve_demo_execution(record)
+        complete("database_execution_state", database_started)
+        record.database_execution_state_completed_at = timeline["database_execution_state_completed_at"]
+        record.execution_stage_durations_ms.update(durations)
         if reserved is None:
             self.last_error = "durable Demo execution reservation failed"
             return None
         if reserved is not None and reserved.id != record.id:
             return reserved
+        self.repository.save_demo_execution(
+            record, event_type="DEMO_EXECUTION_PREFLIGHT_COMPLETE"
+        )
         try:
-            record.order_submitted_at = datetime.now(timezone.utc)
+            record.exchange_submit_started_at = datetime.now(timezone.utc)
+            record.order_submitted_at = record.exchange_submit_started_at
+            record.local_submit_started_at = record.exchange_submit_started_at
+            submit_started_perf = perf_counter()
+            self._submit_started_monotonic[record.id] = submit_started_perf
             response = self.client.create_order({
                 "category": "linear",
                 "symbol": candidate.symbol.value,
@@ -981,6 +1224,15 @@ class DemoExecutionService:
             })
             result = response.get("result") or {}
             record.order_id = str(result.get("orderId") or "") or None
+            record.local_ack_received_at = datetime.now(timezone.utc)
+            record.order_acknowledged_at = record.local_ack_received_at
+            ack_perf = perf_counter()
+            self._ack_received_monotonic[record.id] = ack_perf
+            record.execution_stage_durations_ms["exchange_submit"] = (
+                ack_perf - submit_started_perf
+            ) * 1000
+            if response.get("time") is not None:
+                record.exchange_order_created_at = _timestamp(response.get("time"))
             record.state = DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
             record.exchange_order_status = "Acknowledged"
             record.updated_at = datetime.now(timezone.utc)
@@ -1090,7 +1342,7 @@ class DemoExecutionService:
             if topic == "execution":
                 self._apply_fill(record, item, force_close=attributed_close)
             elif topic == "order":
-                self._apply_order_update(record, item)
+                self._apply_order_update(record, item, force_close=attributed_close)
             elif topic == "position":
                 self._apply_position_update(record, item)
 
@@ -1348,11 +1600,29 @@ class DemoExecutionService:
                         if record.failure_reason
                         else DemoExecutionState.DEMO_CLOSED
                     )
-                    record.close_reason = record.close_reason or "exchange_close"
+                    if not record.exit_attribution:
+                        record.exit_attribution = "unattributed_external_close"
+                        record.close_reason = record.exit_attribution
+                        record.attribution_failure_reason = (
+                            "remote flat reconciliation completed without attributable close metadata"
+                        )
+                        record.exit_attribution_evidence = {
+                            "source": "rest_position_reconciliation",
+                            "entry_order_id": record.order_id,
+                            "close_order_id": record.close_order_id,
+                            "entry_execution_ids": [item.execution_id for item in record.fills],
+                            "exit_execution_ids": [item.execution_id for item in record.close_fills],
+                        }
                 if record.state in {
                     DemoExecutionState.DEMO_CLOSED,
                     DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
                 }:
+                    if not record.exit_attribution:
+                        record.exit_attribution = "unattributed_external_close"
+                        record.close_reason = record.exit_attribution
+                        record.attribution_failure_reason = (
+                            "terminal close has no attributable exchange or bot close evidence"
+                        )
                     record.cleanup_result = (
                         "remote position flat and bot-owned orders zero"
                         if self.bot_owned_open_orders == 0
@@ -1772,11 +2042,13 @@ class DemoExecutionService:
             "rest_reconciliation_watermark_ms": self._discard_ws_before_ms,
         }
 
-    def _apply_order_update(self, record: DemoExecutionRecord, item: dict[str, Any]) -> None:
+    def _apply_order_update(
+        self, record: DemoExecutionRecord, item: dict[str, Any], *, force_close: bool = False
+    ) -> None:
         status = str(item.get("orderStatus") or "")
         order_id = str(item.get("orderId") or "")
         order_link = str(item.get("orderLinkId") or "")
-        is_close = bool(
+        is_close = force_close or bool(
             (record.close_order_id and order_id == record.close_order_id)
             or (record.close_order_link_id and order_link == record.close_order_link_id)
         )
@@ -1785,6 +2057,7 @@ class DemoExecutionService:
                 return
             if order_id and not record.close_order_id:
                 record.close_order_id = order_id
+            attribute_exchange_close(record, item, source="order_update")
             if (
                 status == "Filled"
                 and record.state == DemoExecutionState.DEMO_CLOSING
@@ -1810,6 +2083,12 @@ class DemoExecutionService:
             or record.state in TERMINAL_DEMO_STATES
         ):
             return
+        if record.exchange_order_created_at is None and (
+            item.get("createdTime") is not None or item.get("orderCreateTime") is not None
+        ):
+            record.exchange_order_created_at = _timestamp(
+                item.get("createdTime") or item.get("orderCreateTime")
+            )
         record.exchange_order_status = status or record.exchange_order_status
         if record.state in {
             DemoExecutionState.DEMO_FULLY_FILLED,
@@ -1890,6 +2169,8 @@ class DemoExecutionService:
             return
         if any(fill.execution_id == exec_id for fill in [*record.fills, *record.close_fills]):
             return
+        local_received_at = datetime.now(timezone.utc)
+        local_received_perf = perf_counter()
         fill = DemoFill(
             execution_id=exec_id,
             order_id=str(item.get("orderId") or ""),
@@ -1898,6 +2179,7 @@ class DemoExecutionService:
             fee=_decimal(item.get("execFee"), default="0"),
             fee_currency=item.get("feeCurrency"),
             executed_at=_timestamp(item.get("execTime")),
+            local_received_at=local_received_at,
         )
         is_close_fill = force_close or bool(
             (record.close_order_id and fill.order_id == record.close_order_id)
@@ -1917,6 +2199,7 @@ class DemoExecutionService:
                 return
             if fill.order_id and not record.close_order_id:
                 record.close_order_id = fill.order_id
+            attribute_exchange_close(record, item, source="execution_fill")
             record.close_fills.append(fill)
             record.closed_at = max(
                 (entry.executed_at for entry in record.close_fills), default=fill.executed_at
@@ -1933,17 +2216,9 @@ class DemoExecutionService:
                     close_average - reference
                     if record.side == Side.BUY else reference - close_average
                 )
-                if record.take_profit is not None and record.stop_loss is not None:
-                    if (
-                        (record.side == Side.BUY and close_average >= record.take_profit)
-                        or (record.side == Side.SELL and close_average <= record.take_profit)
-                    ):
-                        record.close_reason = "take_profit"
-                    elif (
-                        (record.side == Side.BUY and close_average <= record.stop_loss)
-                        or (record.side == Side.SELL and close_average >= record.stop_loss)
-                    ):
-                        record.close_reason = "stop_loss"
+                # Price proximity alone is never authoritative. Exact Bybit
+                # order/execution metadata or a durable bot close reason owns
+                # the externally visible attribution.
         else:
             if (
                 record.close_order_id
@@ -1956,6 +2231,36 @@ class DemoExecutionService:
             record.fills.append(fill)
             if record.first_fill_at is None:
                 record.first_fill_at = fill.executed_at
+                record.exchange_fill_at = fill.executed_at
+                record.local_fill_received_at = local_received_at
+                submit_perf = self._submit_started_monotonic.get(record.id)
+                ack_perf = self._ack_received_monotonic.get(record.id)
+                if submit_perf is not None:
+                    record.order_submit_to_first_fill_ms = max(
+                        0.0, (local_received_perf - submit_perf) * 1000
+                    )
+                elif record.local_submit_started_at is not None:
+                    elapsed = (
+                        local_received_at - record.local_submit_started_at
+                    ).total_seconds() * 1000
+                    if elapsed >= 0:
+                        record.order_submit_to_first_fill_ms = elapsed
+                if record.local_ack_received_at is None:
+                    record.fill_before_ack = True
+                    record.ack_to_first_fill_ms = None
+                elif local_received_at < record.local_ack_received_at:
+                    record.fill_before_ack = True
+                    record.ack_to_first_fill_ms = None
+                elif ack_perf is not None:
+                    record.ack_to_first_fill_ms = (
+                        local_received_perf - ack_perf
+                    ) * 1000
+                else:
+                    record.ack_to_first_fill_ms = (
+                        local_received_at - record.local_ack_received_at
+                    ).total_seconds() * 1000
+                self._submit_started_monotonic.pop(record.id, None)
+                self._ack_received_monotonic.pop(record.id, None)
             total_qty = sum((entry.quantity for entry in record.fills), Decimal("0"))
             total_value = sum((entry.quantity * entry.price for entry in record.fills), Decimal("0"))
             record.accepted_quantity = total_qty
@@ -2084,6 +2389,8 @@ class DemoExecutionService:
             record.sl_identifier = str(position.get("stopLoss") or stop_loss)
             record.state = DemoExecutionState.DEMO_POSITION_OPEN
             record.updated_at = datetime.now(timezone.utc)
+            record.position_confirmed_at = record.updated_at
+            record.protection_confirmed_at = record.updated_at
             self.repository.save_demo_execution(
                 record, event_type="DEMO_POSITION_OPEN"
             )
@@ -2115,7 +2422,15 @@ class DemoExecutionService:
         )
         record.state = DemoExecutionState.DEMO_CLOSING
         record.close_order_link_id = link
-        record.close_reason = reason
+        record.exit_attribution = canonical_exit_attribution(reason)
+        record.close_reason = record.exit_attribution
+        record.exit_attribution_evidence = {
+            "source": "bot_reduce_only_close",
+            "requested_reason": reason,
+            "close_order_link_id": link,
+            "owned_quantity": str(quantity),
+        }
+        record.attribution_failure_reason = None
         record.updated_at = datetime.now(timezone.utc)
         self.repository.save_demo_execution(record, event_type="CLOSE_SUBMITTING")
         try:
@@ -2137,29 +2452,52 @@ class DemoExecutionService:
             record.updated_at = datetime.now(timezone.utc)
             self.repository.save_demo_execution(record, event_type="CLOSE_UNCERTAIN")
 
-    def _validate_remote_entry_state(self, symbol: Symbol) -> None:
+    def _validate_remote_entry_state(
+        self,
+        symbol: Symbol,
+        *,
+        positions: list[dict[str, Any]] | None = None,
+        open_orders: list[dict[str, Any]] | None = None,
+        all_positions: list[dict[str, Any]] | None = None,
+    ) -> None:
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
-        positions = [
-            item for item in self.client.get_positions(symbol=symbol)
+        active_positions = [
+            item for item in (
+                positions if positions is not None else self.client.get_positions(symbol=symbol)
+            )
             if _decimal(item.get("size"), default="0") > 0
         ]
-        if positions:
+        if active_positions:
             raise DemoSafetyError("conflicting remote Demo position exists")
-        if self.client.get_open_orders(symbol=symbol):
+        active_orders = (
+            open_orders
+            if open_orders is not None
+            else self.client.get_open_orders(symbol=symbol)
+        )
+        if active_orders:
             raise DemoSafetyError("conflicting active Demo order exists")
-        all_positions = [
-            item for item in self.client.get_positions(settle_coin="USDT")
+        active_account_positions = [
+            item for item in (
+                all_positions
+                if all_positions is not None
+                else self.client.get_positions(settle_coin="USDT")
+            )
             if _decimal(item.get("size"), default="0") > 0
         ]
         max_positions = (
             self.settings.max_concurrent_positions
             if self.settings.v2_enabled else self.settings.paper_max_total_open_positions
         )
-        if len(all_positions) >= max_positions:
+        if len(active_account_positions) >= max_positions:
             raise DemoSafetyError("maximum total Demo positions reached")
 
-    def _enforce_risk_controls(self, symbol: Symbol) -> None:
+    def _enforce_risk_controls(
+        self,
+        symbol: Symbol,
+        *,
+        closed_pnl: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Apply configured cooldown and exchange-realized loss controls."""
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
@@ -2186,7 +2524,11 @@ class DemoExecutionService:
                 )
             ):
                 raise DemoSafetyError("symbol cooldown is active")
-        closed = self.client.get_closed_pnl(settle_coin="USDT")
+        closed = (
+            closed_pnl
+            if closed_pnl is not None
+            else self.client.get_closed_pnl(settle_coin="USDT")
+        )
         daily = Decimal("0")
         weekly = Decimal("0")
         pnl_timeline: list[tuple[datetime, Decimal]] = []
@@ -2242,12 +2584,18 @@ class DemoExecutionService:
             raise DemoSafetyError("; ".join(reasons))
 
     def _verify_leverage_and_mode(
-        self, symbol: Symbol, *, desired_leverage: Decimal = Decimal("1")
+        self,
+        symbol: Symbol,
+        *,
+        desired_leverage: Decimal = Decimal("1"),
+        positions: list[dict[str, Any]] | None = None,
     ) -> None:
         if self.client is None:
             raise DemoSafetyError("Demo client unavailable")
-        positions = self.client.get_positions(symbol=symbol)
-        for item in positions:
+        current_positions = (
+            positions if positions is not None else self.client.get_positions(symbol=symbol)
+        )
+        for item in current_positions:
             leverage = _decimal(item.get("leverage"), default="1")
             position_idx = int(item.get("positionIdx") or 0)
             if leverage != desired_leverage:
@@ -2270,7 +2618,10 @@ class DemoExecutionService:
             item.get("execQty") or item.get("cumExecQty") or item.get("qty"),
             default="0",
         )
-        if str(item.get("reduceOnly") or "").lower() != "true":
+        if (
+            str(item.get("reduceOnly") or "").lower() != "true"
+            and _decimal(item.get("closedSize"), default="0") <= 0
+        ):
             return None
         candidates = [
             record for record in all_records

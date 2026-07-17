@@ -914,6 +914,85 @@ def test_entry_is_never_submitted_without_durable_risk_decision() -> None:
     assert client.orders == []
 
 
+class TimedPreflightClient(FakeDemoClient):
+    def __init__(self, repository: MemoryRepository) -> None:
+        super().__init__()
+        self.repository = repository
+        self.instrument_calls = 0
+        self.create_called_at: float | None = None
+        self.scopes_at_create: tuple[int, int] | None = None
+
+    def get_instrument(self, symbol):
+        self.instrument_calls += 1
+        return instrument()
+
+    def get_positions(self, symbol=None, settle_coin=None):
+        time.sleep(0.08)
+        return super().get_positions(symbol=symbol, settle_coin=settle_coin)
+
+    def get_open_orders(self, symbol=None, settle_coin=None):
+        time.sleep(0.08)
+        return super().get_open_orders(symbol=symbol, settle_coin=settle_coin)
+
+    def get_closed_pnl(self, symbol=None, settle_coin=None):
+        time.sleep(0.08)
+        return super().get_closed_pnl(symbol=symbol, settle_coin=settle_coin)
+
+    def create_order(self, payload):
+        assert self.repository.get_demo_execution(next(iter(self.repository.records)))
+        self.create_called_at = time.perf_counter()
+        self.scopes_at_create = (
+            len(self.position_scopes), len(self.open_order_scopes)
+        )
+        return super().create_order(payload)
+
+
+def test_entry_preflight_reads_are_parallel_cached_and_durable_before_submit() -> None:
+    repository = MemoryRepository()
+    client = TimedPreflightClient(repository)
+    demo = service(client, repository)
+    demo.account_verified = True
+    demo.account_verified_at = datetime.now(timezone.utc)
+    candidate, classification, preview, snapshot = candidate_bundle()
+    started = time.perf_counter()
+    record = demo.submit_candidate(
+        candidate, preview, classification, snapshot,
+        instrument_rules=instrument(),
+        latency_timeline={"execution_task_received_at": datetime.now(timezone.utc)},
+    )
+    assert record is not None and client.create_called_at is not None
+    assert (client.create_called_at - started) < 0.25
+    assert client.instrument_calls == 0
+    assert client.scopes_at_create == (2, 1)
+    assert "DEMO_EXECUTION_PREFLIGHT_COMPLETE" in {
+        event for event, _ in repository.saved_events
+    }
+    assert record.database_execution_state_completed_at is not None
+    assert record.exchange_submit_started_at is not None
+    assert record.execution_stage_durations_ms["position_query"] >= 70
+
+
+def test_cached_environment_verification_is_bounded_and_reused() -> None:
+    repository = MemoryRepository()
+    client = FakeDemoClient()
+    demo = service(client, repository)
+    calls = 0
+
+    def verify():
+        nonlocal calls
+        calls += 1
+        return True
+
+    client.verify_credentials = verify
+    demo.account_verified = True
+    demo.account_verified_at = datetime.now(timezone.utc)
+    demo._verify_execution_environment_cached()
+    assert calls == 0
+    demo.account_verified_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    demo._verify_execution_environment_cached()
+    assert calls == 1
+
+
 def test_historical_paper_candidate_cannot_submit_demo_order() -> None:
     client = FakeDemoClient()
     demo = service(client, MemoryRepository())

@@ -47,6 +47,9 @@ class _BaseStrategy:
         self.enabled = enabled
         self.threshold = threshold or Decimal(str(settings.v2_strategy_default_threshold))
 
+    def applies_to(self, symbol: Symbol) -> bool:
+        return self.settings.v2_strategy_applies_to_symbol(self.name.value, symbol.value)
+
     def _candidate(
         self, features: MarketFeatureSnapshot, side: StrategySide,
         score: Decimal, confidence: Decimal, edge_bps: Decimal, reason: str,
@@ -157,7 +160,12 @@ class LiquidationMomentumStrategy(_BaseStrategy):
         return self._candidate(features, side, score, _clamp(score), abs(imbalance) * Decimal("35") + max(signed_momentum, Decimal("0")), "liquidation continuation with liquidity confirmation")
 
 
-MEME_SYMBOLS = {Symbol.PEPEUSDT, Symbol.SHIBUSDT, Symbol.WIFUSDT, Symbol.BONKUSDT, Symbol.FLOKIUSDT}
+# Portfolio classification remains unchanged; runtime strategy eligibility is
+# independently configuration-driven and also includes DOGE for MemeTrend.
+MEME_SYMBOLS = {
+    Symbol.PEPEUSDT, Symbol.SHIBUSDT, Symbol.WIFUSDT,
+    Symbol.BONKUSDT, Symbol.FLOKIUSDT,
+}
 
 
 class MemeTrendStrategy(_BaseStrategy):
@@ -178,7 +186,7 @@ class MemeTrendStrategy(_BaseStrategy):
         signed = Decimal("1") if side == StrategySide.LONG else Decimal("-1")
         parabolic = abs(features.price_momentum.get("5m", Decimal("0"))) > Decimal("300")
         score = _norm(signed * momentum, Decimal("50")) * Decimal("0.30") + _norm(features.volume_acceleration.get("1m", Decimal("0")) - 1, Decimal("2")) * Decimal("0.25") + _norm(signed * features.relative_strength_vs_btc_bps, Decimal("60")) * Decimal("0.20") + _norm(signed * features.orderbook_imbalance, Decimal("0.5")) * Decimal("0.15") + _clamp(trend_score) * Decimal("0.10")
-        if features.symbol not in MEME_SYMBOLS or parabolic:
+        if not self.applies_to(features.symbol) or parabolic:
             score = Decimal("0")
         return self._candidate(features, side, score, _clamp(score), max(Decimal("0"), signed * momentum), "meme trend, relative strength and liquidity", ttl_seconds=self.ttl_seconds)
 

@@ -17,10 +17,13 @@ class JsonFormatter(logging.Formatter):
         for name in (
             "run_id", "execution_id", "candidate_id", "strategy", "symbol",
             "event_type", "execution_environment", "error_category",
+            "processing_stage", "source", "traceback_fingerprint", "cycle_id",
         ):
             value = getattr(record, name, None)
             if value is not None:
                 payload[name] = value
+        if record.exc_info:
+            payload["traceback"] = _sanitize_log_text(self.formatException(record.exc_info))
         return json.dumps(payload, ensure_ascii=False)
 
 
@@ -31,3 +34,13 @@ def configure_v2_logging(path: str, *, level: str = "INFO") -> logging.Logger:
         handler = RotatingFileHandler(target, maxBytes=10_000_000, backupCount=5, encoding="utf-8")
         handler.setFormatter(JsonFormatter()); logger.addHandler(handler)
     return logger
+
+
+def _sanitize_log_text(value: str) -> str:
+    import re
+
+    text = re.sub(r"https?://[^\s?]+\?\S+", "[REDACTED_URL]", value)
+    return re.sub(
+        r"(?i)(api[_-]?key|secret|signature|authorization)\s*[:=]\s*\S+",
+        r"\1=[REDACTED]", text,
+    )

@@ -54,7 +54,7 @@ from app.v2.execution import V2ExecutionCoordinator
 from app.v2.market import RollingFeatureEngine
 from app.v2.news import (
     CoinGeckoSource, V2ExternalTrendService, V2NewsAggregator,
-    build_default_news_sources,
+    EntityMapper, build_default_news_sources,
 )
 from app.v2.portfolio import PortfolioRiskService
 from app.v2.runtime import V2Runtime, v2_cycle_loop
@@ -142,13 +142,21 @@ v2_execution_coordinator = V2ExecutionCoordinator(
 )
 v2_runtime = V2Runtime(
     settings, persistence, v2_universe_service, v2_feature_engine,
-    V2NewsAggregator(build_default_news_sources(
-        settings.v2_additional_rss_urls,
-        announcement_url=(
-            settings.v2_bybit_announcements_url
-            if settings.v2_bybit_announcements_enabled else None
+    V2NewsAggregator(
+        build_default_news_sources(
+            settings.v2_additional_rss_urls,
+            announcement_url=(
+                settings.v2_bybit_announcements_url
+                if settings.v2_bybit_announcements_enabled else None
+            ),
         ),
-    )),
+        mapper=EntityMapper({
+            Symbol(symbol): tuple(aliases)
+            for symbol, aliases in settings.v2_entity_aliases.items()
+            if symbol in Symbol._value2member_map_
+        }),
+        poll_interval_seconds=settings.v2_news_poll_interval_seconds,
+    ),
     news_service, v2_portfolio_service, v2_execution_coordinator,
     V2ExternalTrendService(
         CoinGeckoSource(settings.v2_coingecko_trending_url, "coingecko-trending"),

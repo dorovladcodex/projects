@@ -85,6 +85,18 @@ class SourceState(BaseModel):
     reconnects: int = 0
 
 
+class NewsModelUsage(BaseModel):
+    """Run-scoped LLM usage; deterministic strategy adapters are excluded."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    news_id: UUID
+    model: str = Field(min_length=1, max_length=100)
+    fallback_used: bool = False
+    fallback_reason: str | None = Field(default=None, max_length=100)
+    classified_at: datetime
+
+
 class MarketFeatureSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -118,6 +130,14 @@ class MarketFeatureSnapshot(BaseModel):
     volume_24h: Decimal = Decimal("0")
     market_regime: str = "UNKNOWN"
     source_health: dict[str, SourceHealth] = Field(default_factory=dict)
+    source_timestamps: dict[str, datetime | None] = Field(default_factory=dict)
+    source_age_seconds: dict[str, float | None] = Field(default_factory=dict)
+    stale_evidence: list[dict[str, Any]] = Field(default_factory=list)
+    liquidation_last_valid_at: datetime | None = None
+    liquidation_data_age_seconds: float | None = Field(default=None, ge=0)
+    liquidation_data_valid: bool = True
+    liquidation_feed_initialized: bool = False
+    liquidation_feed_available: bool = True
 
 
 class ScoreComponents(BaseModel):
@@ -162,6 +182,14 @@ class V2SignalCandidate(BaseModel):
     trailing_stop_pct: Decimal | None = Field(default=None, gt=0)
     break_even_at_r: Decimal | None = Field(default=None, gt=0)
     maximum_holding_seconds: int = Field(gt=0)
+    candidate_persisted_at: datetime | None = None
+    reservation_requested_at: datetime | None = None
+    reservation_created_at: datetime | None = None
+    risk_evaluation_started_at: datetime | None = None
+    risk_approved_at: datetime | None = None
+    execution_queue_entered_at: datetime | None = None
+    execution_task_received_at: datetime | None = None
+    execution_dispatched_at: datetime | None = None
 
 
 class PortfolioReservation(BaseModel):

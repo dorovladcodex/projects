@@ -17,20 +17,130 @@ $process = $null
 $saved = @{}
 
 function Invoke-NativeCommand {
-    param([string]$FilePath, [string[]]$Arguments)
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $FilePath; $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
-    # ProcessStartInfo.ArgumentList is unavailable on Windows PowerShell 5.1.
-    $psi.Arguments = ($Arguments | ForEach-Object {
-        '"' + ([string]$_).Replace('"','\"') + '"'
-    }) -join ' '
-    $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi
-    [void]$p.Start(); $stdout = $p.StandardOutput.ReadToEnd(); $stderr = $p.StandardError.ReadToEnd()
-    $p.WaitForExit(); $code = $p.ExitCode; $p.Dispose()
-    if ($stdout) { Write-Host $stdout.TrimEnd() }
-    if ($stderr) { Write-Host $stderr.TrimEnd() }
-    if ($code -ne 0) { throw "Native command failed with exit code $code" }
+    param(
+        [string]$FilePath, [string[]]$Arguments,
+        [int]$TimeoutSeconds = 120,
+        [string]$Stage = 'NATIVE COMMAND'
+    )
+    $stdoutFile = [IO.Path]::GetTempFileName()
+    $stderrFile = [IO.Path]::GetTempFileName()
+    $p = $null
+    try {
+        $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments `
+            -NoNewWindow -PassThru -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+        # Force Windows PowerShell 5.1 to retain the native process handle.
+        # Without this, Start-Process can return a PID-only proxy whose
+        # ExitCode remains null after a fast redirected child exits.
+        [void]$p.Handle
+        if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                $killer = Start-Process -FilePath 'taskkill.exe' `
+                    -ArgumentList @('/PID', [string]$p.Id, '/T', '/F') `
+                    -NoNewWindow -PassThru
+                $killer.WaitForExit()
+                $killer.Dispose()
+            } catch {
+                if (-not $p.HasExited) { $p.Kill() }
+            }
+            $p.WaitForExit()
+            $p.Refresh()
+            $stdout = [IO.File]::ReadAllText($stdoutFile)
+            $stderr = [IO.File]::ReadAllText($stderrFile)
+            if ($stdout) { Write-Host $stdout.TrimEnd() }
+            if ($stderr) { Write-Host $stderr.TrimEnd() }
+            throw "$Stage timed out after $TimeoutSeconds seconds"
+        }
+
+        # Windows PowerShell 5.1 may not populate ExitCode after the timed
+        # overload until the final asynchronous stream callbacks complete.
+        $p.WaitForExit()
+        $p.Refresh()
+        $code = $null
+        try { $code = $p.ExitCode } catch { $code = $null }
+        $stdout = [IO.File]::ReadAllText($stdoutFile)
+        $stderr = [IO.File]::ReadAllText($stderrFile)
+        if ($stdout) { Write-Host $stdout.TrimEnd() }
+        if ($stderr) { Write-Host $stderr.TrimEnd() }
+        if ($null -eq $code) {
+            throw "Native command exit code was not captured: stage=$Stage"
+        }
+        if ($code -ne 0) { throw "$Stage failed with exit code $code" }
+    } finally {
+        if ($null -ne $p) { $p.Dispose() }
+        Remove-Item -Force -ErrorAction SilentlyContinue $stdoutFile,$stderrFile
+    }
+}
+
+function Get-HostPostgresPort {
+    param(
+        [string]$Service,
+        [int]$TimeoutSeconds = 30,
+        [string]$DockerExecutable = 'docker',
+        [string[]]$DockerPrefixArguments = @()
+    )
+    $out = [IO.Path]::GetTempFileName(); $err = [IO.Path]::GetTempFileName()
+    $p = $null
+    try {
+        $dockerArguments = @($DockerPrefixArguments) + @('compose','port',$Service,'5432')
+        $p = Start-Process -FilePath $DockerExecutable -ArgumentList $dockerArguments `
+            -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+        [void]$p.Handle
+        if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+            try {
+                $killer = Start-Process -FilePath 'taskkill.exe' `
+                    -ArgumentList @('/PID', [string]$p.Id, '/T', '/F') `
+                    -NoNewWindow -PassThru
+                $killer.WaitForExit()
+                $killer.Dispose()
+            } catch {
+                if (-not $p.HasExited) { $p.Kill() }
+            }
+            $p.WaitForExit()
+            $p.Refresh()
+            $stdout = [IO.File]::ReadAllText($out)
+            $stderr = [IO.File]::ReadAllText($err)
+            if ($stdout) { Write-Host $stdout.TrimEnd() }
+            if ($stderr) { Write-Host $stderr.TrimEnd() }
+            throw "POSTGRESQL PORT timed out after $TimeoutSeconds seconds"
+        }
+
+        $p.WaitForExit()
+        $p.Refresh()
+        $code = $null
+        try { $code = $p.ExitCode } catch { $code = $null }
+        $stdout = [IO.File]::ReadAllText($out)
+        $stderr = [IO.File]::ReadAllText($err)
+        if ($stderr) { Write-Host $stderr.TrimEnd() }
+        if ($null -eq $code) {
+            throw 'Native command exit code was not captured: stage=POSTGRESQL PORT'
+        }
+        if ($code -ne 0) {
+            if ($stdout) { Write-Host $stdout.TrimEnd() }
+            throw "POSTGRESQL PORT failed with exit code $code"
+        }
+        $text = $stdout.Trim()
+        if ($text -notmatch ':(\d+)\s*$') { throw 'PostgreSQL mapped port was not reported.' }
+        return [int]$Matches[1]
+    } finally {
+        if ($null -ne $p) { $p.Dispose() }
+        Remove-Item -Force -ErrorAction SilentlyContinue $out,$err
+    }
+}
+
+function Set-HostDatabaseEnvironment([int]$Port) {
+    $db = [Environment]::GetEnvironmentVariable('DATABASE_URL', 'Process')
+    if (-not $db) {
+        $line = Get-Content (Join-Path $root '.env') -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match '^\s*DATABASE_URL=' } | Select-Object -First 1
+        if ($line) { $db = ($line -split '=',2)[1].Trim() }
+    }
+    if (-not $db) { throw 'DATABASE_URL is not configured.' }
+    $hostDb = $db -replace '@(?:db|localhost|127\.0\.0\.1):\d+/', ("@127.0.0.1:$Port/")
+    if ($hostDb -notmatch '@127\.0\.0\.1:' + $Port + '/') {
+        throw 'DATABASE_URL host could not be safely normalized for host Python.'
+    }
+    Set-ChildEnvironment 'DATABASE_URL' $hostDb
 }
 
 function Get-ComposeDatabaseService {
@@ -92,14 +202,13 @@ try {
     Set-ChildEnvironment 'DEMO_RUN_STARTED_AT' ([DateTime]::UtcNow.ToString('o'))
     Set-ChildEnvironment 'ALLOWED_SYMBOLS' '["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","LINKUSDT","AVAXUSDT","SUIUSDT","NEARUSDT","LTCUSDT","TONUSDT","PEPEUSDT","SHIBUSDT","WIFUSDT","BONKUSDT","FLOKIUSDT"]'
     Set-ChildEnvironment 'V2_REPORT_DIRECTORY' (Join-Path $root 'artifacts\demo-v2')
-    $db = [Environment]::GetEnvironmentVariable('DATABASE_URL', 'Process')
-    if ($db) { Set-ChildEnvironment 'DATABASE_URL' ($db -replace '@db:', '@127.0.0.1:') }
-
     Push-Location $root
     try {
-        Invoke-NativeCommand 'docker' @('--version')
+        Invoke-NativeCommand -FilePath 'docker' -Arguments @('--version') -Stage 'DOCKER VERSION'
         $databaseService = Get-ComposeDatabaseService
-        Invoke-NativeCommand 'docker' @('compose', 'up', '-d', $databaseService)
+        Invoke-NativeCommand -FilePath 'docker' `
+            -Arguments @('compose', 'up', '-d', $databaseService) `
+            -Stage 'POSTGRESQL START'
         $dbReady = $false
         for ($i=0; $i -lt 60; $i++) {
             if (Test-PostgresReady $databaseService) { $dbReady = $true; break }
@@ -107,11 +216,19 @@ try {
         }
         if (-not $dbReady) { throw 'PostgreSQL did not become healthy.' }
         Write-Host 'POSTGRESQL: PASS'
-        Invoke-NativeCommand $python @('-m', 'alembic', 'upgrade', 'head')
+        Set-HostDatabaseEnvironment (Get-HostPostgresPort $databaseService)
+        Write-Host 'ALEMBIC: START'
+        Invoke-NativeCommand -FilePath $python `
+            -Arguments @('-m', 'alembic', 'upgrade', 'head') `
+            -TimeoutSeconds 120 -Stage 'ALEMBIC UPGRADE'
         Write-Host 'ALEMBIC: PASS'
-        Invoke-NativeCommand $python @('scripts\demo_v2_preflight.py')
+        Write-Host 'READ-ONLY PREFLIGHT: START'
+        Invoke-NativeCommand -FilePath $python `
+            -Arguments @('scripts\demo_v2_preflight.py') `
+            -TimeoutSeconds 120 -Stage 'READ-ONLY PREFLIGHT'
         Write-Host 'READ-ONLY PREFLIGHT: PASS'
 
+        Write-Host 'UVICORN: START'
         $stdout = Join-Path $artifactDir 'uvicorn.stdout.log'
         $stderr = Join-Path $artifactDir 'uvicorn.stderr.log'
         $script:process = Start-Process -FilePath $python -ArgumentList @(
@@ -153,9 +270,14 @@ try {
         }
         $report = Invoke-RestMethod "$base/v2/report" -Method Post -TimeoutSec 30
         $report | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 (Join-Path $artifactDir 'runner-report.json')
-        Write-Host ('FUNCTIONAL RESULT: PASS')
+        $functionalResult = [string]$report.functional_result
+        if (-not $functionalResult) { $functionalResult = 'FAIL' }
+        Write-Host ('FUNCTIONAL RESULT: ' + $functionalResult)
         Write-Host ('SAFETY RESULT: ' + $(if ($status.kill_switch_active) { 'FAIL_CLOSED' } else { 'PASS' }))
         Write-Host ('ARTIFACTS: ' + $artifactDir)
+        if ($functionalResult -ne 'PASS') {
+            throw ('V2 functional validation failed: ' + ($report.functional_blockers -join '; '))
+        }
     } finally { Pop-Location }
 } finally {
     Stop-Uvicorn

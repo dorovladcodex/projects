@@ -1488,6 +1488,59 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
+    def update_demo_exit_attribution(
+        self,
+        execution_id: str,
+        *,
+        attribution: str,
+        evidence: dict[str, Any],
+        attribution_failure_reason: str | None = None,
+    ) -> bool:
+        """Append-only audited analytics repair; exchange economics stay immutable."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(DemoExecutionRow, execution_id)
+                if row is None:
+                    return False
+                record = DemoExecutionRecord.model_validate(row.payload)
+                if record.state not in {
+                    DemoExecutionState.DEMO_CLOSED,
+                    DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+                    DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+                    DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+                    DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
+                }:
+                    return False
+                record.exit_attribution = attribution
+                record.close_reason = attribution
+                record.exit_attribution_evidence = dict(evidence)
+                record.attribution_failure_reason = attribution_failure_reason
+                record.updated_at = datetime.now(timezone.utc)
+                row.payload = record.model_dump(mode="json")
+                row.updated_at = record.updated_at
+                session.add(DemoExecutionEventRow(
+                    id=str(uuid4()), execution_id=execution_id,
+                    event_key=f"analytics-exit-attribution:{execution_id}:{attribution}",
+                    event_type="EXIT_ATTRIBUTION_REPAIRED",
+                    payload={
+                        "execution_id": execution_id,
+                        "exit_attribution": attribution,
+                        "evidence": dict(evidence),
+                        "repaired_at": record.updated_at.isoformat(),
+                    },
+                    occurred_at=record.updated_at,
+                ))
+                session.flush()
+            return True
+        except IntegrityError:
+            # Exact attribution repairs are idempotent by event_key.
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
     def begin_demo_soak_run(
         self, run_id: str, started_at: datetime
     ) -> dict[str, Any] | None:
@@ -2219,6 +2272,33 @@ class PersistenceRepository:
     def finish_v2_run(self, run_id: str, payload: dict[str, Any]) -> bool:
         if not self.available:
             return False
+
+    def update_v2_run_runtime(self, run_id: str, payload: dict[str, Any]) -> bool:
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2RunRow, run_id)
+                if row is None:
+                    return False
+                current = dict(row.payload or {})
+                current["runtime"] = payload
+                row.payload = current
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def load_v2_run_runtime(self, run_id: str) -> dict[str, Any]:
+        if not self.available:
+            return {}
+        try:
+            with Session(self.engine) as session:
+                row = session.get(V2RunRow, run_id)
+                return dict((row.payload or {}).get("runtime") or {}) if row else {}
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return {}
         try:
             with Session(self.engine) as session, session.begin():
                 row = session.get(V2RunRow, run_id)
@@ -2237,15 +2317,19 @@ class PersistenceRepository:
             return False
         try:
             with Session(self.engine) as session, session.begin():
-                session.add(V2IncidentRow(
-                    id=str(incident.id), run_id=incident.run_id,
-                    event_type=incident.event_type,
-                    symbol=incident.symbol.value if incident.symbol else None,
-                    execution_id=str(incident.execution_id) if incident.execution_id else None,
-                    candidate_id=str(incident.candidate_id) if incident.candidate_id else None,
-                    payload=incident.model_dump(mode="json"),
-                    occurred_at=incident.occurred_at,
-                ))
+                row = session.get(V2IncidentRow, str(incident.id))
+                payload = incident.model_dump(mode="json")
+                if row is None:
+                    session.add(V2IncidentRow(
+                        id=str(incident.id), run_id=incident.run_id,
+                        event_type=incident.event_type,
+                        symbol=incident.symbol.value if incident.symbol else None,
+                        execution_id=str(incident.execution_id) if incident.execution_id else None,
+                        candidate_id=str(incident.candidate_id) if incident.candidate_id else None,
+                        payload=payload, occurred_at=incident.occurred_at,
+                    ))
+                else:
+                    row.payload = payload
             return True
         except IntegrityError:
             return True
@@ -2255,22 +2339,30 @@ class PersistenceRepository:
 
     def v2_report_rows(self, run_id: str) -> dict[str, list[dict[str, Any]]]:
         if not self.available:
-            return {"signals": [], "rejections": [], "incidents": [], "executions": []}
+            return {
+                "signals": [], "rejections": [], "incidents": [],
+                "executions": [], "runtime": {},
+            }
         try:
             with Session(self.engine) as session:
                 signals = session.scalars(select(V2SignalCandidateRow).where(V2SignalCandidateRow.run_id == run_id)).all()
                 rejections = session.scalars(select(V2RejectionRow).where(V2RejectionRow.run_id == run_id)).all()
                 incidents = session.scalars(select(V2IncidentRow).where(V2IncidentRow.run_id == run_id)).all()
                 executions = session.scalars(select(DemoExecutionRow).where(DemoExecutionRow.run_id == run_id)).all()
+                run = session.get(V2RunRow, run_id)
                 return {
                     "signals": [row.payload for row in signals],
                     "rejections": [row.payload for row in rejections],
                     "incidents": [row.payload for row in incidents],
                     "executions": [row.payload for row in executions],
+                    "runtime": dict((run.payload or {}).get("runtime") or {}) if run else {},
                 }
         except SQLAlchemyError as exc:
             self._failed(exc)
-            return {"signals": [], "rejections": [], "incidents": [], "executions": []}
+            return {
+                "signals": [], "rejections": [], "incidents": [],
+                "executions": [], "runtime": {},
+            }
 
     def _failed(self, exc: SQLAlchemyError) -> None:
         self.available = False

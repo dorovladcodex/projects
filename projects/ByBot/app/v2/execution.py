@@ -76,6 +76,7 @@ class V2ExecutionCoordinator:
         return list(dict.fromkeys(reasons))
 
     def execute(self, candidate: V2SignalCandidate) -> dict[str, Any]:
+        candidate.execution_task_received_at = datetime.now(timezone.utc)
         symbol_lock = self._locks.setdefault(candidate.symbol, RLock())
         with symbol_lock, self.portfolio.symbol_lock(candidate.symbol):
             return self._execute_locked(candidate)
@@ -118,6 +119,8 @@ class V2ExecutionCoordinator:
         risk_usdt = notional * candidate.stop_loss_pct / Decimal("100")
         if risk_usdt > self.settings.risk_capital_usdt * self.settings.max_portfolio_risk_pct / Decimal("100"):
             return self._blocked(candidate, "position risk exceeds portfolio risk capital")
+        candidate.reservation_requested_at = datetime.now(timezone.utc)
+        self.repository.save_v2_signal_candidate(candidate)
         reservation = self.portfolio.reserve(
             run_id=self.run_id, candidate_id=candidate.id, symbol=candidate.symbol,
             strategy_name=candidate.strategy_name, notional=notional,
@@ -125,11 +128,17 @@ class V2ExecutionCoordinator:
         )
         if reservation is None:
             return self._blocked(candidate, "durable portfolio reservation was rejected")
+        candidate.reservation_created_at = reservation.created_at
+        candidate.risk_evaluation_started_at = datetime.now(timezone.utc)
+        self.repository.save_v2_signal_candidate(candidate)
         compatibility = self._persist_compatibility_candidate(candidate, quantity, notional)
         if compatibility is None:
             self.portfolio.release(reservation.id)
             return self._blocked(candidate, "durable execution candidate could not be persisted")
         result, classification = compatibility
+        candidate.risk_approved_at = datetime.now(timezone.utc)
+        candidate.execution_dispatched_at = datetime.now(timezone.utc)
+        self.repository.save_v2_signal_candidate(candidate)
         reservation.state = ReservationState.EXECUTING
         self.repository.update_v2_portfolio_reservation(reservation)
         leverage = normalize_leverage(
@@ -144,6 +153,16 @@ class V2ExecutionCoordinator:
             trailing_stop_pct=candidate.trailing_stop_pct,
             break_even_at_r=candidate.break_even_at_r,
             maximum_holding_seconds=candidate.maximum_holding_seconds,
+            latency_timeline={
+                "candidate_persisted_at": candidate.candidate_persisted_at,
+                "reservation_requested_at": candidate.reservation_requested_at,
+                "reservation_created_at": candidate.reservation_created_at,
+                "risk_evaluation_started_at": candidate.risk_evaluation_started_at,
+                "risk_approved_at": candidate.risk_approved_at,
+                "execution_dispatched_at": candidate.execution_dispatched_at,
+                "execution_task_received_at": candidate.execution_task_received_at,
+            },
+            instrument_rules=universe_status.instrument,
         )
         if record is None:
             self.last_error = self.demo_execution.last_error or "Demo execution was blocked"
@@ -179,7 +198,7 @@ class V2ExecutionCoordinator:
             reason="deterministic V2 strategy; no LLM market data",
             classification_status=ClassificationStatus.SUCCESS,
             trade_eligible=True, provider_name="deterministic-v2",
-            model_name=candidate.strategy_name.value,
+            model_name="deterministic-v2",
             classifier_version=candidate.strategy_version, classified_at=now,
         )
         action = NewsSignalAction.BUY if candidate.side == StrategySide.LONG else NewsSignalAction.SELL

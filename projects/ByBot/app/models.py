@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from typing import Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -156,6 +157,7 @@ class DemoFill(BaseModel):
     fee: Decimal = Decimal("0")
     fee_currency: str | None = None
     executed_at: datetime
+    local_received_at: datetime | None = None
 
 
 class DemoExecutionRecord(BaseModel):
@@ -200,13 +202,56 @@ class DemoExecutionRecord(BaseModel):
     exit_slippage: Decimal | None = None
     paper_shadow_pnl: Decimal | None = None
     close_reason: str | None = None
+    exit_attribution: str | None = None
+    exit_attribution_evidence: dict[str, Any] = Field(default_factory=dict)
+    attribution_failure_reason: str | None = None
     failure_reason: str | None = None
     cleanup_result: str | None = None
     last_reconciliation_at: datetime | None = None
     last_error: str | None = None
     signal_created_at: datetime | None = None
+    candidate_persisted_at: datetime | None = None
+    reservation_requested_at: datetime | None = None
+    reservation_created_at: datetime | None = None
+    risk_evaluation_started_at: datetime | None = None
+    risk_approved_at: datetime | None = None
+    execution_dispatched_at: datetime | None = None
+    execution_task_received_at: datetime | None = None
+    ownership_check_started_at: datetime | None = None
+    ownership_check_completed_at: datetime | None = None
+    reconciliation_check_started_at: datetime | None = None
+    reconciliation_check_completed_at: datetime | None = None
+    account_verification_started_at: datetime | None = None
+    account_verification_completed_at: datetime | None = None
+    position_query_started_at: datetime | None = None
+    position_query_completed_at: datetime | None = None
+    open_orders_query_started_at: datetime | None = None
+    open_orders_query_completed_at: datetime | None = None
+    instrument_metadata_started_at: datetime | None = None
+    instrument_metadata_completed_at: datetime | None = None
+    leverage_setup_started_at: datetime | None = None
+    leverage_setup_completed_at: datetime | None = None
+    quantity_normalization_started_at: datetime | None = None
+    quantity_normalization_completed_at: datetime | None = None
+    protection_plan_started_at: datetime | None = None
+    protection_plan_completed_at: datetime | None = None
+    database_execution_state_started_at: datetime | None = None
+    database_execution_state_completed_at: datetime | None = None
+    exchange_submit_started_at: datetime | None = None
+    execution_stage_durations_ms: dict[str, float] = Field(default_factory=dict)
     order_submitted_at: datetime | None = None
+    order_acknowledged_at: datetime | None = None
+    exchange_order_created_at: datetime | None = None
+    exchange_fill_at: datetime | None = None
+    local_submit_started_at: datetime | None = None
+    local_ack_received_at: datetime | None = None
+    local_fill_received_at: datetime | None = None
+    fill_before_ack: bool = False
+    order_submit_to_first_fill_ms: float | None = Field(default=None, ge=0)
+    ack_to_first_fill_ms: float | None = Field(default=None, ge=0)
     first_fill_at: datetime | None = None
+    position_confirmed_at: datetime | None = None
+    protection_confirmed_at: datetime | None = None
     closed_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -267,6 +312,10 @@ class NewsClassification(BaseModel):
     codex_cli_token_count_available: bool = False
     cache_hit: bool = False
     error_code: str | None = None
+    fallback_used: bool = False
+    fallback_reason: str | None = Field(default=None, max_length=100)
+    request_attempt_number: int = Field(default=1, ge=0)
+    failure_category: str | None = Field(default=None, max_length=100)
     classified_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

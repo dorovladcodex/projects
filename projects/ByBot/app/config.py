@@ -73,7 +73,9 @@ class Settings(BaseSettings):
     news_classifier_mode: NewsClassifierMode = NewsClassifierMode.MOCK
     llm_provider_name: str = "openai-compatible"
     llm_api_url: str = "https://api.openai.com/v1/chat/completions"
-    llm_model: str = "gpt-4.1-mini"
+    llm_model: str = "gpt-5.4-mini"
+    news_primary_model: str = "gpt-5.4-mini"
+    news_fallback_model: str = "gpt-5.6-luna"
     llm_classifier_version: str = "news-v1"
     llm_allow_mock_fallback: bool = False
     llm_cache_ttl_seconds: int = Field(default=3600, ge=1, le=86400)
@@ -135,13 +137,42 @@ class Settings(BaseSettings):
     v2_public_rest_url: str = "https://api.bybit.com"
     v2_ws_reconnect_max_seconds: int = Field(default=30, ge=1, le=300)
     v2_rest_metrics_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    v2_news_poll_interval_seconds: int = Field(default=180, ge=10, le=3600)
+    v2_liquidation_stale_seconds: int = Field(default=60, ge=5, le=3600)
+    v2_demo_account_verification_ttl_seconds: int = Field(
+        default=900, ge=30, le=3600
+    )
     v2_feature_history_limit: int = Field(default=7200, ge=120, le=100000)
+    v2_entity_aliases: dict[str, tuple[str, ...]] = Field(default_factory=lambda: {
+        "BTCUSDT": ("BTC", "Bitcoin"), "ETHUSDT": ("ETH", "Ethereum", "Ether"),
+        "SOLUSDT": ("SOL", "Solana"), "XRPUSDT": ("XRP", "Ripple"),
+        "DOGEUSDT": ("DOGE", "Dogecoin"), "ADAUSDT": ("ADA", "Cardano"),
+        "LINKUSDT": ("LINK", "Chainlink"), "AVAXUSDT": ("AVAX", "Avalanche"),
+        "SUIUSDT": ("SUI", "Sui"), "NEARUSDT": ("NEAR", "NEAR Protocol"),
+        "LTCUSDT": ("LTC", "Litecoin"), "WIFUSDT": ("WIF", "dogwifhat"),
+    })
 
     v2_news_momentum_enabled: bool = True
     v2_volume_breakout_enabled: bool = True
     v2_oi_funding_squeeze_enabled: bool = True
     v2_liquidation_momentum_enabled: bool = True
     v2_meme_trend_enabled: bool = True
+    v2_news_momentum_symbols: tuple[str, ...] = (
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "NEARUSDT",
+        "LTCUSDT", "TONUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
+        "BONKUSDT", "FLOKIUSDT",
+    )
+    v2_market_strategy_symbols: tuple[str, ...] = (
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "NEARUSDT",
+        "LTCUSDT", "TONUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
+        "BONKUSDT", "FLOKIUSDT",
+    )
+    v2_meme_trend_symbols: tuple[str, ...] = (
+        "DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
+    )
+    v2_cycle_failure_repeat_limit: int = Field(default=3, ge=1, le=100)
     v2_strategy_default_threshold: float = Field(default=0.62, ge=0, le=1)
     v2_meme_strategy_threshold: float = Field(default=0.70, ge=0, le=1)
     v2_min_expected_edge_bps: Decimal = Field(default=Decimal("8"), ge=0)
@@ -386,6 +417,15 @@ class Settings(BaseSettings):
         if symbol in {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
             return self.meme_position_notional_usdt
         return self.alt_position_notional_usdt
+
+    def v2_strategy_applies_to_symbol(self, strategy: str, symbol: str) -> bool:
+        if strategy == "NewsMomentumStrategyV2":
+            scope = self.v2_news_momentum_symbols
+        elif strategy == "MemeTrendStrategy":
+            scope = self.v2_meme_trend_symbols
+        else:
+            scope = self.v2_market_strategy_symbols
+        return symbol.upper() in {value.upper() for value in scope}
 
 
 @lru_cache

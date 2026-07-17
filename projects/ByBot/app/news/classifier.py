@@ -54,6 +54,9 @@ class ProviderResponse:
     additional_estimated_input_tokens: int = 0
     additional_estimated_output_tokens: int = 0
     codex_cli_total_tokens: int | None = None
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    request_attempt_number: int = 1
 
 
 @dataclass(frozen=True)
@@ -232,6 +235,9 @@ class CodexCLIProvider:
                     codex_cli_total_tokens=_sum_optional_tokens(
                         primary.total_tokens, fallback.total_tokens
                     ),
+                    fallback_used=True,
+                    fallback_reason="ambiguous_primary_result",
+                    request_attempt_number=2,
                 )
         return ProviderResponse(
             content=primary.content,
@@ -652,7 +658,7 @@ class LLMNewsClassifier:
             classification_status=ClassificationStatus.SUCCESS,
             trade_eligible=True,
             provider_name=self.provider.name,
-            model_name=response.model_name or self.settings.llm_model,
+            model_name=response.model_name or self.settings.news_primary_model,
             classifier_version=self.settings.llm_classifier_version,
             latency_ms=(time.perf_counter() - started) * 1000,
             input_tokens=input_tokens,
@@ -662,6 +668,11 @@ class LLMNewsClassifier:
             codex_cli_total_tokens=response.codex_cli_total_tokens,
             codex_cli_token_count_available=response.codex_cli_total_tokens is not None,
             cache_hit=False,
+            fallback_used=response.fallback_used,
+            fallback_reason=response.fallback_reason,
+            request_attempt_number=max(
+                response.request_attempt_number, attempt + 1
+            ),
             classified_at=now,
         )
         with self._lock:
@@ -700,7 +711,8 @@ class LLMNewsClassifier:
             "credentials_present": credentials_present,
             "error_code": error_code,
             "provider_name": self.provider.name if self.provider else self.settings.llm_provider_name,
-            "model_name": self.settings.llm_model,
+            "model_name": self.settings.news_primary_model,
+            "fallback_model_name": self.settings.news_fallback_model,
             "classifier_version": self.settings.llm_classifier_version,
             "circuit_breaker_state": circuit_state,
             "last_error": self._last_error,
@@ -870,7 +882,7 @@ class LLMNewsClassifier:
             classification_status=ClassificationStatus.FAILED,
             trade_eligible=False,
             provider_name=self.provider.name if self.provider else self.settings.llm_provider_name,
-            model_name=self.settings.llm_model,
+            model_name=self.settings.news_primary_model,
             classifier_version=self.settings.llm_classifier_version,
             latency_ms=(time.perf_counter() - started) * 1000,
             estimated_input_tokens=estimated_input,
@@ -879,6 +891,11 @@ class LLMNewsClassifier:
             estimated_output_tokens=estimated_output_tokens,
             cache_hit=False,
             error_code=error_code,
+            request_attempt_number=0 if error_code in {
+                "PROVIDER_UNAVAILABLE", "CIRCUIT_OPEN", "DAILY_REQUEST_BUDGET",
+                "HOURLY_REQUEST_BUDGET", "DAILY_TOKEN_BUDGET", "RATE_LIMIT",
+            } else 1,
+            failure_category=error_code,
             classified_at=now,
         )
         return apply_trade_eligibility(
@@ -957,8 +974,8 @@ class CodexCLINewsClassifier(LLMNewsClassifier):
             "credentials_present": provider_available,
             "error_code": error_code,
             "provider_name": "codex-cli",
-            "model_name": self.settings.codex_cli_model,
-            "fallback_model_name": self.settings.codex_cli_fallback_model,
+            "model_name": self.settings.news_primary_model,
+            "fallback_model_name": self.settings.news_fallback_model,
             "classifier_version": self.settings.llm_classifier_version,
             "circuit_breaker_state": circuit_state,
             "last_error": self._last_error,
@@ -982,8 +999,8 @@ def build_news_classifier(settings: Settings) -> BaseNewsClassifier:
         codex_provider = (
             CodexCLIProvider(
                 executable=executable,
-                model=settings.codex_cli_model,
-                fallback_model=settings.codex_cli_fallback_model,
+                model=settings.news_primary_model,
+                fallback_model=settings.news_fallback_model,
                 reasoning_effort=settings.codex_cli_reasoning_effort,
                 fallback_min_confidence=settings.codex_cli_fallback_min_confidence,
             )
@@ -995,7 +1012,7 @@ def build_news_classifier(settings: Settings) -> BaseNewsClassifier:
         OpenAICompatibleProvider(
             api_url=settings.llm_api_url,
             api_key=settings.llm_api_key,
-            model=settings.llm_model,
+            model=settings.news_primary_model,
             provider_name=settings.llm_provider_name,
         )
         if _credentials_present(settings.llm_api_key)

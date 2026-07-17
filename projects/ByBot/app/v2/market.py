@@ -52,6 +52,9 @@ class RollingFeatureEngine:
             lambda: deque(maxlen=limit)
         )
         self.books: dict[Symbol, tuple[Decimal, Decimal, Decimal, Decimal, datetime]] = {}
+        self._book_levels: dict[
+            Symbol, tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]]
+        ] = {}
         self.tickers: dict[Symbol, dict[str, Any]] = {}
         self.funding: dict[Symbol, tuple[Decimal, datetime]] = {}
         self.open_interest: dict[Symbol, deque[tuple[datetime, Decimal]]] = defaultdict(
@@ -61,10 +64,19 @@ class RollingFeatureEngine:
             name: SourceState(source=name)
             for name in ("ticker", "trades", "orderbook", "liquidations", "rest")
         }
-        self.stale_incidents = 0
+        self.stale_incidents = 0  # Backward-compatible critical incident counter.
+        self.stale_feature_observations = 0
+        self.invalid_liquidation_symbols: set[Symbol] = set()
+        self._source_age_samples: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=10_000)
+        )
 
     def ingest_ticker(self, symbol: Symbol, data: dict[str, Any], timestamp: datetime) -> None:
-        self.tickers[symbol] = {**data, "timestamp": timestamp}
+        # Bybit ticker messages after the initial snapshot are sparse deltas.
+        # Merge them so a funding-only delta cannot erase lastPrice.
+        ticker = self.tickers.setdefault(symbol, {})
+        ticker.update(data)
+        ticker["timestamp"] = timestamp
         self._healthy("ticker", timestamp)
 
     def ingest_trade(
@@ -76,13 +88,25 @@ class RollingFeatureEngine:
 
     def ingest_orderbook(
         self, symbol: Symbol, bids: list[list[object]], asks: list[list[object]],
-        timestamp: datetime,
+        timestamp: datetime, *, snapshot: bool = True,
     ) -> None:
-        if not bids or not asks:
+        if snapshot or symbol not in self._book_levels:
+            bid_levels: dict[Decimal, Decimal] = {}
+            ask_levels: dict[Decimal, Decimal] = {}
+        else:
+            current_bids, current_asks = self._book_levels[symbol]
+            bid_levels = dict(current_bids)
+            ask_levels = dict(current_asks)
+        _apply_book_updates(bid_levels, bids)
+        _apply_book_updates(ask_levels, asks)
+        self._book_levels[symbol] = (bid_levels, ask_levels)
+        if not bid_levels or not ask_levels:
             return
-        bid = Decimal(str(bids[0][0])); ask = Decimal(str(asks[0][0]))
-        bid_depth = sum(Decimal(str(row[0])) * Decimal(str(row[1])) for row in bids)
-        ask_depth = sum(Decimal(str(row[0])) * Decimal(str(row[1])) for row in asks)
+        bid = max(bid_levels); ask = min(ask_levels)
+        if bid <= 0 or ask <= bid:
+            return
+        bid_depth = sum((price * quantity for price, quantity in bid_levels.items()), Decimal("0"))
+        ask_depth = sum((price * quantity for price, quantity in ask_levels.items()), Decimal("0"))
         self.books[symbol] = (bid, ask, bid_depth, ask_depth, timestamp)
         self._healthy("orderbook", timestamp)
 
@@ -90,6 +114,13 @@ class RollingFeatureEngine:
         self, symbol: Symbol, side: str, price: Decimal,
         quantity: Decimal, timestamp: datetime,
     ) -> None:
+        if side.upper() not in {"BUY", "SELL"} or price <= 0 or quantity <= 0:
+            self.invalid_liquidation_symbols.add(symbol)
+            state = self.source_states["liquidations"]
+            state.health = SourceHealth.DEGRADED
+            state.last_error = "invalid liquidation payload"
+            return
+        self.invalid_liquidation_symbols.discard(symbol)
         self.liquidations[symbol].append(
             LiquidationPoint(timestamp, price * quantity, side.upper())
         )
@@ -121,8 +152,28 @@ class RollingFeatureEngine:
         last = _dec(ticker.get("lastPrice") or ticker.get("price"))
         bid, ask, bid_depth, ask_depth, book_time = book
         ticker_time = ticker.get("timestamp")
+        trade_time = self.trades[symbol][-1].timestamp if self.trades[symbol] else None
+        liquidation_time = (
+            self.liquidations[symbol][-1].timestamp
+            if self.liquidations[symbol] else None
+        )
+        source_timestamps = {
+            "ticker": ticker_time if isinstance(ticker_time, datetime) else None,
+            "orderbook": book_time,
+            "trades": trade_time,
+            "liquidations": liquidation_time,
+        }
+        source_ages = {
+            source: max(0.0, (current - timestamp).total_seconds())
+            if timestamp is not None else None
+            for source, timestamp in source_timestamps.items()
+        }
+        for source, age in source_ages.items():
+            if age is not None:
+                self._source_age_samples[source].append(age)
         mandatory_times = [item for item in (ticker_time, book_time) if isinstance(item, datetime)]
         stale_reasons: list[str] = []
+        stale_evidence: list[dict[str, Any]] = []
         if len(mandatory_times) != 2:
             stale_reasons.append("mandatory source timestamp missing")
         elif any(
@@ -136,9 +187,22 @@ class RollingFeatureEngine:
             self.settings.v2_market_stale_seconds
         ):
             stale_reasons.append("public trades are stale")
+        for source in ("ticker", "orderbook", "trades"):
+            age = source_ages[source]
+            if age is None or age > self.settings.v2_market_stale_seconds:
+                stale_evidence.append({
+                    "source": source,
+                    "observed_age_seconds": age,
+                    "configured_maximum_age_seconds": self.settings.v2_market_stale_seconds,
+                    "latest_source_timestamp": (
+                        source_timestamps[source].isoformat()
+                        if source_timestamps[source] else None
+                    ),
+                    "evaluation_timestamp": current.isoformat(),
+                })
         fresh = not stale_reasons
         if not fresh:
-            self.stale_incidents += 1
+            self.stale_feature_observations += 1
         momentum: dict[str, Decimal] = {}
         breakout: dict[str, Decimal] = {}
         acceleration: dict[str, Decimal] = {}
@@ -188,7 +252,38 @@ class RollingFeatureEngine:
             liquidation_imbalance=(short_liq - long_liq) / liq_total if liq_total else Decimal("0"),
             volume_24h=_dec(ticker.get("volume24h"), "0"), market_regime=market_regime,
             source_health={key: value.health for key, value in self.source_states.items()},
+            source_timestamps=source_timestamps,
+            source_age_seconds=source_ages,
+            stale_evidence=stale_evidence,
+            liquidation_last_valid_at=liquidation_time,
+            liquidation_data_age_seconds=source_ages["liquidations"],
+            liquidation_data_valid=symbol not in self.invalid_liquidation_symbols,
+            liquidation_feed_initialized=liquidation_time is not None,
+            liquidation_feed_available=(
+                self.source_states["liquidations"].health
+                not in {SourceHealth.UNAVAILABLE, SourceHealth.DEGRADED}
+            ),
         )
+
+    def record_critical_stale_incident(self) -> None:
+        self.stale_incidents += 1
+
+    def data_age_metrics(self) -> dict[str, dict[str, float | None]]:
+        result: dict[str, dict[str, float | None]] = {}
+        for source in ("ticker", "trades", "orderbook", "liquidations", "rest"):
+            samples = sorted(self._source_age_samples.get(source, ()))
+            state = self.source_states[source]
+            latest_age = (
+                max(0.0, (datetime.now(timezone.utc) - state.last_message_at).total_seconds())
+                if state.last_message_at else None
+            )
+            result[source] = {
+                "maximum": max(samples) if samples else None,
+                "p50": _percentile(samples, 0.50),
+                "p95": _percentile(samples, 0.95),
+                "latest_message_age": latest_age,
+            }
+        return result
 
     def _healthy(self, source: str, timestamp: datetime) -> None:
         state = self.source_states[source]
@@ -262,7 +357,8 @@ class BybitPublicWebSocketEngine:
                 )
         elif topic.startswith("orderbook.") and isinstance(rows[0], dict):
             self.features.ingest_orderbook(
-                symbol, rows[0].get("b") or [], rows[0].get("a") or [], timestamp
+                symbol, rows[0].get("b") or [], rows[0].get("a") or [], timestamp,
+                snapshot=str(message.get("type") or "").lower() == "snapshot",
             )
         elif topic.startswith("allLiquidation."):
             for row in rows:
@@ -396,6 +492,13 @@ def _regime(momentum_bps: Decimal, volatility_bps: Decimal) -> str:
     return "RANGE"
 
 
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    index = min(len(values) - 1, max(0, int((len(values) - 1) * percentile)))
+    return values[index]
+
+
 def _rest_get(url: str, params: dict[str, str], timeout: float) -> dict[str, Any]:
     request = Request(f"{url}?{urlencode(params)}", headers={"User-Agent": "ByBot/2"})
     with urlopen(request, timeout=timeout) as response:  # noqa: S310
@@ -407,3 +510,18 @@ def _result_first(payload: dict[str, Any]) -> dict[str, Any]:
     if not rows:
         raise ValueError("public REST response has no rows")
     return rows[0]
+
+
+def _apply_book_updates(
+    levels: dict[Decimal, Decimal], rows: list[list[object]]
+) -> None:
+    for row in rows:
+        if len(row) < 2:
+            continue
+        price = _dec(row[0]); quantity = _dec(row[1])
+        if price <= 0:
+            continue
+        if quantity <= 0:
+            levels.pop(price, None)
+        else:
+            levels[price] = quantity
