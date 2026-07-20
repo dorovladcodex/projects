@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import RLock
@@ -19,6 +20,56 @@ from app.v2.portfolio import (
     PortfolioRiskService, normalize_leverage, normalize_order_quantity,
 )
 from app.v2.universe import SymbolUniverseService
+
+
+@dataclass(frozen=True)
+class ExpectedDemoPolicyRejection:
+    code: str
+    risk_control: str
+
+
+EXPECTED_DEMO_POLICY_REJECTIONS: dict[str, ExpectedDemoPolicyRejection] = {
+    "symbol cooldown is active": ExpectedDemoPolicyRejection(
+        "SYMBOL_COOLDOWN_ACTIVE", "symbol_cooldown"
+    ),
+    "global entry cooldown is active": ExpectedDemoPolicyRejection(
+        "GLOBAL_ENTRY_COOLDOWN_ACTIVE", "global_entry_cooldown"
+    ),
+    "maximum total Demo positions reached": ExpectedDemoPolicyRejection(
+        "MAXIMUM_POSITIONS_REACHED", "maximum_total_positions"
+    ),
+    "conflicting remote Demo position exists": ExpectedDemoPolicyRejection(
+        "DUPLICATE_POSITION", "per_symbol_position_limit"
+    ),
+    "conflicting active Demo order exists": ExpectedDemoPolicyRejection(
+        "CONFLICTING_ACTIVE_ORDER", "per_symbol_order_limit"
+    ),
+    "maximum daily Demo net loss reached": ExpectedDemoPolicyRejection(
+        "DAILY_LOSS_LIMIT_REACHED", "daily_loss_limit"
+    ),
+    "maximum weekly Demo net loss reached": ExpectedDemoPolicyRejection(
+        "WEEKLY_LOSS_LIMIT_REACHED", "weekly_loss_limit"
+    ),
+    "maximum Demo account drawdown reached": ExpectedDemoPolicyRejection(
+        "DRAWDOWN_LIMIT_REACHED", "drawdown_limit"
+    ),
+}
+
+
+def classify_expected_demo_policy_rejection(
+    exc: DemoSafetyError,
+) -> ExpectedDemoPolicyRejection | None:
+    parts = [part.strip() for part in str(exc).split(";") if part.strip()]
+    matches = [EXPECTED_DEMO_POLICY_REJECTIONS.get(part) for part in parts]
+    if not parts or any(item is None for item in matches):
+        return None
+    resolved = [item for item in matches if item is not None]
+    if len(resolved) == 1:
+        return resolved[0]
+    return ExpectedDemoPolicyRejection(
+        code="MULTIPLE_RISK_LIMITS_REACHED",
+        risk_control="+".join(item.risk_control for item in resolved),
+    )
 
 
 class V2ExecutionCoordinator:
@@ -129,11 +180,12 @@ class V2ExecutionCoordinator:
         if reservation is None:
             return self._blocked(candidate, "durable portfolio reservation was rejected")
         candidate.reservation_created_at = reservation.created_at
+        candidate.reservation_id = reservation.id
         candidate.risk_evaluation_started_at = datetime.now(timezone.utc)
         self.repository.save_v2_signal_candidate(candidate)
         compatibility = self._persist_compatibility_candidate(candidate, quantity, notional)
         if compatibility is None:
-            self.portfolio.release(reservation.id)
+            self.portfolio.release(reservation.id, activate_cooldown=False)
             return self._blocked(candidate, "durable execution candidate could not be persisted")
         result, classification = compatibility
         candidate.risk_approved_at = datetime.now(timezone.utc)
@@ -145,28 +197,61 @@ class V2ExecutionCoordinator:
             self.settings.v2_leverage_for_symbol(candidate.symbol.value),
             universe_status.instrument,
         )
-        record = self.demo_execution.submit_candidate(
-            result.candidate, result.risk_preview, classification,
-            _market_snapshot(candidate), desired_leverage=leverage,
-            strategy_name=candidate.strategy_name.value,
-            strategy_version=candidate.strategy_version,
-            trailing_stop_pct=candidate.trailing_stop_pct,
-            break_even_at_r=candidate.break_even_at_r,
-            maximum_holding_seconds=candidate.maximum_holding_seconds,
-            latency_timeline={
-                "candidate_persisted_at": candidate.candidate_persisted_at,
-                "reservation_requested_at": candidate.reservation_requested_at,
-                "reservation_created_at": candidate.reservation_created_at,
-                "risk_evaluation_started_at": candidate.risk_evaluation_started_at,
-                "risk_approved_at": candidate.risk_approved_at,
-                "execution_dispatched_at": candidate.execution_dispatched_at,
-                "execution_task_received_at": candidate.execution_task_received_at,
-            },
-            instrument_rules=universe_status.instrument,
-        )
+        try:
+            record = self.demo_execution.submit_candidate(
+                result.candidate, result.risk_preview, classification,
+                _market_snapshot(candidate), desired_leverage=leverage,
+                strategy_name=candidate.strategy_name.value,
+                strategy_version=candidate.strategy_version,
+                trailing_stop_pct=candidate.trailing_stop_pct,
+                break_even_at_r=candidate.break_even_at_r,
+                maximum_holding_seconds=candidate.maximum_holding_seconds,
+                latency_timeline={
+                    "candidate_persisted_at": candidate.candidate_persisted_at,
+                    "reservation_requested_at": candidate.reservation_requested_at,
+                    "reservation_created_at": candidate.reservation_created_at,
+                    "risk_evaluation_started_at": candidate.risk_evaluation_started_at,
+                    "risk_approved_at": candidate.risk_approved_at,
+                    "execution_dispatched_at": candidate.execution_dispatched_at,
+                    "execution_task_received_at": candidate.execution_task_received_at,
+                },
+                instrument_rules=universe_status.instrument,
+            )
+        except DemoSafetyError as exc:
+            policy = classify_expected_demo_policy_rejection(exc)
+            if policy is None:
+                raise
+            rejected_at = datetime.now(timezone.utc)
+            self.portfolio.release(
+                reservation.id, activate_cooldown=False
+            )
+            candidate.admitted = False
+            candidate.state = "EXECUTION_REJECTED"
+            candidate.rejection_reason = str(exc)
+            candidate.execution_rejected_at = rejected_at
+            self.repository.save_v2_signal_candidate(candidate)
+            self.last_error = str(exc)
+            return {
+                "execution_attempted": False,
+                "candidate_id": str(candidate.id),
+                "reservation_id": str(reservation.id),
+                "execution_id": None,
+                "state": candidate.state,
+                "symbol": candidate.symbol.value,
+                "strategy": candidate.strategy_name.value,
+                "rejection_code": policy.code,
+                "rejection_message": str(exc),
+                "risk_control": policy.risk_control,
+                "processing_stage": "demo_execution",
+                "rejected_at": rejected_at.isoformat(),
+                "handled_policy_rejection": True,
+                "exchange_mutation_performed": False,
+                "exchange_order_submitted": False,
+                "exchange_environment": "BYBIT_DEMO",
+            }
         if record is None:
             self.last_error = self.demo_execution.last_error or "Demo execution was blocked"
-            self.portfolio.release(reservation.id)
+            self.portfolio.release(reservation.id, activate_cooldown=False)
             return self._blocked(candidate, self.last_error)
         self.portfolio.mark_open(reservation.id, record.id)
         candidate.state = record.state.value

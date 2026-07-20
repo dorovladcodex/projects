@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import logging
 import re
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from threading import RLock
 from uuid import NAMESPACE_URL, uuid5
 
 from app.config import Settings
@@ -89,6 +91,39 @@ class V2Runtime:
         self.strategy_not_applicable_counts: dict[str, int] = dict(
             restored.get("strategy_not_applicable_counts") or {}
         )
+        self.signal_metrics: dict[str, Any] = dict(
+            restored.get("signal_metrics") or {
+                "strategy_evaluations": 0,
+                "raw_candidates": 0,
+                "deduplicated_candidates": 0,
+                "threshold_passes": 0,
+                "risk_rejections": 0,
+                "portfolio_rejections": 0,
+                "pre_execution_admissions": 0,
+                "execution_policy_rejections": 0,
+                "cooldown_rejections": 0,
+                "admitted_signals": 0,
+                "by_strategy": {},
+                "by_symbol": {},
+            }
+        )
+        self._candidate_signatures: dict[str, datetime] = {}
+        for restored_candidate in self.candidates:
+            self._candidate_signatures[_candidate_signature(restored_candidate)] = (
+                restored_candidate.created_at
+            )
+        self._status_lock = RLock()
+        self._status_snapshot: dict[str, Any] = {
+            "enabled": settings.v2_enabled,
+            "execution_environment": "BYBIT_DEMO",
+            "run_id": run_id,
+            "started_at": self.started_at.isoformat(),
+            "status_snapshot_state": "INITIALIZING",
+            "status_snapshot_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.status_request_count = 0
+        self.status_request_failures = 0
+        self.status_request_latency_ms = 0.0
         self.failure_occurrences: dict[str, int] = dict(
             restored.get("failure_occurrences") or {}
         )
@@ -100,6 +135,7 @@ class V2Runtime:
             "trade_eligible_items": 0, "mapped_assets": 0,
             "news_momentum_candidates_generated": 0,
             "news_momentum_candidates_admitted": 0,
+            "news_funnel_reasons": {},
         }
         self.news_metrics.update(restored.get("news_metrics") or {})
         self.stale_metrics: dict[str, Any] = dict(restored.get("stale_metrics") or {
@@ -148,6 +184,7 @@ class V2Runtime:
                 # Persistence health is reported elsewhere; startup remains
                 # safe and restored NewsItems still prevent reinsertion.
                 pass
+        self._refresh_status_snapshot()
 
     def start(self) -> None:
         if not self.settings.v2_enabled:
@@ -155,6 +192,7 @@ class V2Runtime:
         if not self.repository.begin_v2_run(self.run_id, self.started_at):
             raise RuntimeError("V2 run boundary could not be persisted")
         self.universe.refresh()
+        self._refresh_status_snapshot()
 
     async def cycle(self) -> None:
         if not self.settings.v2_enabled:
@@ -194,6 +232,7 @@ class V2Runtime:
             if sum(self.failure_occurrences.values()) > cycle_failures_before else None
         )
         self._persist_runtime_metrics()
+        self._refresh_status_snapshot()
 
     def refresh_universe_if_due(self) -> None:
         now = datetime.now(timezone.utc)
@@ -240,13 +279,20 @@ class V2Runtime:
                 "mapped_symbols": [symbol.value for symbol in symbols],
                 "market_confirmation_result": {}, "candidate_ids": [],
                 "final_decision": "NO_CANDIDATE", "rejection_reason": None,
+                "aggregator_filter_decision": "accepted",
+                "classifier_prefilter_decision": None,
+                "llm_decision_reason": None,
+                "funnel_stage": "deterministic_accepted",
             }
             try:
                 before_calls = self.v1_news_service.real_llm_calls_count
+                classifier_before = self.v1_news_service.classifier_metrics_payload()
                 accepted, filter_reason, classification = await asyncio.to_thread(
                     self.v1_news_service.ingest, item
                 )
+                classifier_after = self.v1_news_service.classifier_metrics_payload()
                 decision["deterministic_filter_decision"] = filter_reason
+                decision["classifier_prefilter_decision"] = filter_reason
                 decision["llm_used"] = self.v1_news_service.real_llm_calls_count > before_calls
             except Exception as exc:
                 self._record_failure(
@@ -271,6 +317,17 @@ class V2Runtime:
                             source_metric.get("deterministic_filter_rejections", 0) + 1
                         )
                 decision["rejection_reason"] = filter_reason
+                decision["llm_decision_reason"] = _news_skip_reason(
+                    accepted=accepted,
+                    filter_reason=filter_reason,
+                    classification=classification,
+                    before=classifier_before,
+                    after=classifier_after,
+                )
+                decision["funnel_stage"] = "deterministic_rejected" if not accepted else "llm_skipped"
+                self._record_news_funnel_reason(
+                    item.source, decision["llm_decision_reason"]
+                )
                 self._persist_news_audit("V2_NEWS_DECISION_AUDIT", decision)
                 continue
             decision.update({
@@ -285,6 +342,10 @@ class V2Runtime:
                 "confidence": classification.confidence,
             })
             self._record_news_model_usage(classification)
+            decision["llm_decision_reason"] = _news_classification_reason(
+                classification, decision["llm_used"], classifier_before, classifier_after
+            )
+            decision["funnel_stage"] = "classified"
             self.news_metrics["llm_classifications"] += 1
             if decision["llm_used"]:
                 self.news_metrics["items_sent_to_llm"] += 1
@@ -292,11 +353,21 @@ class V2Runtime:
             if source_metric is not None:
                 source_metric["classified_items"] = source_metric.get("classified_items", 0) + 1
                 source_metric["items_sent_to_llm"] = source_metric.get("items_sent_to_llm", 0) + int(decision["llm_used"])
+                if decision["llm_decision_reason"] == "classifier_cache_hit":
+                    source_metric["llm_cache_hits"] = source_metric.get("llm_cache_hits", 0) + 1
+                elif decision["llm_decision_reason"] == "classifier_budget_rejected":
+                    source_metric["llm_budget_rejections"] = source_metric.get("llm_budget_rejections", 0) + 1
+                elif decision["llm_decision_reason"] == "classifier_circuit_breaker_open":
+                    source_metric["llm_circuit_breaker_rejections"] = source_metric.get("llm_circuit_breaker_rejections", 0) + 1
+                elif str(decision["llm_decision_reason"]).startswith("classifier_failed"):
+                    source_metric["classifier_failures"] = source_metric.get("classifier_failures", 0) + 1
             if not classification.trade_eligible:
                 decision["rejection_reason"] = "classification_not_trade_eligible"
+                decision["funnel_stage"] = "classified_not_trade_eligible"
                 self._persist_news_audit("V2_NEWS_DECISION_AUDIT", decision)
                 continue
             self.news_metrics["trade_eligible_items"] += 1
+            decision["funnel_stage"] = "trade_eligible"
             if source_metric is not None:
                 source_metric["trade_eligible_items"] = source_metric.get("trade_eligible_items", 0) + 1
             for symbol in symbols:
@@ -340,6 +411,13 @@ class V2Runtime:
             decision["final_decision"] = (
                 "CANDIDATE_CREATED" if decision["candidate_ids"] else "NO_CANDIDATE"
             )
+            if decision["candidate_ids"]:
+                decision["funnel_stage"] = (
+                    "admitted" if any(
+                        value == "READY"
+                        for value in decision["market_confirmation_result"].values()
+                    ) else "candidate"
+                )
             if not decision["candidate_ids"] and not decision["rejection_reason"]:
                 decision["rejection_reason"] = "no_accepted_symbol_with_fresh_market_confirmation"
             self._persist_news_audit("V2_NEWS_DECISION_AUDIT", decision)
@@ -440,6 +518,7 @@ class V2Runtime:
 
     def _admit(self, candidate: V2SignalCandidate) -> V2SignalCandidate:
         candidate.run_id = self.run_id
+        self._record_signal_metric("raw_candidates", candidate)
         notional = self.settings.v2_target_notional_for_symbol(candidate.symbol.value)
         portfolio_reasons = self.portfolio.block_reasons(candidate.symbol, notional)
         status = self.universe.get(candidate.symbol)
@@ -465,9 +544,27 @@ class V2Runtime:
                 portfolio_exposure_penalty=exposure * Decimal("0.15"),
             ),
         )
+        if candidate.distance_to_threshold >= 0:
+            self._record_signal_metric("threshold_passes", candidate)
+        if portfolio_reasons:
+            self._record_signal_metric("portfolio_rejections", candidate)
+        signature = _candidate_signature(candidate)
+        prior = self._candidate_signatures.get(signature)
+        deduplication_window = max(
+            timedelta(seconds=5), candidate.expires_at - candidate.created_at
+        )
+        if prior is not None and candidate.created_at - prior < deduplication_window:
+            candidate.admitted = False
+            candidate.state = "DEDUPLICATED"
+            candidate.rejection_reason = "duplicate unchanged candidate"
+            self._record_signal_metric("deduplicated_candidates", candidate)
+            return candidate
+        self._candidate_signatures[signature] = candidate.created_at
         candidate.candidate_persisted_at = datetime.now(timezone.utc)
         self.repository.save_v2_signal_candidate(candidate)
         self.candidates.append(candidate)
+        if candidate.admitted:
+            self._record_signal_metric("pre_execution_admissions", candidate)
         if candidate.feature_snapshot.stale_evidence and not candidate.admitted:
             self.stale_metrics["stale_feature_rejections"] += 1
             self._increment(
@@ -540,6 +637,62 @@ class V2Runtime:
                     result, stage="demo_execution", cycle_id=cycle_id,
                     symbol=candidate.symbol, strategy=candidate.strategy_name.value,
                 )
+            elif isinstance(result, dict) and result.get("handled_policy_rejection"):
+                self._record_execution_policy_rejection(candidate, result)
+            elif isinstance(result, dict) and result.get("execution_id"):
+                self._record_signal_metric("admitted_signals", candidate)
+
+    def _record_execution_policy_rejection(
+        self,
+        candidate: V2SignalCandidate,
+        result: dict[str, Any],
+    ) -> None:
+        rejected_at = _aware_utc_datetime(result.get("rejected_at"))
+        self._record_signal_metric("execution_policy_rejections", candidate)
+        if result.get("rejection_code") in {
+            "SYMBOL_COOLDOWN_ACTIVE", "GLOBAL_ENTRY_COOLDOWN_ACTIVE",
+        }:
+            self._record_signal_metric("cooldown_rejections", candidate)
+        incident = V2Incident(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"bybot-v2-policy-rejection:{self.run_id}:{candidate.id}",
+            ),
+            run_id=self.run_id,
+            event_type="EXECUTION_REJECTED",
+            symbol=candidate.symbol,
+            candidate_id=candidate.id,
+            payload={
+                "candidate_id": str(candidate.id),
+                "reservation_id": result.get("reservation_id"),
+                "execution_id": None,
+                "symbol": candidate.symbol.value,
+                "strategy": candidate.strategy_name.value,
+                "rejection_code": result.get("rejection_code"),
+                "rejection_message": result.get("rejection_message"),
+                "risk_control": result.get("risk_control"),
+                "processing_stage": "demo_execution",
+                "rejected_at": rejected_at.isoformat(),
+                "exchange_mutation_performed": False,
+            },
+            occurred_at=rejected_at,
+        )
+        self.repository.save_v2_incident(incident)
+        self.logger.info(
+            "V2 execution policy rejected candidate: %s",
+            result.get("rejection_message"),
+            extra={
+                "event_timestamp": rejected_at,
+                "run_id": self.run_id,
+                "candidate_id": str(candidate.id),
+                "strategy": candidate.strategy_name.value,
+                "symbol": candidate.symbol.value,
+                "event_type": "EXECUTION_REJECTED",
+                "execution_environment": "BYBIT_DEMO",
+                "error_category": result.get("rejection_code"),
+                "processing_stage": "demo_execution",
+            },
+        )
 
     def _liquidation_not_applicable_reason(
         self, feature: Any,
@@ -550,12 +703,9 @@ class V2Runtime:
             return "liquidation_feed_never_initialized"
         if not feature.liquidation_feed_available:
             return "liquidation_feed_unavailable"
-        if (
-            feature.liquidation_data_age_seconds is None
-            or feature.liquidation_data_age_seconds
-            > self.settings.v2_liquidation_stale_seconds
-        ):
-            return "liquidation_feed_stale"
+        # Liquidation events are sparse by nature. Once the transport and
+        # subscription are healthy, no recent event means zero intensity, not
+        # stale transport. Connection/heartbeat health owns staleness.
         return None
 
     def _update_liquidation_symbol_status(self, feature: Any) -> None:
@@ -569,6 +719,12 @@ class V2Runtime:
             "observed_age_seconds": feature.liquidation_data_age_seconds,
             "state": "ELIGIBLE" if reason is None else "INELIGIBLE",
             "not_applicable_reason": reason,
+            "connection_state": feature.liquidation_connection_state,
+            "subscription_state": feature.liquidation_subscription_state,
+            "rolling_event_count": feature.liquidation_event_count_5m,
+            "rolling_liquidation_notional": str(
+                feature.liquidation_notional_5m
+            ),
         }
 
     def _liquidation_metrics_at(self, generated_at: datetime) -> dict[str, Any]:
@@ -607,6 +763,7 @@ class V2Runtime:
         metrics["ineligible_symbol_count"] = sum(
             row.get("state") != "ELIGIBLE" for row in by_symbol.values()
         )
+        metrics["age_calculated_at"] = generated_at.isoformat()
         # Remove the old cycle-local scalar that caused cross-symbol ambiguity.
         metrics.pop("current_liquidation_data_age_seconds", None)
         metrics.pop("last_valid_liquidation_timestamp", None)
@@ -663,6 +820,7 @@ class V2Runtime:
             "V2 isolated failure: %s", message,
             exc_info=(type(exc), exc, exc.__traceback__),
             extra={
+                "event_timestamp": now,
                 "run_id": self.run_id, "strategy": strategy,
                 "symbol": symbol.value if symbol else None,
                 "event_type": "V2_CYCLE_FAILURE",
@@ -697,6 +855,31 @@ class V2Runtime:
             fallback_reason=classification.fallback_reason,
             classified_at=classification.classified_at,
         )
+        with self._status_lock:
+            self._status_snapshot["last_news_model_usage"] = (
+                self.last_news_model_usage.model_dump(mode="json")
+            )
+            self._status_snapshot["last_news_model_used"] = (
+                self.last_news_model_usage.model
+            )
+            self._status_snapshot["last_news_fallback_used"] = (
+                self.last_news_model_usage.fallback_used
+            )
+
+    def _record_news_funnel_reason(self, source: str, reason: str) -> None:
+        reasons = self.news_metrics.setdefault("news_funnel_reasons", {})
+        reasons[reason] = int(reasons.get(reason) or 0) + 1
+        source_metric = self.news_aggregator.source_metrics.get(source)
+        if source_metric is None:
+            return
+        key = {
+            "missing_keywords": "skipped_missing_keywords",
+            "low_importance": "skipped_low_importance",
+            "classifier_budget_rejected": "llm_budget_rejections",
+            "classifier_circuit_breaker_open": "llm_circuit_breaker_rejections",
+        }.get(reason)
+        if key:
+            source_metric[key] = int(source_metric.get(key) or 0) + 1
 
     def _runtime_metrics_payload(self) -> dict[str, Any]:
         return {
@@ -707,6 +890,7 @@ class V2Runtime:
             "symbol_cycle_metrics": self.symbol_cycle_metrics,
             "strategy_evaluation_counts": self.strategy_evaluation_counts,
             "strategy_not_applicable_counts": self.strategy_not_applicable_counts,
+            "signal_metrics": self._signal_metrics_snapshot(),
             "failure_occurrences": self.failure_occurrences,
             "news_metrics": self.news_metrics,
             "news_source_metrics": self.news_aggregator.source_metrics,
@@ -771,7 +955,21 @@ class V2Runtime:
                     },
                 ))
             self.execution.demo_execution.monitor_strategy_position(
-                str(record.id), feature.last_price, data_fresh=feature.fresh,
+                str(record.id),
+                feature.last_price,
+                data_fresh=feature.fresh,
+                stale_feature="; ".join(feature.stale_reasons) or None,
+                stale_age_seconds=max(
+                    (
+                        float(item["observed_age_seconds"])
+                        for item in feature.stale_evidence
+                        if item.get("observed_age_seconds") is not None
+                    ),
+                    default=None,
+                ),
+                stale_exit_threshold_seconds=float(
+                    self.settings.v2_position_data_stale_exit_seconds
+                ),
             )
 
     def _sync_reservations(self) -> None:
@@ -786,9 +984,12 @@ class V2Runtime:
                 continue
             record = records.get(str(reservation.execution_id))
             if record and record.state.value in terminal:
-                self.portfolio.release(reservation.id, closed_at=record.updated_at)
+                self.portfolio.release(
+                    reservation.id,
+                    closed_at=record.closed_at or record.updated_at,
+                )
 
-    def status(self) -> dict[str, Any]:
+    def _build_status_snapshot(self) -> dict[str, Any]:
         preflight = self.execution.safety_preflight(require_auto_execution=False)
         active_reservations = [row for row in self.portfolio.reservations if row.state in self.portfolio.ACTIVE]
         accepted = [item.value for item in self.universe.accepted_symbols]
@@ -838,7 +1039,8 @@ class V2Runtime:
                 self.last_news_model_usage.fallback_used
                 if self.last_news_model_usage else None
             ),
-            "signal_count": len(self.candidates),
+            "signal_count": int(self.signal_metrics.get("admitted_signals") or 0),
+            "signal_metrics": self._signal_metrics_snapshot(),
             "open_reservations": len(active_reservations),
             "max_concurrent_positions": self.settings.max_concurrent_positions,
             "kill_switch_active": self.portfolio.kill_switch_active or self.execution.demo_execution.kill_switch_active,
@@ -871,11 +1073,79 @@ class V2Runtime:
                 self.external_trends.health.value if self.external_trends else "DISABLED"
             ),
             "persistence_status": "OK" if self.repository.available else "UNAVAILABLE",
+            "status_snapshot_state": "READY",
+            "status_snapshot_at": datetime.now(timezone.utc).isoformat(),
+            "status_request_metrics": {
+                "count": self.status_request_count,
+                "failures": self.status_request_failures,
+                "last_latency_ms": self.status_request_latency_ms,
+            },
         }
+
+    def _refresh_status_snapshot(self) -> None:
+        try:
+            snapshot = self._build_status_snapshot()
+        except Exception as exc:
+            with self._status_lock:
+                snapshot = copy.deepcopy(self._status_snapshot)
+                snapshot["status_snapshot_state"] = "STALE"
+                snapshot["status_snapshot_error"] = type(exc).__name__
+                snapshot["status_snapshot_at"] = datetime.now(timezone.utc).isoformat()
+        with self._status_lock:
+            self._status_snapshot = snapshot
+
+    def status(self) -> dict[str, Any]:
+        """Return one cached immutable-by-convention snapshot; never do I/O."""
+        with self._status_lock:
+            return copy.deepcopy(self._status_snapshot)
+
+    def record_status_request(self, *, latency_ms: float, succeeded: bool) -> None:
+        with self._status_lock:
+            self.status_request_count += 1
+            self.status_request_latency_ms = max(0.0, latency_ms)
+            if not succeeded:
+                self.status_request_failures += 1
 
     def _data_age_metrics(self) -> dict[str, Any]:
         loader = getattr(self.features, "data_age_metrics", None)
         return loader() if callable(loader) else {}
+
+    def _record_signal_metric(
+        self, name: str, candidate: V2SignalCandidate,
+    ) -> None:
+        self.signal_metrics[name] = int(self.signal_metrics.get(name) or 0) + 1
+        for dimension, key in (
+            ("by_strategy", candidate.strategy_name.value),
+            ("by_symbol", candidate.symbol.value),
+        ):
+            rows = self.signal_metrics.setdefault(dimension, {})
+            metrics = rows.setdefault(key, {})
+            metrics[name] = int(metrics.get(name) or 0) + 1
+
+    def _signal_metrics_snapshot(self) -> dict[str, Any]:
+        metrics = copy.deepcopy(self.signal_metrics)
+        executions = [
+            item for item in self.repository.load_demo_executions()
+            if item.run_id == self.run_id
+        ]
+        metrics["strategy_evaluations"] = sum(
+            int(value) for value in self.strategy_evaluation_counts.values()
+        )
+        metrics["orders_submitted"] = sum(bool(item.order_id) for item in executions)
+        metrics["orders_filled"] = sum(item.accepted_quantity > 0 for item in executions)
+        metrics["risk_rejections"] = max(
+            int(metrics.get("risk_rejections") or 0),
+            sum(item.state == "EXECUTION_BLOCKED" for item in self.candidates),
+        )
+        metrics["completed_trades"] = sum(
+            item.state.value in {
+                "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE",
+                "DEMO_CLOSED_AFTER_INTERRUPTION", "DEMO_CLOSED_EXTERNALLY",
+                "DEMO_FAILED_FLAT_VERIFIED",
+            }
+            for item in executions
+        )
+        return metrics
 
     def finish(self) -> dict[str, Any]:
         self.stop_new_entries = True
@@ -892,6 +1162,69 @@ async def v2_cycle_loop(runtime: V2Runtime, interval_seconds: int = 5) -> None:
         runtime.refresh_universe_if_due()
         await runtime.cycle()
         await asyncio.sleep(interval_seconds)
+
+
+def _aware_utc_datetime(value: datetime | str | None) -> datetime:
+    if isinstance(value, datetime):
+        stamp = value
+    elif value:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    else:
+        stamp = datetime.now(timezone.utc)
+    if stamp.tzinfo is None or stamp.utcoffset() is None:
+        raise ValueError("event timestamp must be timezone-aware")
+    return stamp.astimezone(timezone.utc)
+
+
+def _candidate_signature(candidate: V2SignalCandidate) -> str:
+    components = candidate.score_components
+    material = "|".join((
+        candidate.strategy_name.value,
+        candidate.symbol.value,
+        candidate.side.value,
+        str(candidate.raw_strategy_score),
+        str(components.final_score if components else ""),
+        str(candidate.threshold),
+        str(candidate.estimated_edge_bps),
+        str(candidate.rejection_reason or ""),
+    ))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _news_skip_reason(
+    *, accepted: bool, filter_reason: str,
+    classification: Any | None,
+    before: dict[str, Any], after: dict[str, Any],
+) -> str:
+    if not accepted:
+        return filter_reason
+    if classification is None:
+        return "codex_importance_below_minimum"
+    return _news_classification_reason(classification, False, before, after)
+
+
+def _news_classification_reason(
+    classification: Any,
+    llm_used: bool,
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> str:
+    error_code = str(getattr(classification, "error_code", None) or "")
+    if error_code in {
+        "HOURLY_REQUEST_BUDGET", "DAILY_REQUEST_BUDGET", "DAILY_TOKEN_BUDGET",
+    }:
+        return "classifier_budget_rejected"
+    if error_code == "CIRCUIT_OPEN":
+        return "classifier_circuit_breaker_open"
+    if error_code:
+        return f"classifier_failed:{error_code.lower()}"
+    if bool(getattr(classification, "cache_hit", False)) or int(
+        after.get("llm_cache_hits") or 0
+    ) > int(before.get("llm_cache_hits") or 0):
+        return "classifier_cache_hit"
+    if str(getattr(classification, "provider_name", "")) == "deterministic-v2":
+        return "deterministic_high_confidence"
+    return "llm_requested" if llm_used else "classifier_completed_without_provider_call"
 
 
 def _sanitize_runtime_error(message: str) -> str:

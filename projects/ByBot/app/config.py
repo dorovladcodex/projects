@@ -130,6 +130,7 @@ class Settings(BaseSettings):
     )
     v2_universe_refresh_seconds: int = Field(default=300, ge=30, le=3600)
     v2_market_stale_seconds: int = Field(default=15, ge=2, le=300)
+    v2_position_data_stale_exit_seconds: int = Field(default=120, ge=15, le=3600)
     v2_min_turnover_24h_usdt: Decimal = Field(default=Decimal("1000000"), ge=0)
     v2_max_spread_bps: Decimal = Field(default=Decimal("15"), gt=0)
     v2_min_orderbook_depth_usdt: Decimal = Field(default=Decimal("10000"), ge=0)

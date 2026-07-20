@@ -64,18 +64,59 @@ class PortfolioRiskService:
         if not state:
             return
         self.reservations = [PortfolioReservation.model_validate(item) for item in state.get("reservations", [])]
+        executions = (
+            self.repository.load_demo_executions()
+            if callable(getattr(self.repository, "load_demo_executions", None))
+            else []
+        )
+        executions_by_candidate = {
+            str(item.candidate_id): item for item in executions
+        }
+        # A Demo order cannot exist without a durable DemoExecution reservation.
+        # Therefore a restored V2 reservation with neither execution_id nor a
+        # matching DemoExecution is a safe pre-submit orphan and must not block
+        # the symbol after restart.
+        recovered_reservation = False
+        for reservation in self.reservations:
+            if reservation.state not in self.ACTIVE or reservation.execution_id:
+                continue
+            execution = executions_by_candidate.get(str(reservation.candidate_id))
+            if execution is not None:
+                reservation.execution_id = execution.id
+                if execution.state.value in {
+                    "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE",
+                    "DEMO_CLOSED_AFTER_INTERRUPTION", "DEMO_CLOSED_EXTERNALLY",
+                    "DEMO_FAILED_FLAT_VERIFIED", "DEMO_NOT_SUBMITTED",
+                    "DEMO_ORDER_CANCELLED",
+                }:
+                    reservation.state = ReservationState.RELEASED
+                    reservation.released_at = execution.closed_at or execution.updated_at
+                else:
+                    reservation.state = ReservationState.OPEN
+            else:
+                reservation.state = ReservationState.RELEASED
+                reservation.released_at = datetime.now(timezone.utc)
+            recovered_reservation = True
+            updater = getattr(self.repository, "update_v2_portfolio_reservation", None)
+            if callable(updater):
+                updater(reservation)
         now = datetime.now(timezone.utc)
         self.symbol_cooldown_until = {
             Symbol(key): datetime.fromisoformat(value)
             for key, value in (state.get("symbol_cooldowns") or {}).items()
             if datetime.fromisoformat(value) > now
         }
-        self.last_entry_at = datetime.fromisoformat(state["last_entry_at"]) if state.get("last_entry_at") else None
+        actual_entries = [
+            item.created_at for item in self.reservations if item.execution_id is not None
+        ]
+        self.last_entry_at = max(actual_entries) if actual_entries else None
         self.kill_switch_active = bool(state.get("kill_switch_active"))
         self.kill_switch_reasons = list(state.get("kill_switch_reasons") or [])
         self.daily_pnl = Decimal(str(state.get("daily_pnl", "0")))
         self.weekly_pnl = Decimal(str(state.get("weekly_pnl", "0")))
         self.current_drawdown_pct = Decimal(str(state.get("current_drawdown_pct", "0")))
+        if recovered_reservation:
+            self._persist_state()
 
     @contextmanager
     def symbol_lock(self, symbol: Symbol) -> Iterator[None]:
@@ -110,10 +151,18 @@ class PortfolioRiskService:
             reasons.append("symbol cooldown is active")
         if self.last_entry_at and current - self.last_entry_at < timedelta(seconds=self.settings.v2_global_entry_cooldown_seconds):
             reasons.append("global entry cooldown is active")
-        recent = [item for item in self.reservations if current - item.created_at <= timedelta(minutes=5)]
+        recent = [
+            item for item in self.reservations
+            if (item.state in self.ACTIVE or item.execution_id is not None)
+            and current - item.created_at <= timedelta(minutes=5)
+        ]
         if len(recent) >= self.settings.max_new_entries_per_5_minutes:
             reasons.append("five-minute entry rate limit reached")
-        today = [item for item in self.reservations if item.created_at.date() == current.date()]
+        today = [
+            item for item in self.reservations
+            if (item.state in self.ACTIVE or item.execution_id is not None)
+            and item.created_at.date() == current.date()
+        ]
         if len(today) >= self.settings.max_trades_per_day:
             reasons.append("daily trade cap reached")
         return reasons
@@ -142,17 +191,39 @@ class PortfolioRiskService:
             return reservation
 
     def mark_open(self, reservation_id: Any, execution_id: Any) -> None:
-        self._transition(reservation_id, ReservationState.OPEN, execution_id=execution_id)
+        item = self._transition(
+            reservation_id, ReservationState.OPEN, execution_id=execution_id
+        )
+        if item is not None:
+            self.last_entry_at = datetime.now(timezone.utc)
+            self._persist_state()
 
-    def release(self, reservation_id: Any, *, closed_at: datetime | None = None) -> None:
+    def release(
+        self,
+        reservation_id: Any,
+        *,
+        closed_at: datetime | None = None,
+        activate_cooldown: bool = True,
+    ) -> None:
         current = closed_at or datetime.now(timezone.utc)
         item = self._transition(reservation_id, ReservationState.RELEASED)
         if item:
             item.released_at = current
-            self.symbol_cooldown_until[item.symbol] = current + timedelta(seconds=self.settings.v2_symbol_cooldown_seconds)
+            if activate_cooldown and item.execution_id is not None:
+                self.symbol_cooldown_until[item.symbol] = current + timedelta(
+                    seconds=self.settings.v2_symbol_cooldown_seconds
+                )
             updater = getattr(self.repository, "update_v2_portfolio_reservation", None)
             if callable(updater):
                 updater(item)
+            if not activate_cooldown and item.execution_id is None:
+                remaining_entries = [
+                    row.created_at for row in self.reservations
+                    if row.state in self.ACTIVE or row.execution_id is not None
+                ]
+                self.last_entry_at = (
+                    max(remaining_entries) if remaining_entries else None
+                )
             self._persist_state()
 
     def apply_realized_pnl(self, pnl: Decimal, peak_equity: Decimal, equity: Decimal) -> None:

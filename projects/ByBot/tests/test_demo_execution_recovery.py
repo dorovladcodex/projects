@@ -6,8 +6,16 @@ from app.bybit.demo_diagnostics import DemoDiagnosticsConfig
 from app.bybit.demo_execution_recovery import (
     apply_demo_execution_repair,
     diagnose_demo_execution,
+    exact_close_reconciliation_blockers,
 )
-from app.models import DemoExecutionRecord, DemoExecutionState, DemoFill, Side, Symbol
+from app.models import (
+    DemoExecutionRecord,
+    DemoExecutionState,
+    DemoFill,
+    ExecutionEnvironment,
+    Side,
+    Symbol,
+)
 from tests.test_bybit_demo_execution import candidate_bundle
 
 
@@ -40,6 +48,7 @@ class ReadClient:
 
     def get_order_history(self, symbol):
         rows = [{
+            "symbol": symbol.value,
             "orderId": "entry", "orderLinkId": "entry-link",
             "orderStatus": "Filled", "side": "Buy", "qty": "0.001",
             "cumExecQty": "0.001", "avgPrice": "100", "reduceOnly": False,
@@ -47,6 +56,7 @@ class ReadClient:
         }]
         if self.close:
             rows.append({
+                "symbol": symbol.value,
                 "orderId": "external-close", "orderLinkId": "",
                 "orderStatus": "Filled", "side": "Sell", "qty": "0.001",
                 "cumExecQty": "0.001", "avgPrice": "110",
@@ -57,6 +67,7 @@ class ReadClient:
 
     def get_executions(self, symbol):
         rows = [{
+            "symbol": symbol.value,
             "execId": "entry-fill", "orderId": "entry",
             "orderLinkId": "entry-link", "side": "Buy",
             "execQty": "0.001", "execPrice": "100", "execFee": "0.01",
@@ -64,6 +75,7 @@ class ReadClient:
         }]
         if self.close:
             rows.append({
+                "symbol": symbol.value,
                 "execId": "close-fill", "orderId": "external-close",
                 "orderLinkId": "", "side": "Sell", "execQty": "0.001",
                 "execPrice": "110", "execFee": "0.02", "execTime": "2000",
@@ -172,6 +184,7 @@ def test_historical_close_before_entry_is_rejected_and_real_close_is_used() -> N
         def get_order_history(self, symbol):
             rows = super().get_order_history(symbol)
             rows.append({
+                "symbol": symbol.value,
                 "orderId": "historical-close", "orderLinkId": "",
                 "orderStatus": "Filled", "side": "Sell", "qty": "0.001",
                 "cumExecQty": "0.001", "avgPrice": "90", "reduceOnly": True,
@@ -182,6 +195,7 @@ def test_historical_close_before_entry_is_rejected_and_real_close_is_used() -> N
         def get_executions(self, symbol):
             rows = super().get_executions(symbol)
             rows.append({
+                "symbol": symbol.value,
                 "execId": "historical-exec", "orderId": "historical-close",
                 "side": "Sell", "execQty": "0.001", "execPrice": "90",
                 "execFee": "0.01", "execTime": "500",
@@ -195,3 +209,90 @@ def test_historical_close_before_entry_is_rejected_and_real_close_is_used() -> N
     assert diagnosis.rejected_close_execution_ids == ["historical-exec"]
     assert diagnosis.close_executions[0]["execId"] == "close-fill"
     assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+
+
+def test_exact_persisted_close_reconciles_to_demo_closed() -> None:
+    item = record().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSING,
+        "close_order_id": "external-close",
+        "close_reason": "exchange_generated_sl",
+    })
+    repo = Repo(item)
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=repo, client=ReadClient()
+    )
+
+    assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED
+    assert exact_close_reconciliation_blockers(diagnosis) == []
+    assert apply_demo_execution_repair(diagnosis, repo)
+    repaired, events, _ = repo.repaired
+    assert repaired.state == DemoExecutionState.DEMO_CLOSED
+    assert repaired.failure_reason is None
+    assert repaired.close_reason == "exchange_generated_sl"
+    assert repaired.closed_at == datetime.fromtimestamp(2, tz=timezone.utc)
+    assert events == [
+        "READ_ONLY_RECONCILIATION_COMPLETED",
+        "EXACT_CLOSE_ATTRIBUTED",
+        "FINAL_REMOTE_STATE_FLAT",
+    ]
+
+
+def test_exact_close_reconciliation_blocks_non_demo_execution() -> None:
+    item = record().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSING,
+        "close_order_id": "external-close",
+        "close_reason": "exchange_generated_sl",
+        "execution_environment": ExecutionEnvironment.PAPER,
+    })
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=Repo(item), client=ReadClient()
+    )
+    assert "execution does not belong to BYBIT_DEMO" in (
+        exact_close_reconciliation_blockers(diagnosis)
+    )
+
+
+def test_exact_close_reconciliation_blocks_owned_open_order() -> None:
+    item = record().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSING,
+        "close_order_id": "external-close",
+        "close_reason": "exchange_generated_sl",
+    })
+    open_close = {
+        "symbol": "BTCUSDT", "orderId": "external-close",
+        "orderLinkId": "", "side": "Sell", "qty": "0.001",
+    }
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=Repo(item),
+        client=ReadClient(orders=[open_close]),
+    )
+    assert "bot-owned open order remains for execution" in (
+        exact_close_reconciliation_blockers(diagnosis)
+    )
+
+
+def test_exact_close_reconciliation_blocks_global_fill_identity_conflict() -> None:
+    item = record().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSING,
+        "close_order_id": "external-close",
+        "close_reason": "exchange_generated_sl",
+        "close_fills": [DemoFill(
+            execution_id="close-fill", order_id="external-close",
+            quantity=Decimal("0.001"), price=Decimal("110"),
+            executed_at=datetime.fromtimestamp(2, tz=timezone.utc),
+        )],
+    })
+    other = record().model_copy(update={
+        "close_order_id": "external-close",
+        "close_fills": [DemoFill(
+            execution_id="close-fill", order_id="external-close",
+            quantity=Decimal("0.001"), price=Decimal("110"),
+            executed_at=datetime.fromtimestamp(2, tz=timezone.utc),
+        )],
+    })
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=Repo(item, [other]), client=ReadClient()
+    )
+    blockers = exact_close_reconciliation_blockers(diagnosis)
+    assert "exchange order ID is assigned to another Demo execution" in blockers
+    assert "exchange execution ID is assigned to another Demo execution" in blockers

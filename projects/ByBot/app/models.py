@@ -188,6 +188,11 @@ class DemoExecutionRecord(BaseModel):
     trailing_stop_pct: Decimal | None = Field(default=None, gt=0)
     break_even_at_r: Decimal | None = Field(default=None, gt=0)
     maximum_holding_seconds: int | None = Field(default=None, gt=0)
+    position_data_stale_since: datetime | None = None
+    position_data_stale_feature: str | None = None
+    position_data_stale_age_seconds: float | None = Field(default=None, ge=0)
+    position_data_stale_threshold_seconds: float | None = Field(default=None, gt=0)
+    position_data_stale_protection_confirmed: bool | None = None
     tp_identifier: str | None = None
     sl_identifier: str | None = None
     protection_confirmed: bool = False

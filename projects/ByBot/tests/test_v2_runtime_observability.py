@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -284,6 +285,130 @@ def test_repeated_failures_are_fingerprinted_and_counted(tmp_path) -> None:
 
     assert len(repo.incidents) == 1
     assert next(iter(repo.incidents.values())).payload["occurrence_count"] == 2
+
+
+def test_handled_cooldown_rejection_is_not_cycle_failure_and_preserves_context(
+    tmp_path,
+) -> None:
+    app, repo, _ = runtime(tmp_path, (Symbol.LTCUSDT, Symbol.ETHUSDT))
+    strategy = next(
+        item for item in app.strategies
+        if item.name == StrategyName.VOLUME_BREAKOUT
+    )
+    ltc = strategy.evaluate(feature(Symbol.LTCUSDT))
+    eth = strategy.evaluate(feature(Symbol.ETHUSDT))
+    reservation_id = "ecc04eed-dc2e-42a5-8086-30f3f74d57b5"
+
+    async def collect() -> None:
+        loop = asyncio.get_running_loop()
+        rejected = loop.create_future()
+        rejected.set_result({
+            "handled_policy_rejection": True,
+            "candidate_id": str(ltc.id),
+            "reservation_id": reservation_id,
+            "execution_id": None,
+            "rejection_code": "SYMBOL_COOLDOWN_ACTIVE",
+            "rejection_message": "symbol cooldown is active",
+            "risk_control": "symbol_cooldown",
+            "rejected_at": "2026-07-20T09:15:25.383788+00:00",
+            "exchange_mutation_performed": False,
+        })
+        succeeded = loop.create_future()
+        succeeded.set_result({"execution_id": "execution-for-other-symbol"})
+        await app._collect_dispatches(
+            [(ltc, rejected), (eth, succeeded)], "runtime-test:1"
+        )
+
+    asyncio.run(collect())
+
+    incidents = list(repo.incidents.values())
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident.event_type == "EXECUTION_REJECTED"
+    assert str(incident.candidate_id) == str(ltc.id)
+    assert incident.payload["reservation_id"] == reservation_id
+    assert incident.payload["execution_id"] is None
+    assert incident.payload["exchange_mutation_performed"] is False
+    assert app.failure_occurrences == {}
+    assert app.signal_metrics["execution_policy_rejections"] == 1
+    assert app.signal_metrics["cooldown_rejections"] == 1
+    assert app.signal_metrics["admitted_signals"] == 1
+    for handler in app.logger.handlers:
+        handler.flush()
+    event = next(
+        json.loads(line)
+        for line in Path(
+            app.settings.v2_report_directory,
+            app.run_id,
+            "events.jsonl",
+        ).read_text(encoding="utf-8").splitlines()
+        if '"event_type": "EXECUTION_REJECTED"' in line
+    )
+    report = app.reporter.generate(app.run_id)
+    reported_incident = json.loads(
+        Path(report["artifact_directory"], "incidents.json").read_text(
+            encoding="utf-8"
+        )
+    )[0]
+    assert event["timestamp"] == reported_incident["occurred_at"]
+
+
+def test_signal_metrics_distinguish_pre_execution_and_policy_rejection(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["LTCUSDT"],
+        "symbol_cycle_metrics": {
+            "LTCUSDT": {
+                "cycles_attempted": 1, "cycles_succeeded": 1,
+                "cycles_failed": 0,
+            }
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 1},
+        "signal_metrics": {
+            "raw_candidates": 1, "threshold_passes": 1,
+            "pre_execution_admissions": 1,
+            "execution_policy_rejections": 1,
+            "cooldown_rejections": 1,
+            "admitted_signals": 0,
+        },
+    }
+    incident = {
+        "id": "handled", "run_id": "r", "event_type": "EXECUTION_REJECTED",
+        "payload": {
+            "candidate_id": "candidate", "reservation_id": "reservation",
+            "processing_stage": "demo_execution",
+            "rejection_code": "SYMBOL_COOLDOWN_ACTIVE",
+        },
+    }
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, [incident]), str(tmp_path)
+    ).generate("r")
+    assert report["functional_result"] == "PASS"
+    assert report["total_cycle_failures"] == 0
+    assert report["pre_execution_admissions"] == 1
+    assert report["execution_policy_rejections"] == 1
+    assert report["cooldown_rejections"] == 1
+    assert report["admitted_signals"] == 0
+
+
+def test_unexpected_execution_exception_remains_cycle_failure(tmp_path) -> None:
+    app, repo, _ = runtime(tmp_path, (Symbol.LTCUSDT,))
+    strategy = next(
+        item for item in app.strategies
+        if item.name == StrategyName.VOLUME_BREAKOUT
+    )
+    candidate = strategy.evaluate(feature(Symbol.LTCUSDT))
+
+    async def collect() -> None:
+        future = asyncio.get_running_loop().create_future()
+        future.set_exception(RuntimeError("unexpected execution defect"))
+        await app._collect_dispatches([(candidate, future)], "runtime-test:1")
+
+    asyncio.run(collect())
+
+    incident = next(iter(repo.incidents.values()))
+    assert incident.event_type == "V2_CYCLE_FAILURE"
+    assert incident.payload["message"] == "unexpected execution defect"
 
 
 def test_meme_strategy_scope_is_configuration_driven(tmp_path) -> None:

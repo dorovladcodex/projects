@@ -17,7 +17,7 @@ from app.v2.analytics import V2ReportGenerator
 from app.v2.execution import V2ExecutionCoordinator
 from app.v2.market import BybitRestMetricsPoller, RollingFeatureEngine
 from app.v2.models import (
-    MarketFeatureSnapshot, SourceHealth, StrategyName, StrategySide,
+    MarketFeatureSnapshot, ReservationState, SourceHealth, StrategyName, StrategySide,
     UniverseInstrument, UniverseStatus, UniverseState,
 )
 from app.v2.news import EntityMapper, V2NewsAggregator, semantic_fingerprint
@@ -239,7 +239,7 @@ def test_rest_metric_source_failure_is_isolated_per_symbol() -> None:
     assert poller.failures[Symbol.ETHUSDT] == "TimeoutError"
 
 
-def test_sqlite_persistence_reservation_survives_service_restart() -> None:
+def test_sqlite_pre_submit_orphan_is_released_on_service_restart() -> None:
     repository = PersistenceRepository("sqlite+pysqlite:///:memory:")
     candidate = build_v2_strategies(settings())[1].evaluate(feature())
     candidate.run_id = "run"; repository.save_v2_signal_candidate(candidate)
@@ -248,7 +248,8 @@ def test_sqlite_persistence_reservation_survives_service_restart() -> None:
     assert reservation
     restarted = PortfolioRiskService(settings(), repository)
     assert len(restarted.reservations) == 1
-    assert restarted.reserve(run_id="run", candidate_id=uuid4(), symbol=Symbol.BTCUSDT, strategy_name=StrategyName.VOLUME_BREAKOUT, notional=Decimal("50"), risk_usdt=Decimal("1")) is None
+    assert restarted.reservations[0].state == ReservationState.RELEASED
+    assert restarted.reserve(run_id="run", candidate_id=uuid4(), symbol=Symbol.BTCUSDT, strategy_name=StrategyName.VOLUME_BREAKOUT, notional=Decimal("50"), risk_usdt=Decimal("1")) is not None
 
 
 class ReportRepo:

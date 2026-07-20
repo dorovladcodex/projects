@@ -12,7 +12,12 @@ from app.bybit.demo_diagnostics import (
     ReadOnlyBybitDemoClient,
 )
 from app.db.persistence import PersistenceRepository
-from app.models import DemoExecutionRecord, DemoExecutionState, DemoFill
+from app.models import (
+    DemoExecutionRecord,
+    DemoExecutionState,
+    DemoFill,
+    ExecutionEnvironment,
+)
 
 
 TERMINAL_ORDER_STATES = {"Filled", "Cancelled", "Rejected", "Deactivated"}
@@ -43,10 +48,59 @@ class DemoExecutionDiagnosis:
     repeated_remote_flat: bool
     rejected_close_order_ids: list[str]
     rejected_close_execution_ids: list[str]
+    conflicting_order_ids: list[str]
+    conflicting_execution_ids: list[str]
 
     @property
     def repairable(self) -> bool:
         return self.proposed_state is not None and not self.blockers
+
+
+def exact_close_reconciliation_blockers(
+    diagnosis: DemoExecutionDiagnosis,
+) -> list[str]:
+    """Return fail-closed blockers for the narrow CLOSING maintenance path."""
+    record = diagnosis.record
+    blockers = list(diagnosis.blockers)
+    entry_quantity = sum(
+        (_decimal(item.get("execQty")) for item in diagnosis.entry_executions),
+        Decimal("0"),
+    )
+    close_quantity = sum(
+        (_decimal(item.get("execQty")) for item in diagnosis.close_executions),
+        Decimal("0"),
+    )
+    active_symbol_position = any(
+        str(item.get("symbol") or "") == record.symbol.value
+        and _decimal(item.get("size")) > 0
+        for item in diagnosis.remote_positions
+    )
+    if record.execution_environment != ExecutionEnvironment.BYBIT_DEMO:
+        blockers.append("execution does not belong to BYBIT_DEMO")
+    if record.state not in {
+        DemoExecutionState.DEMO_CLOSING,
+        DemoExecutionState.DEMO_CLOSED,
+    }:
+        blockers.append("durable state is not DEMO_CLOSING")
+    if not record.order_id or not diagnosis.entry_order_history:
+        blockers.append("exact entry order is not attributed")
+    if not diagnosis.entry_executions:
+        blockers.append("exact entry fill is not attributed")
+    if entry_quantity <= 0 or entry_quantity != record.accepted_quantity:
+        blockers.append("entry filled quantity does not equal owned quantity")
+    if not record.close_order_id or not diagnosis.close_order_history:
+        blockers.append("exact close order is not attributed")
+    if not diagnosis.close_executions:
+        blockers.append("exact close fill is not attributed")
+    if close_quantity <= 0 or close_quantity != record.accepted_quantity:
+        blockers.append("attributed close quantity does not equal owned quantity")
+    if active_symbol_position:
+        blockers.append("remote position attributable to execution is not zero")
+    if diagnosis.bot_owned_open_orders:
+        blockers.append("bot-owned open order remains for execution")
+    if diagnosis.proposed_state != DemoExecutionState.DEMO_CLOSED:
+        blockers.append("exact close evidence does not propose DEMO_CLOSED")
+    return list(dict.fromkeys(blockers))
 
 
 def diagnose_demo_execution(
@@ -85,6 +139,8 @@ def diagnose_demo_execution(
     entry_history = [
         item for item in history
         if _matches(item, record.order_id, record.order_link_id)
+        and str(item.get("symbol") or "") == record.symbol.value
+        and str(item.get("side") or "").upper() == record.side.value
     ]
     raw_close_history = [
         item for item in history
@@ -93,6 +149,8 @@ def diagnose_demo_execution(
     entry_fills = [
         item for item in executions
         if _matches(item, record.order_id, record.order_link_id)
+        and str(item.get("symbol") or "") == record.symbol.value
+        and str(item.get("side") or "").upper() == record.side.value
     ]
     raw_close_fills = [
         item for item in executions
@@ -119,6 +177,19 @@ def diagnose_demo_execution(
         for other in all_records if str(other.id) != execution_id
         for fill in [*other.fills, *other.close_fills]
     }
+    selected_order_ids = {
+        value for value in (
+            record.order_id,
+            record.close_order_id,
+            *(fill.order_id for fill in [*record.fills, *record.close_fills]),
+        ) if value
+    }
+    selected_exec_ids = {
+        fill.execution_id for fill in [*record.fills, *record.close_fills]
+        if fill.execution_id
+    }
+    conflicting_order_ids = sorted(selected_order_ids & used_order_ids)
+    conflicting_execution_ids = sorted(selected_exec_ids & used_exec_ids)
     position_watermark = max(
         (int(str(item.get("updatedTime") or "0")) for item in positions),
         default=0,
@@ -127,7 +198,7 @@ def diagnose_demo_execution(
         item for item in raw_close_history
         if _valid_close_order(
             item, entry_time, entry_qty_for_match, used_order_ids,
-            position_watermark,
+            position_watermark, record.symbol.value, record.side.value,
         )
     ]
     allowed_close_order_ids = {
@@ -138,6 +209,7 @@ def diagnose_demo_execution(
         if _valid_close_execution(
             item, entry_time, entry_qty_for_match, used_exec_ids,
             allowed_close_order_ids, position_watermark,
+            record.symbol.value, record.side.value,
         )
     ]
     rejected_close_order_ids = [
@@ -199,9 +271,13 @@ def diagnose_demo_execution(
     known_links = {
         link for link in (record.order_link_id, record.close_order_link_id) if link
     }
+    known_order_ids = {
+        order_id for order_id in (record.order_id, record.close_order_id) if order_id
+    }
     bot_orders = [
         item for item in open_orders
         if str(item.get("orderLinkId") or "") in known_links
+        or str(item.get("orderId") or "") in known_order_ids
     ]
     unrelated = [item for item in open_orders if item not in bot_orders]
     active_positions = [item for item in positions if _decimal(item.get("size")) > 0]
@@ -222,6 +298,12 @@ def diagnose_demo_execution(
         blockers.append("entry order is absent from authoritative history")
     if record.close_order_id and not close_history and not close_fills:
         blockers.append("close order is absent from authoritative history")
+    if conflicting_order_ids:
+        blockers.append("exchange order ID is assigned to another Demo execution")
+    if conflicting_execution_ids:
+        blockers.append("exchange execution ID is assigned to another Demo execution")
+    if record.execution_environment != ExecutionEnvironment.BYBIT_DEMO:
+        blockers.append("execution does not belong to BYBIT_DEMO")
     for label, rows in (("entry", entry_history), ("close", close_history)):
         if any(str(item.get("orderStatus") or "") not in TERMINAL_ORDER_STATES for item in rows):
             blockers.append(f"{label} order is not terminal")
@@ -247,6 +329,15 @@ def diagnose_demo_execution(
         net = _decimal(matching_closed_pnl[0].get("closedPnl"))
 
     proposed: DemoExecutionState | None = None
+    persisted_exact_close = bool(
+        record.close_order_id
+        and close_history
+        and close_fills
+        and all(
+            str(item.get("orderId") or "") == record.close_order_id
+            for item in [*close_history, *close_fills]
+        )
+    )
     if not record.order_id and not entry_history and not entry_fills:
         conclusion = "submitted no exchange order"
         proposed = DemoExecutionState.DEMO_NOT_SUBMITTED
@@ -262,8 +353,11 @@ def diagnose_demo_execution(
     elif entry_qty >= record.requested_quantity and close_qty >= entry_qty and not active_positions:
         conclusion = "fully filled and later closed"
         proposed = (
-            DemoExecutionState.DEMO_CLOSED_EXTERNALLY
-            if close_source else DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION
+            DemoExecutionState.DEMO_CLOSED
+            if persisted_exact_close
+            else DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+            if close_source == "external_or_exchange_triggered_reduce_only"
+            else DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION
         )
     elif entry_qty >= record.requested_quantity:
         other_owners = [
@@ -314,6 +408,8 @@ def diagnose_demo_execution(
         repeated_remote_flat=repeated_remote_flat,
         rejected_close_order_ids=rejected_close_order_ids,
         rejected_close_execution_ids=rejected_close_execution_ids,
+        conflicting_order_ids=conflicting_order_ids,
+        conflicting_execution_ids=conflicting_execution_ids,
     )
 
 
@@ -331,6 +427,9 @@ def apply_demo_execution_repair(
     record = diagnosis.record.model_copy(deep=True)
     record.state = diagnosis.proposed_state
     record.failure_reason = (
+        diagnosis.record.failure_reason
+        if diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED
+        else
         "position closed outside the bot workflow"
         if diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY
         else "remote flat verified; closing execution attribution unavailable"
@@ -360,6 +459,10 @@ def apply_demo_execution_repair(
         record.realized_exchange_pnl = diagnosis.net_realized_pnl
         record.exchange_fees = diagnosis.entry_fees + diagnosis.close_fees
         record.average_close_price = _weighted_average(diagnosis.close_executions)
+        record.closed_at = max(
+            _exchange_timestamp(item.get("execTime"))
+            for item in diagnosis.close_executions
+        )
     elif diagnosis.proposed_state == DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED:
         record.close_order_id = None
         record.close_order_link_id = None
@@ -386,6 +489,8 @@ def apply_demo_execution_repair(
         "close_source": diagnosis.close_source,
         "rejected_close_order_ids": diagnosis.rejected_close_order_ids,
         "rejected_close_execution_ids": diagnosis.rejected_close_execution_ids,
+        "conflicting_order_ids": diagnosis.conflicting_order_ids,
+        "conflicting_execution_ids": diagnosis.conflicting_execution_ids,
     }
     event_types = []
     if diagnosis.rejected_close_order_ids or diagnosis.rejected_close_execution_ids:
@@ -396,6 +501,9 @@ def apply_demo_execution_repair(
         "EXECUTION_FINALIZED_FLAT_VERIFIED",
     ] if diagnosis.proposed_state == DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED else [
         "READ_ONLY_RECONCILIATION_COMPLETED",
+        "EXACT_CLOSE_ATTRIBUTED"
+        if diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED
+        else
         "EXTERNAL_CLOSE_ATTRIBUTED"
         if diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY
         else "EXECUTION_REPAIR_APPLIED",
@@ -415,7 +523,11 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
         "candidate_id": str(record.candidate_id),
         "risk_decision_id": record.risk_decision_id,
         "run_id": record.run_id,
+        "execution_environment": record.execution_environment.value,
+        "symbol": record.symbol.value,
+        "side": record.side.value,
         "order_link_id": record.order_link_id,
+        "close_order_link_id": record.close_order_link_id,
         "entry_order_id": record.order_id or (
             str(diagnosis.entry_order_history[0].get("orderId") or "")
             if diagnosis.entry_order_history else None
@@ -428,6 +540,10 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
         "durable_transitions": diagnosis.durable_events,
         "quantity_requested": str(record.requested_quantity),
         "quantity_executed": str(sum((_decimal(x.get("execQty")) for x in diagnosis.entry_executions), Decimal("0"))),
+        "entry_filled_quantity": str(sum((_decimal(x.get("execQty")) for x in diagnosis.entry_executions), Decimal("0"))),
+        "attributed_close_filled_quantity": str(sum((_decimal(x.get("execQty")) for x in diagnosis.close_executions), Decimal("0"))),
+        "entry_fill_ids": [str(item.get("execId") or "") for item in diagnosis.entry_executions],
+        "close_fill_ids": [str(item.get("execId") or "") for item in diagnosis.close_executions],
         "entry_average_price": str(_weighted_average(diagnosis.entry_executions)),
         "close_average_price": str(_weighted_average(diagnosis.close_executions)),
         "entry_fees": str(diagnosis.entry_fees),
@@ -436,6 +552,8 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
         "repeated_remote_flat": diagnosis.repeated_remote_flat,
         "rejected_close_order_ids": diagnosis.rejected_close_order_ids,
         "rejected_close_execution_ids": diagnosis.rejected_close_execution_ids,
+        "conflicting_order_ids": diagnosis.conflicting_order_ids,
+        "conflicting_execution_ids": diagnosis.conflicting_execution_ids,
         "gross_realized_pnl": str(diagnosis.gross_realized_pnl),
         "net_realized_pnl": str(diagnosis.net_realized_pnl),
         "tp_sl_attempts": [event for event in diagnosis.durable_events if event["event_type"] in {"PROTECTION_PENDING", "DEMO_POSITION_OPEN"}],
@@ -447,9 +565,11 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
         "transaction_log": _json_safe(diagnosis.transaction_log),
         "final_remote_position": _json_safe(diagnosis.remote_positions),
         "final_remote_open_orders": _json_safe(diagnosis.remote_open_orders),
+        "remaining_bot_owned_open_orders": _json_safe(diagnosis.bot_owned_open_orders),
         "unrelated_open_orders": _json_safe(diagnosis.unrelated_open_orders),
         "conclusion": diagnosis.conclusion,
         "proposed_terminal_state": diagnosis.proposed_state.value if diagnosis.proposed_state else None,
+        "can_reconcile": diagnosis.repairable,
         "repairable": diagnosis.repairable,
         "blockers": diagnosis.blockers,
     }
@@ -465,11 +585,15 @@ def _matches(item: dict[str, Any], order_id: str | None, link_id: str | None) ->
 def _valid_close_order(
     item: dict[str, Any], entry_time: int, owned_quantity: Decimal,
     used_order_ids: set[str], position_watermark: int,
+    symbol: str, entry_side: str,
 ) -> bool:
     timestamp = int(str(item.get("updatedTime") or item.get("createdTime") or "0"))
     quantity = _decimal(item.get("cumExecQty") or item.get("qty"))
     return bool(
         entry_time and timestamp >= entry_time
+        and str(item.get("symbol") or "") == symbol
+        and str(item.get("side") or "").upper()
+        == ("SELL" if entry_side == "BUY" else "BUY")
         and (not position_watermark or timestamp <= position_watermark)
         and str(item.get("orderId") or "") not in used_order_ids
         and str(item.get("reduceOnly") or "").lower() == "true"
@@ -480,12 +604,15 @@ def _valid_close_order(
 def _valid_close_execution(
     item: dict[str, Any], entry_time: int, owned_quantity: Decimal,
     used_exec_ids: set[str], allowed_order_ids: set[str],
-    position_watermark: int,
+    position_watermark: int, symbol: str, entry_side: str,
 ) -> bool:
     timestamp = int(str(item.get("execTime") or "0"))
     quantity = _decimal(item.get("execQty"))
     return bool(
         entry_time and timestamp >= entry_time
+        and str(item.get("symbol") or "") == symbol
+        and str(item.get("side") or "").upper()
+        == ("SELL" if entry_side == "BUY" else "BUY")
         and (not position_watermark or timestamp <= position_watermark)
         and str(item.get("execId") or "") not in used_exec_ids
         and str(item.get("orderId") or "") in allowed_order_ids

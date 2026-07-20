@@ -5,6 +5,7 @@ import csv
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,21 @@ class V2ReportGenerator:
             run_id, signals, rejections, executions, trades,
             operational_incidents, runtime, trade_rows, generated_at,
         )
+        decision_reasons = Counter(
+            str(item.get("llm_decision_reason") or item.get("rejection_reason") or "unknown")
+            for item in news_decisions
+        )
+        summary["news_funnel_reasons"] = dict(decision_reasons)
+        funnel = summary.get("news_funnel") or {}
+        funnel["missing_keyword_rejections"] = max(
+            int(funnel.get("missing_keyword_rejections") or 0),
+            int(decision_reasons.get("missing_keywords") or 0),
+        )
+        funnel["low_importance_rejections"] = max(
+            int(funnel.get("low_importance_rejections") or 0),
+            int(decision_reasons.get("low_importance") or 0),
+        )
+        summary["news_funnel"] = funnel
         _write_json(directory / "summary.json", summary)
         _write_json(directory / "incidents.json", operational_incidents)
         _write_json(directory / "news_sources.json", {
@@ -147,6 +163,30 @@ class V2ReportGenerator:
         ):
             blockers.append("cycle failure reports are not explanatory")
         news_metrics = dict(runtime.get("news_metrics") or {})
+        signal_metrics = dict(runtime.get("signal_metrics") or {})
+        signal_metrics.update({
+            "strategy_evaluations": sum(int(value) for value in evaluations.values()),
+            "orders_submitted": sum(bool(item.get("order_id")) for item in executions),
+            "orders_filled": sum(_d(item.get("accepted_quantity")) > 0 for item in executions),
+            "completed_trades": len(trades),
+        })
+        signal_metrics.setdefault("raw_candidates", len(signals))
+        signal_metrics.setdefault("deduplicated_candidates", 0)
+        signal_metrics.setdefault(
+            "threshold_passes",
+            sum(_d(item.get("distance_to_threshold")) >= 0 for item in signals),
+        )
+        signal_metrics.setdefault(
+            "risk_rejections",
+            sum(str(item.get("state")) == "EXECUTION_BLOCKED" for item in signals),
+        )
+        signal_metrics.setdefault("portfolio_rejections", 0)
+        signal_metrics.setdefault("pre_execution_admissions", 0)
+        signal_metrics.setdefault("execution_policy_rejections", 0)
+        signal_metrics.setdefault("cooldown_rejections", 0)
+        signal_metrics.setdefault(
+            "admitted_signals", sum(bool(item.get("admitted")) for item in signals)
+        )
         unattributed = [
             item for item in trades
             if _canonical_attribution(item) == "unattributed_external_close"
@@ -161,6 +201,7 @@ class V2ReportGenerator:
         if any(row.get("latency_validation_errors") for row in trade_rows):
             analytics_blockers.append("trade latency contains incompatible or impossible timestamps")
         source_metrics = runtime.get("news_source_metrics") or {}
+        news_funnel = _news_funnel_totals(source_metrics)
         analytics_blockers.extend(_news_funnel_blockers(source_metrics))
         model_usage = runtime.get("last_news_model_usage")
         primary_model = runtime.get("news_primary_model")
@@ -174,6 +215,16 @@ class V2ReportGenerator:
             runtime.get("liquidation_metrics") or {}, generated_at
         )
         analytics_blockers.extend(liquidation_blockers)
+        source_liquidation_age = (
+            ((runtime.get("stale_metrics") or {}).get("data_age_seconds_by_source") or {})
+            .get("liquidations", {})
+            .get("latest_message_age")
+        )
+        if source_liquidation_age is not None and (
+            not math.isfinite(float(source_liquidation_age))
+            or float(source_liquidation_age) < 0
+        ):
+            analytics_blockers.append("liquidation source age is invalid")
         analytics_blockers = list(dict.fromkeys(analytics_blockers))
         analytics_result = (
             "FAIL" if analytics_blockers
@@ -197,6 +248,25 @@ class V2ReportGenerator:
             "strategy_evaluation_counts": evaluations,
             "enabled_strategies_never_evaluated": never_evaluated,
             "strategy_not_applicable_counts": runtime.get("strategy_not_applicable_counts") or {},
+            "signal_metrics": signal_metrics,
+            "strategy_evaluations": signal_metrics.get("strategy_evaluations", 0),
+            "raw_candidates": signal_metrics.get("raw_candidates", len(signals)),
+            "deduplicated_candidates": signal_metrics.get("deduplicated_candidates", 0),
+            "threshold_passes": signal_metrics.get("threshold_passes", 0),
+            "risk_rejections": signal_metrics.get("risk_rejections", 0),
+            "portfolio_rejections": signal_metrics.get("portfolio_rejections", 0),
+            "pre_execution_admissions": signal_metrics.get(
+                "pre_execution_admissions", 0
+            ),
+            "execution_policy_rejections": signal_metrics.get(
+                "execution_policy_rejections", 0
+            ),
+            "cooldown_rejections": signal_metrics.get("cooldown_rejections", 0),
+            "admitted_signals": signal_metrics.get(
+                "admitted_signals", sum(bool(item.get("admitted")) for item in signals)
+            ),
+            "orders_submitted": signal_metrics["orders_submitted"],
+            "orders_filled": signal_metrics["orders_filled"],
             "news_source_health": runtime.get("news_source_health") or {},
             "raw_news_feed_items_received": int(
                 news_metrics.get("raw_news_feed_items_received")
@@ -206,7 +276,9 @@ class V2ReportGenerator:
                 news_metrics.get("unique_news_items_discovered") or 0
             ),
             "news_items_classified": int(news_metrics.get("llm_classifications") or 0),
+            "news_funnel_reasons": news_metrics.get("news_funnel_reasons") or {},
             "news_source_metrics": source_metrics,
+            "news_funnel": news_funnel,
             "news_primary_model": primary_model,
             "news_fallback_model": fallback_model,
             "last_news_model_usage": model_usage,
@@ -329,7 +401,11 @@ def _news_item_row(item: dict[str, Any]) -> dict[str, Any]:
 def _news_decision_row(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "news_id": item.get("news_id"),
+        "aggregator_filter_decision": item.get("aggregator_filter_decision"),
         "deterministic_filter_decision": item.get("deterministic_filter_decision"),
+        "classifier_prefilter_decision": item.get("classifier_prefilter_decision"),
+        "llm_decision_reason": item.get("llm_decision_reason"),
+        "funnel_stage": item.get("funnel_stage"),
         "llm_used": item.get("llm_used"), "model": item.get("model"),
         "fallback_used": item.get("fallback_used"),
         "fallback_reason": item.get("fallback_reason"),
@@ -351,6 +427,7 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
     entry_fills = item.get("fills") or []
     exit_fills = item.get("close_fills") or []
     errors: list[str] = []
+    diagnostics: list[str] = []
     for name, value in (item.get("execution_stage_durations_ms") or {}).items():
         if float(value) < 0:
             errors.append(f"negative_latency:{name}")
@@ -371,11 +448,36 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
     fill_before_ack = bool(item.get("fill_before_ack"))
     if local_fill and local_ack and _raw_latency_ms(local_ack, local_fill) < 0:
         fill_before_ack = True
-    if exchange_fill and local_ack and not local_fill:
-        errors.append("ack_to_fill_clock_domain_mismatch")
-    ack_to_fill = None if fill_before_ack else _validated_latency_ms(
-        local_ack, local_fill, errors, "ack_to_first_fill"
+        diagnostics.append("fill_received_before_ack")
+    if exchange_fill and not local_fill:
+        diagnostics.append("local_fill_receipt_unavailable")
+    ack_to_fill = None
+    if not fill_before_ack:
+        if item.get("ack_to_first_fill_ms") is not None:
+            ack_to_fill = item.get("ack_to_first_fill_ms")
+        else:
+            ack_to_fill = _validated_latency_ms(
+                local_ack, local_fill, errors, "ack_to_first_fill"
+            )
+            if ack_to_fill is not None:
+                diagnostics.append("wall_clock_fallback:ack_to_first_fill")
+    if fill_before_ack:
+        diagnostics.append("fill_before_ack_supported")
+    position_after_fill_receipt = _ordered_local_latency_ms(
+        local_fill,
+        item.get("position_confirmed_at"),
+        errors,
+        diagnostics,
+        "first_fill_to_position_confirmed",
+        negative_code="position_confirmed_before_fill_receipt",
     )
+    submit_to_fill = item.get("order_submit_to_first_fill_ms")
+    if submit_to_fill is None:
+        submit_to_fill = _validated_latency_ms(
+            local_submit, local_fill, errors, "order_submit_to_first_fill"
+        )
+        if submit_to_fill is not None:
+            diagnostics.append("wall_clock_fallback:order_submit_to_first_fill")
     row = {
         "run_id": item.get("run_id"), "execution_id": item.get("id"),
         "candidate_id": item.get("candidate_id"), "strategy": item.get("strategy_name"),
@@ -400,7 +502,7 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
         "net_pnl": item.get("realized_exchange_pnl"), "opened_at": item.get("created_at"),
         "closed_at": item.get("closed_at") or item.get("updated_at"),
         "signal_to_order_latency_ms": _validated_latency_ms(item.get("signal_created_at"), local_submit, errors, "signal_to_order"),
-        "order_to_fill_latency_ms": _validated_latency_ms(local_submit, local_fill, errors, "order_to_fill"),
+        "order_to_fill_latency_ms": submit_to_fill,
         "candidate_created_at": item.get("signal_created_at"),
         "candidate_persisted_at": item.get("candidate_persisted_at"),
         "reservation_requested_at": item.get("reservation_requested_at"),
@@ -425,14 +527,19 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
         "reservation_to_risk_approved_ms": _validated_latency_ms(item.get("reservation_created_at"), item.get("risk_approved_at"), errors, "reservation_to_risk_approved"),
         "risk_approved_to_execution_dispatch_ms": _validated_latency_ms(item.get("risk_approved_at"), item.get("execution_dispatched_at"), errors, "risk_approved_to_execution_dispatch"),
         "execution_dispatch_to_order_submit_ms": _validated_latency_ms(item.get("execution_dispatched_at"), local_submit, errors, "execution_dispatch_to_order_submit"),
-        "order_submit_to_ack_ms": _validated_latency_ms(local_submit, local_ack, errors, "order_submit_to_ack"),
-        "order_submit_to_first_fill_ms": _validated_latency_ms(local_submit, local_fill, errors, "order_submit_to_first_fill"),
+        "order_submit_to_ack_ms": (item.get("execution_stage_durations_ms") or {}).get("exchange_submit"),
+        "order_submit_to_first_fill_ms": submit_to_fill,
         "ack_to_first_fill_ms": ack_to_fill,
-        "first_fill_to_position_confirmed_ms": _validated_latency_ms(local_fill, item.get("position_confirmed_at"), errors, "first_fill_to_position_confirmed"),
+        "first_fill_to_position_confirmed_ms": position_after_fill_receipt,
         "position_confirmed_to_protection_confirmed_ms": _validated_latency_ms(item.get("position_confirmed_at"), item.get("protection_confirmed_at"), errors, "position_confirmed_to_protection_confirmed"),
         "total_signal_to_order_ms": _validated_latency_ms(item.get("signal_created_at"), local_submit, errors, "total_signal_to_order"),
         "total_signal_to_fill_ms": _validated_latency_ms(item.get("signal_created_at"), local_fill, errors, "total_signal_to_fill"),
         "latency_validation_errors": errors,
+        "latency_diagnostic_codes": [],
+        "exchange_order_to_fill_ms": _validated_latency_ms(
+            item.get("exchange_order_created_at"), exchange_fill, errors,
+            "exchange_order_to_fill",
+        ),
         "execution_stage_durations_ms": json.dumps(
             item.get("execution_stage_durations_ms") or {}, sort_keys=True
         ),
@@ -445,10 +552,15 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
     ):
         row[f"{stage}_started_at"] = item.get(f"{stage}_started_at")
         row[f"{stage}_completed_at"] = item.get(f"{stage}_completed_at")
-        row[f"{stage}_ms"] = _validated_latency_ms(
-            item.get(f"{stage}_started_at"), item.get(f"{stage}_completed_at"),
-            errors, stage,
-        )
+        row[f"{stage}_ms"] = (item.get("execution_stage_durations_ms") or {}).get(stage)
+        if row[f"{stage}_ms"] is None:
+            row[f"{stage}_ms"] = _validated_latency_ms(
+                item.get(f"{stage}_started_at"), item.get(f"{stage}_completed_at"),
+                errors, stage,
+            )
+            if row[f"{stage}_ms"] is not None:
+                diagnostics.append(f"wall_clock_fallback:{stage}")
+    row["latency_diagnostic_codes"] = list(dict.fromkeys(diagnostics))
     return row
 
 
@@ -488,9 +600,18 @@ def _latency_ms(start: object, finish: object) -> float | None:
 
 
 def _raw_latency_ms(start: object, finish: object) -> float:
-    return (
-        datetime.fromisoformat(str(finish)) - datetime.fromisoformat(str(start))
-    ).total_seconds() * 1000
+    return (_utc_datetime(finish) - _utc_datetime(start)).total_seconds() * 1000
+
+
+def _utc_datetime(value: object) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp is not timezone-aware")
+    return parsed.astimezone(timezone.utc)
 
 
 def _validated_latency_ms(
@@ -501,9 +622,35 @@ def _validated_latency_ms(
 ) -> float | None:
     if not start or not finish:
         return None
-    value = _raw_latency_ms(start, finish)
+    try:
+        value = _raw_latency_ms(start, finish)
+    except (TypeError, ValueError, OverflowError):
+        errors.append(f"invalid_utc_timestamp:{label}")
+        return None
     if value < 0:
         errors.append(f"negative_latency:{label}")
+        return None
+    return value
+
+
+def _ordered_local_latency_ms(
+    start: object,
+    finish: object,
+    errors: list[str],
+    diagnostics: list[str],
+    label: str,
+    *,
+    negative_code: str,
+) -> float | None:
+    if not start or not finish:
+        return None
+    try:
+        value = _raw_latency_ms(start, finish)
+    except (TypeError, ValueError, OverflowError):
+        errors.append(f"invalid_utc_timestamp:{label}")
+        return None
+    if value < 0:
+        diagnostics.append(negative_code)
         return None
     return value
 
@@ -584,6 +731,32 @@ def _news_funnel_blockers(source_metrics: dict[str, Any]) -> list[str]:
     return blockers
 
 
+def _news_funnel_totals(source_metrics: dict[str, Any]) -> dict[str, int]:
+    mapping = {
+        "received": "raw_feed_items_received",
+        "unique": "unique_items_discovered",
+        "fresh": "fresh_items",
+        "symbol_matched": "symbol_matched_items",
+        "deterministic_accepted": "deterministic_filter_accepts",
+        "llm_requested": "items_sent_to_llm",
+        "classified": "classified_items",
+        "trade_eligible": "trade_eligible_items",
+        "candidate": "candidates_generated",
+        "admitted": "candidates_admitted",
+        "cache_hits": "llm_cache_hits",
+        "budget_rejections": "llm_budget_rejections",
+        "circuit_breaker_rejections": "llm_circuit_breaker_rejections",
+        "classifier_failures": "classifier_failures",
+        "previous_run_duplicates": "duplicate_from_previous_run",
+        "missing_keyword_rejections": "skipped_missing_keywords",
+        "low_importance_rejections": "skipped_low_importance",
+    }
+    return {
+        output: sum(int(values.get(source) or 0) for values in source_metrics.values())
+        for output, source in mapping.items()
+    }
+
+
 def _liquidation_metrics_at(
     raw: dict[str, Any], generated_at: datetime,
 ) -> tuple[dict[str, Any], list[str]]:
@@ -596,19 +769,34 @@ def _liquidation_metrics_at(
     by_symbol: dict[str, dict[str, Any]] = {}
     timestamps: list[datetime] = []
     blockers: list[str] = []
+    raw_age_reference = raw.get("age_calculated_at")
+    if raw_age_reference:
+        blockers.extend(
+            _liquidation_age_blockers(
+                raw, datetime.fromisoformat(str(raw_age_reference))
+            )
+        )
     for symbol, value in source_rows.items():
         row = dict(value)
         stamp_text = row.get("last_valid_timestamp")
         stamp = datetime.fromisoformat(str(stamp_text)) if stamp_text else None
+        if stamp is None:
+            if row.get("current_age_seconds") is not None:
+                blockers.append(f"liquidation null timestamp has non-null age: {symbol}")
+            healthy_zero = _healthy_zero_liquidation_row(row)
+            if row.get("state") != "INELIGIBLE" and not healthy_zero:
+                blockers.append(f"liquidation uninitialized symbol is not ineligible: {symbol}")
+            if not healthy_zero and row.get("not_applicable_reason") not in {
+                "liquidation_feed_never_initialized", "liquidation_feed_unavailable",
+            }:
+                blockers.append(f"liquidation uninitialized reason is invalid: {symbol}")
         calculated_age = (
             max(0.0, (generated_at - stamp).total_seconds()) if stamp else None
         )
-        reported_age = row.get("current_age_seconds")
-        if (
-            calculated_age is not None and reported_age is not None
-            and abs(float(reported_age) - calculated_age) > 1.0
-        ):
-            blockers.append(f"liquidation timestamp/age mismatch: {symbol}")
+        # The runtime age may have been calculated before final report generation.
+        # Rebase it to the one authoritative report timestamp, then validate the
+        # final pair below. Generic source health timestamps are intentionally
+        # outside this per-symbol calculation.
         row["current_age_seconds"] = calculated_age
         by_symbol[symbol] = row
         if stamp:
@@ -637,7 +825,76 @@ def _liquidation_metrics_at(
     metrics.pop("current_liquidation_data_age_seconds", None)
     metrics.pop("last_valid_liquidation_timestamp", None)
     metrics.pop("by_symbol", None)
-    return metrics, blockers
+    metrics["age_calculated_at"] = generated_at.isoformat()
+    blockers.extend(_liquidation_age_blockers(metrics, generated_at))
+    return metrics, list(dict.fromkeys(blockers))
+
+
+def _liquidation_age_blockers(
+    metrics: dict[str, Any], generated_at: datetime,
+    *, tolerance_seconds: float = 0.010,
+) -> list[str]:
+    """Validate only timestamp/age pairs from the same liquidation scope."""
+    blockers: list[str] = []
+    rows = metrics.get("liquidation_eligibility_by_symbol") or {}
+    for symbol, row in rows.items():
+        stamp_text = row.get("last_valid_timestamp")
+        age = row.get("current_age_seconds")
+        if not stamp_text:
+            if age is not None:
+                blockers.append(f"liquidation null timestamp has non-null age: {symbol}")
+            healthy_zero = _healthy_zero_liquidation_row(row)
+            if row.get("state") != "INELIGIBLE" and not healthy_zero:
+                blockers.append(f"liquidation uninitialized symbol is not ineligible: {symbol}")
+            if not healthy_zero and row.get("not_applicable_reason") not in {
+                "liquidation_feed_never_initialized", "liquidation_feed_unavailable",
+            }:
+                blockers.append(f"liquidation uninitialized reason is invalid: {symbol}")
+            continue
+        stamp = datetime.fromisoformat(str(stamp_text))
+        expected = (generated_at - stamp).total_seconds()
+        if (
+            age is None or not math.isfinite(float(age)) or expected < 0
+            or abs(float(age) - expected) > tolerance_seconds
+        ):
+            blockers.append(f"liquidation timestamp/age mismatch: {symbol}")
+
+    aggregate_pairs = (
+        (
+            "most_recent_valid_liquidation_timestamp", "most_recent_age_seconds",
+            "liquidation most-recent timestamp/age mismatch",
+        ),
+        (
+            "oldest_valid_liquidation_timestamp", "maximum_age_seconds",
+            "liquidation oldest/maximum timestamp/age mismatch",
+        ),
+    )
+    for timestamp_field, age_field, message in aggregate_pairs:
+        stamp_text = metrics.get(timestamp_field)
+        age = metrics.get(age_field)
+        if stamp_text is None:
+            if age is not None:
+                blockers.append(message)
+            continue
+        stamp = datetime.fromisoformat(str(stamp_text))
+        expected = (generated_at - stamp).total_seconds()
+        if (
+            age is None or not math.isfinite(float(age)) or expected < 0
+            or abs(float(age) - expected) > tolerance_seconds
+        ):
+            blockers.append(message)
+    return blockers
+
+
+def _healthy_zero_liquidation_row(row: dict[str, Any]) -> bool:
+    return (
+        row.get("state") == "ELIGIBLE"
+        and row.get("connection_state") == "CONNECTED"
+        and row.get("subscription_state") == "SUBSCRIBED"
+        and int(row.get("rolling_event_count") or 0) == 0
+        and _d(row.get("rolling_liquidation_notional")) == 0
+        and row.get("not_applicable_reason") in {None, ""}
+    )
 
 
 def _percentile(values: list[float], percentile: float) -> float | None:

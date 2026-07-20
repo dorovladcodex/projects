@@ -139,3 +139,11 @@ def test_both_helpers_finalize_and_refresh_before_exit_code() -> None:
         exit_code = body.index("$p.ExitCode", refresh)
         dispose = body.rindex("$p.Dispose()")
         assert final_wait < refresh < exit_code < dispose
+
+
+def test_runner_requires_final_read_only_diagnostics_for_safety_pass() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "scripts\\demo_kill_switch_diagnostics.py" in source
+    assert "FINAL READ-ONLY DIAGNOSTICS" in source
+    assert "SAFETY RESULT: ' + $safetyResult" in source
+    assert "unresolved durable execution or remote-state disagreement" in source

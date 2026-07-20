@@ -80,6 +80,11 @@ class UniverseStatus(BaseModel):
 class SourceState(BaseModel):
     source: str
     health: SourceHealth = SourceHealth.UNAVAILABLE
+    connected: bool = False
+    subscribed: bool = False
+    subscription_confirmed_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    last_event_at: datetime | None = None
     last_message_at: datetime | None = None
     last_error: str | None = None
     reconnects: int = 0
@@ -138,6 +143,10 @@ class MarketFeatureSnapshot(BaseModel):
     liquidation_data_valid: bool = True
     liquidation_feed_initialized: bool = False
     liquidation_feed_available: bool = True
+    liquidation_connection_state: str = "DISCONNECTED"
+    liquidation_subscription_state: str = "NOT_SUBSCRIBED"
+    liquidation_event_count_5m: int = Field(default=0, ge=0)
+    liquidation_notional_5m: Decimal = Field(default=Decimal("0"), ge=0)
 
 
 class ScoreComponents(BaseModel):
@@ -185,11 +194,13 @@ class V2SignalCandidate(BaseModel):
     candidate_persisted_at: datetime | None = None
     reservation_requested_at: datetime | None = None
     reservation_created_at: datetime | None = None
+    reservation_id: UUID | None = None
     risk_evaluation_started_at: datetime | None = None
     risk_approved_at: datetime | None = None
     execution_queue_entered_at: datetime | None = None
     execution_task_received_at: datetime | None = None
     execution_dispatched_at: datetime | None = None
+    execution_rejected_at: datetime | None = None
 
 
 class PortfolioReservation(BaseModel):

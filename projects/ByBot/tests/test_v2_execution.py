@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import uuid4
 
@@ -8,6 +8,11 @@ import pytest
 
 from app.config import Settings
 from app.db.persistence import PersistenceRepository
+from app.bybit.demo import (
+    DemoExecutionService,
+    DemoSafetyError,
+    demo_symbol_cooldown_window,
+)
 from app.models import (
     BotEvent, DemoExecutionRecord, DemoExecutionState, Side, Symbol,
 )
@@ -83,8 +88,13 @@ class DemoStub:
     def __init__(self) -> None:
         self.kill_switch_active = False; self.kill_switch_reasons = []
         self.account_verified = True; self.last_error = None; self.calls = []
+        self.failure: Exception | None = None
+        self.exchange_mutations = 0
     def submit_candidate(self, candidate, preview, classification, snapshot, **kwargs):
         self.calls.append((candidate, preview, classification, snapshot, kwargs))
+        if self.failure is not None:
+            raise self.failure
+        self.exchange_mutations += 1
         return DemoExecutionRecord(
             candidate_id=candidate.id, risk_decision_id=preview.risk_decision_id,
             run_id="run", order_link_id=f"test-{candidate.id.hex[:20]}",
@@ -181,3 +191,96 @@ def test_settings_never_enable_live_or_generic_trading() -> None:
     config = demo_settings()
     assert config.bybit_live_trading_enabled is False
     assert config.bybit_enable_trading is False
+
+
+def _admitted_candidate(service, repository, symbol=Symbol.LTCUSDT):
+    strategy = build_v2_strategies(service.settings)[1]
+    candidate = strategy.evaluate(features(symbol)); candidate.run_id = "run"
+    candidate = CommonScoringPipeline(service.settings).admit(
+        candidate, symbol_valid=True, portfolio_reasons=[]
+    )
+    assert candidate.admitted
+    repository.save_v2_signal_candidate(candidate)
+    return candidate
+
+
+def test_expected_symbol_cooldown_releases_reservation_without_mutation() -> None:
+    service, repository, demo = coordinator()
+    demo.failure = DemoSafetyError("symbol cooldown is active")
+    candidate = _admitted_candidate(service, repository)
+
+    result = service.execute(candidate)
+
+    assert result["state"] == "EXECUTION_REJECTED"
+    assert result["rejection_code"] == "SYMBOL_COOLDOWN_ACTIVE"
+    assert result["candidate_id"] == str(candidate.id)
+    assert result["reservation_id"] == str(candidate.reservation_id)
+    assert result["execution_id"] is None
+    assert result["exchange_mutation_performed"] is False
+    assert demo.exchange_mutations == 0
+    assert repository.load_demo_executions() == []
+    reservation = next(
+        item for item in service.portfolio.reservations
+        if str(item.id) == result["reservation_id"]
+    )
+    assert reservation.state.value == "RELEASED"
+    assert Symbol.LTCUSDT not in service.portfolio.symbol_cooldown_until
+
+
+def test_unexpected_demo_safety_error_remains_unhandled() -> None:
+    service, repository, demo = coordinator()
+    demo.failure = DemoSafetyError("impossible internal ownership invariant")
+    candidate = _admitted_candidate(service, repository)
+
+    with pytest.raises(DemoSafetyError, match="ownership invariant"):
+        service.execute(candidate)
+
+    assert demo.exchange_mutations == 0
+
+
+def test_symbol_cooldown_uses_closed_at_not_mutable_updated_at() -> None:
+    now = datetime.now(timezone.utc)
+    closed = DemoExecutionRecord(
+        candidate_id=uuid4(), run_id="old", order_link_id="old-entry",
+        state=DemoExecutionState.DEMO_CLOSED, symbol=Symbol.LTCUSDT,
+        side=Side.BUY, requested_quantity=Decimal("1"),
+        closed_at=now - timedelta(seconds=301),
+        updated_at=now,
+    )
+    started, until = demo_symbol_cooldown_window(
+        [closed], Symbol.LTCUSDT, 300
+    )
+    assert started == closed.closed_at
+    assert until < now
+
+    class RiskRepo:
+        def load_demo_kill_switch(self): return None
+        def load_demo_executions(self): return [closed]
+
+    risk_service = DemoExecutionService(
+        demo_settings(), RiskRepo(), object(), run_id="run"
+    )
+    risk_service._enforce_risk_controls(Symbol.LTCUSDT, closed_pnl=[])
+
+
+def test_legitimate_symbol_cooldown_remains_enforced() -> None:
+    now = datetime.now(timezone.utc)
+    closed = DemoExecutionRecord(
+        candidate_id=uuid4(), run_id="old", order_link_id="old-entry",
+        state=DemoExecutionState.DEMO_CLOSED, symbol=Symbol.LTCUSDT,
+        side=Side.BUY, requested_quantity=Decimal("1"),
+        closed_at=now - timedelta(seconds=60),
+        updated_at=now,
+    )
+    _, until = demo_symbol_cooldown_window([closed], Symbol.LTCUSDT, 300)
+    assert until > now
+
+    class RiskRepo:
+        def load_demo_kill_switch(self): return None
+        def load_demo_executions(self): return [closed]
+
+    risk_service = DemoExecutionService(
+        demo_settings(), RiskRepo(), object(), run_id="run"
+    )
+    with pytest.raises(DemoSafetyError, match="symbol cooldown"):
+        risk_service._enforce_risk_controls(Symbol.LTCUSDT, closed_pnl=[])

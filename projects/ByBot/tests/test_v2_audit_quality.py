@@ -285,7 +285,7 @@ def test_stale_feature_and_critical_incident_metrics_are_separate(tmp_path: Path
         ({"liquidation_feed_initialized": False}, "liquidation_feed_never_initialized"),
         ({"liquidation_feed_initialized": True, "liquidation_feed_available": False}, "liquidation_feed_unavailable"),
         ({"liquidation_feed_initialized": True, "liquidation_data_valid": False}, "liquidation_data_invalid"),
-        ({"liquidation_feed_initialized": True, "liquidation_data_age_seconds": 120.0}, "liquidation_feed_stale"),
+        ({"liquidation_feed_initialized": True, "liquidation_data_age_seconds": 120.0}, None),
     ],
 )
 def test_liquidation_not_applicable_reasons(tmp_path: Path, updates, reason) -> None:
@@ -466,7 +466,8 @@ def test_exchange_fill_timestamp_is_never_subtracted_from_local_ack() -> None:
     })
     row = _trade_row(record)
     assert row["ack_to_first_fill_ms"] is None
-    assert "ack_to_fill_clock_domain_mismatch" in row["latency_validation_errors"]
+    assert row["latency_validation_errors"] == []
+    assert "local_fill_receipt_unavailable" in row["latency_diagnostic_codes"]
 
 
 def test_news_model_usage_rejects_strategy_contamination(tmp_path: Path) -> None:
@@ -508,7 +509,7 @@ def test_liquidation_ages_are_recalculated_from_one_generated_at() -> None:
     }, generated)
     assert metrics["most_recent_age_seconds"] == pytest.approx(1200)
     assert metrics["maximum_age_seconds"] == pytest.approx(1200)
-    assert blockers == ["liquidation timestamp/age mismatch: BTCUSDT"]
+    assert blockers == []
 
 
 def test_stale_open_position_is_warning_not_critical_incident(tmp_path: Path) -> None:
@@ -559,11 +560,10 @@ def test_analytics_result_fails_for_run_consistency_errors(tmp_path: Path) -> No
                     "liquidation_metrics": {
                         "liquidation_eligibility_by_symbol": {
                             "BTCUSDT": {
-                                "last_valid_timestamp": (
-                                    generated - timedelta(minutes=20)
-                                ).isoformat(),
+                                "last_valid_timestamp": None,
                                 "current_age_seconds": 58,
-                                "state": "INELIGIBLE",
+                                "state": "ELIGIBLE",
+                                "not_applicable_reason": None,
                             }
                         }
                     },
@@ -574,4 +574,4 @@ def test_analytics_result_fails_for_run_consistency_errors(tmp_path: Path) -> No
     assert report["analytics_result"] == "FAIL"
     assert "last_news_model_used is not a configured news model" in report["analytics_blockers"]
     assert "news funnel raw invariant failed: rss" in report["analytics_blockers"]
-    assert "liquidation timestamp/age mismatch: BTCUSDT" in report["analytics_blockers"]
+    assert "liquidation null timestamp has non-null age: BTCUSDT" in report["analytics_blockers"]

@@ -1418,11 +1418,106 @@ class DemoExecutionService:
                     record, event_type="DEMO_FULLY_FILLED"
                 )
                 self._install_protection(record)
+        finalized = self._finalize_attributed_flat_close(
+            record,
+            realtime=realtime,
+            history=history,
+            executions=executions,
+            positions=positions,
+        )
         record.last_reconciliation_at = datetime.now(timezone.utc)
         record.updated_at = record.last_reconciliation_at
-        if _execution_material_fingerprint(record) != starting_fingerprint:
+        if not finalized and _execution_material_fingerprint(record) != starting_fingerprint:
             self.repository.save_demo_execution(record, event_type="REST_ORDER_RECONCILED")
         return record
+
+    def _finalize_attributed_flat_close(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        realtime: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        executions: list[dict[str, Any]],
+        positions: list[dict[str, Any]],
+    ) -> bool:
+        """Finalize a CLOSING record only from exact, complete REST evidence."""
+
+        if record.state != DemoExecutionState.DEMO_CLOSING:
+            return False
+        if any(
+            str(item.get("symbol") or "") == record.symbol.value
+            and _decimal(item.get("size"), default="0") > 0
+            for item in positions
+        ):
+            return False
+        if any(_is_execution_owned_open_order(item, record) for item in realtime):
+            return False
+        close_order = next(
+            (
+                item for item in history
+                if record.close_order_id
+                and str(item.get("orderId") or "") == record.close_order_id
+            ),
+            None,
+        )
+        if close_order is None or str(close_order.get("orderStatus") or "") != "Filled":
+            return False
+        entry_time_ms = _record_entry_time_ms(record)
+        attributed = [
+            item for item in executions
+            if record.close_order_id
+            and str(item.get("orderId") or "") == record.close_order_id
+            and _exchange_event_time_ms(item) >= entry_time_ms
+            and (
+                str(item.get("reduceOnly") or "").lower() == "true"
+                or _decimal(item.get("closedSize"), default="0") > 0
+            )
+            and (
+                (record.side == Side.BUY and str(item.get("side") or "").upper() == "SELL")
+                or (record.side == Side.SELL and str(item.get("side") or "").upper() == "BUY")
+            )
+        ]
+        if not attributed:
+            return False
+        all_records = self.repository.load_demo_executions()
+        if any(
+            _exchange_identity_used_by_other(
+                all_records,
+                record,
+                str(item.get("orderId") or ""),
+                str(item.get("execId") or ""),
+            )
+            for item in attributed
+        ):
+            return False
+        close_quantity = sum(
+            (_decimal(item.get("execQty"), default="0") for item in attributed),
+            Decimal("0"),
+        )
+        if record.accepted_quantity <= 0 or close_quantity != record.accepted_quantity:
+            return False
+        # _apply_fill owns exact fill persistence and PnL/fee calculation. It
+        # may already have processed these rows; either way the durable result
+        # must contain the same complete quantity before terminalization.
+        for item in attributed:
+            self._apply_fill(record, item, force_close=True)
+        durable_close_quantity = sum(
+            (fill.quantity for fill in record.close_fills), Decimal("0")
+        )
+        if durable_close_quantity != record.accepted_quantity:
+            return False
+        record.state = (
+            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+            if record.failure_reason else DemoExecutionState.DEMO_CLOSED
+        )
+        record.cleanup_result = "remote position flat and bot-owned orders zero"
+        record.last_error = None
+        record.closed_at = max(fill.executed_at for fill in record.close_fills)
+        record.updated_at = datetime.now(timezone.utc)
+        self.repository.save_demo_execution(
+            record, event_type="REST_FLAT_CLOSE_FINALIZED"
+        )
+        return True
 
     def reconcile(self) -> dict[str, Any]:
         if not self.enabled or self.client is None:
@@ -1916,6 +2011,9 @@ class DemoExecutionService:
         *,
         data_fresh: bool = True,
         setup_valid: bool = True,
+        stale_feature: str | None = None,
+        stale_age_seconds: float | None = None,
+        stale_exit_threshold_seconds: float | None = None,
         now: datetime | None = None,
     ) -> DemoExecutionRecord | None:
         """Manage one exact owned V2 position; unrelated positions are untouched."""
@@ -1938,7 +2036,36 @@ class DemoExecutionService:
         ).total_seconds() >= record.maximum_holding_seconds:
             close_reason = "maximum_holding_time"
         elif not data_fresh:
-            close_reason = "stale_signal"
+            threshold = stale_exit_threshold_seconds or float(
+                self.settings.v2_position_data_stale_exit_seconds
+            )
+            first_observation = record.position_data_stale_since is None
+            if first_observation:
+                record.position_data_stale_since = current
+            record.position_data_stale_feature = stale_feature or "mandatory_market_data"
+            record.position_data_stale_age_seconds = stale_age_seconds
+            record.position_data_stale_threshold_seconds = threshold
+            record.position_data_stale_protection_confirmed = record.protection_confirmed
+            stale_duration = (
+                current - _aware(record.position_data_stale_since)
+            ).total_seconds()
+            if first_observation:
+                record.updated_at = current
+                self.repository.save_demo_execution(
+                    record, event_type="POSITION_DATA_STALE_OBSERVED"
+                )
+            if (
+                not record.protection_confirmed
+                or stale_duration >= threshold
+                or (stale_age_seconds is not None and stale_age_seconds >= threshold)
+            ):
+                close_reason = "stale_signal"
+        elif record.position_data_stale_since is not None:
+            record.position_data_stale_since = None
+            record.updated_at = current
+            self.repository.save_demo_execution(
+                record, event_type="POSITION_DATA_FRESH_RESTORED"
+            )
         elif not setup_valid:
             close_reason = "invalidated_setup"
         if close_reason:
@@ -2514,15 +2641,18 @@ class DemoExecutionService:
                 )
             ):
                 raise DemoSafetyError("global entry cooldown is active")
-        symbol_records = [item for item in completed if item.symbol == symbol]
-        if symbol_records:
-            latest_symbol_close = max(item.updated_at for item in symbol_records)
-            if now - _aware(latest_symbol_close) < timedelta(
-                seconds=(
-                    self.settings.v2_symbol_cooldown_seconds
-                    if self.settings.v2_enabled else self.settings.paper_symbol_cooldown_seconds
-                )
-            ):
+        symbol_window = demo_symbol_cooldown_window(
+            completed,
+            symbol,
+            (
+                self.settings.v2_symbol_cooldown_seconds
+                if self.settings.v2_enabled
+                else self.settings.paper_symbol_cooldown_seconds
+            ),
+        )
+        if symbol_window is not None:
+            _, cooldown_until = symbol_window
+            if now < cooldown_until:
                 raise DemoSafetyError("symbol cooldown is active")
         closed = (
             closed_pnl
@@ -2756,6 +2886,25 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def demo_symbol_cooldown_window(
+    records: list[DemoExecutionRecord],
+    symbol: Symbol,
+    duration_seconds: int,
+) -> tuple[datetime, datetime] | None:
+    """Return the immutable close-based cooldown window for one symbol."""
+    symbol_records = [
+        item
+        for item in records
+        if item.state == DemoExecutionState.DEMO_CLOSED and item.symbol == symbol
+    ]
+    if not symbol_records:
+        return None
+    started_at = max(
+        _aware(item.closed_at or item.updated_at) for item in symbol_records
+    )
+    return started_at, started_at + timedelta(seconds=duration_seconds)
+
+
 def _event_key(topic: str, item: dict[str, Any]) -> str:
     stable = str(
         item.get("execId") or item.get("orderId") or item.get("updatedTime")
@@ -2849,6 +2998,41 @@ def _protection_matches(
         _decimal(position.get("takeProfit"), default="0") == take_profit
         and _decimal(position.get("stopLoss"), default="0") == stop_loss
     )
+
+
+def _is_execution_owned_open_order(
+    order: dict[str, Any], execution: DemoExecutionRecord,
+) -> bool:
+    """Match an open entry/close/protection order to one exact execution."""
+
+    order_id = str(order.get("orderId") or "")
+    order_link = str(order.get("orderLinkId") or "")
+    if order_id and order_id in {execution.order_id, execution.close_order_id}:
+        return True
+    if order_link and order_link in {
+        execution.order_link_id, execution.close_order_link_id,
+    }:
+        return True
+    if str(order.get("symbol") or "") != execution.symbol.value:
+        return False
+    if str(order.get("reduceOnly") or "").lower() != "true":
+        return False
+    if str(order.get("closeOnTrigger") or "").lower() != "true":
+        return False
+    stop_type = str(order.get("stopOrderType") or "")
+    if stop_type not in {"TakeProfit", "StopLoss"}:
+        return False
+    expected_side = "SELL" if execution.side == Side.BUY else "BUY"
+    if str(order.get("side") or "").upper() != expected_side:
+        return False
+    if _decimal(order.get("qty"), default="0") != execution.accepted_quantity:
+        return False
+    expected_trigger = (
+        execution.take_profit if stop_type == "TakeProfit" else execution.stop_loss
+    )
+    return expected_trigger is not None and _decimal(
+        order.get("triggerPrice"), default="0"
+    ) == expected_trigger
 
 
 def _is_owned_bybit_protection_order(

@@ -269,14 +269,31 @@ try {
             if (-not $cleanup.live_execution_blocked) { throw 'Demo cleanup safety assertion failed.' }
         }
         $report = Invoke-RestMethod "$base/v2/report" -Method Post -TimeoutSec 30
+        Stop-Uvicorn
+        $safetyResult = 'PASS'
+        try {
+            Invoke-NativeCommand -FilePath $python `
+                -Arguments @('scripts\demo_kill_switch_diagnostics.py') `
+                -TimeoutSeconds 120 -Stage 'FINAL READ-ONLY DIAGNOSTICS'
+        } catch {
+            $safetyResult = 'FAIL'
+            Write-Warning ('Final read-only diagnostics failed: ' + $_.Exception.Message)
+        }
+        $report | Add-Member -NotePropertyName safety_result `
+            -NotePropertyValue $safetyResult -Force
+        $report | Add-Member -NotePropertyName final_read_only_diagnostics `
+            -NotePropertyValue $(if ($safetyResult -eq 'PASS') { 'PASS' } else { 'FAIL' }) -Force
         $report | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 (Join-Path $artifactDir 'runner-report.json')
         $functionalResult = [string]$report.functional_result
         if (-not $functionalResult) { $functionalResult = 'FAIL' }
         Write-Host ('FUNCTIONAL RESULT: ' + $functionalResult)
-        Write-Host ('SAFETY RESULT: ' + $(if ($status.kill_switch_active) { 'FAIL_CLOSED' } else { 'PASS' }))
+        Write-Host ('SAFETY RESULT: ' + $safetyResult)
         Write-Host ('ARTIFACTS: ' + $artifactDir)
         if ($functionalResult -ne 'PASS') {
             throw ('V2 functional validation failed: ' + ($report.functional_blockers -join '; '))
+        }
+        if ($safetyResult -ne 'PASS') {
+            throw 'V2 safety validation failed: unresolved durable execution or remote-state disagreement'
         }
     } finally { Pop-Location }
 } finally {

@@ -217,12 +217,20 @@ class V2NewsAggregator:
                 "duplicate_within_poll": 0,
                 "duplicate_within_run": 0,
                 "duplicate_from_previous_run": 0,
+                "fresh_items": 0,
+                "symbol_matched_items": 0,
                 "unique_items_discovered": 0,
                 "duplicate_items_seen": 0,
                 "duplicate_items_not_reinserted": 0,
                 "deterministic_filter_accepts": 0,
                 "deterministic_filter_rejections": 0,
                 "items_sent_to_llm": 0, "classified_items": 0,
+                "llm_cache_hits": 0,
+                "llm_budget_rejections": 0,
+                "llm_circuit_breaker_rejections": 0,
+                "classifier_failures": 0,
+                "skipped_missing_keywords": 0,
+                "skipped_low_importance": 0,
                 "trade_eligible_items": 0, "candidates_generated": 0,
                 "candidates_admitted": 0,
             }
@@ -401,12 +409,14 @@ class V2NewsAggregator:
                     self.source_metrics[source.name]["deterministic_filter_rejections"] += 1
                     self.last_poll_audit.append(audit)
                     continue
+                self.source_metrics[source.name]["fresh_items"] += 1
                 if not symbols:
                     audit["deterministic_filter_decision"] = "unrelated_asset"
                     self.items_rejected += 1
                     self.source_metrics[source.name]["deterministic_filter_rejections"] += 1
                     self.last_poll_audit.append(audit)
                     continue
+                self.source_metrics[source.name]["symbol_matched_items"] += 1
                 self.items_accepted += 1
                 self.source_metrics[source.name]["deterministic_filter_accepts"] += 1
                 self.last_poll_audit.append(audit)

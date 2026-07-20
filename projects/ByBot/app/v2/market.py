@@ -67,6 +67,8 @@ class RollingFeatureEngine:
         self.stale_incidents = 0  # Backward-compatible critical incident counter.
         self.stale_feature_observations = 0
         self.invalid_liquidation_symbols: set[Symbol] = set()
+        self.liquidation_subscriptions: dict[Symbol, datetime] = {}
+        self.unsupported_liquidation_symbols: set[Symbol] = set()
         self._source_age_samples: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=10_000)
         )
@@ -124,7 +126,34 @@ class RollingFeatureEngine:
         self.liquidations[symbol].append(
             LiquidationPoint(timestamp, price * quantity, side.upper())
         )
+        state = self.source_states["liquidations"]
+        state.last_event_at = timestamp
         self._healthy("liquidations", timestamp)
+
+    def mark_transport_connected(self, connected: bool, *, at: datetime | None = None) -> None:
+        current = at or datetime.now(timezone.utc)
+        for state in self.source_states.values():
+            state.connected = connected
+            state.last_heartbeat_at = current
+            if not connected:
+                state.health = SourceHealth.DEGRADED
+
+    def mark_liquidation_subscribed(
+        self, symbols: tuple[Symbol, ...], *, at: datetime | None = None,
+        unsupported: tuple[Symbol, ...] = (),
+    ) -> None:
+        current = at or datetime.now(timezone.utc)
+        state = self.source_states["liquidations"]
+        state.connected = True
+        state.subscribed = True
+        state.subscription_confirmed_at = current
+        state.last_heartbeat_at = current
+        state.health = SourceHealth.OK
+        state.last_error = None
+        self.unsupported_liquidation_symbols.update(unsupported)
+        for symbol in symbols:
+            if symbol not in self.unsupported_liquidation_symbols:
+                self.liquidation_subscriptions[symbol] = current
 
     def ingest_rest_metrics(
         self, symbol: Symbol, *, funding_rate: Decimal | None,
@@ -227,6 +256,15 @@ class RollingFeatureEngine:
         short_liq = sum((p.notional for p in liqs if p.side == "BUY"), Decimal("0"))
         long_liq = sum((p.notional for p in liqs if p.side == "SELL"), Decimal("0"))
         liq_total = short_liq + long_liq
+        liquidation_state = self.source_states["liquidations"]
+        subscribed = symbol in self.liquidation_subscriptions
+        transport_available = (
+            liquidation_state.connected
+            and liquidation_state.health not in {
+                SourceHealth.UNAVAILABLE, SourceHealth.DEGRADED, SourceHealth.STALE,
+            }
+            and symbol not in self.unsupported_liquidation_symbols
+        )
         oi_change = _series_change(self.open_interest[symbol], current, timedelta(minutes=5))
         funding_rate = self.funding.get(symbol, (None, current))[0]
         funding_deviation = funding_rate * Decimal("10000") if funding_rate is not None else None
@@ -258,18 +296,25 @@ class RollingFeatureEngine:
             liquidation_last_valid_at=liquidation_time,
             liquidation_data_age_seconds=source_ages["liquidations"],
             liquidation_data_valid=symbol not in self.invalid_liquidation_symbols,
-            liquidation_feed_initialized=liquidation_time is not None,
-            liquidation_feed_available=(
-                self.source_states["liquidations"].health
-                not in {SourceHealth.UNAVAILABLE, SourceHealth.DEGRADED}
+            # Subscription initialization is intentionally independent from
+            # event recency: a healthy stream can legitimately emit zero
+            # liquidation events for a symbol.
+            liquidation_feed_initialized=subscribed,
+            liquidation_feed_available=transport_available,
+            liquidation_connection_state=("CONNECTED" if liquidation_state.connected else "DISCONNECTED"),
+            liquidation_subscription_state=(
+                "UNSUPPORTED" if symbol in self.unsupported_liquidation_symbols
+                else "SUBSCRIBED" if subscribed else "NOT_SUBSCRIBED"
             ),
+            liquidation_event_count_5m=len(liqs),
+            liquidation_notional_5m=liq_total,
         )
 
     def record_critical_stale_incident(self) -> None:
         self.stale_incidents += 1
 
-    def data_age_metrics(self) -> dict[str, dict[str, float | None]]:
-        result: dict[str, dict[str, float | None]] = {}
+    def data_age_metrics(self) -> dict[str, dict[str, float | str | bool | None]]:
+        result: dict[str, dict[str, float | str | bool | None]] = {}
         for source in ("ticker", "trades", "orderbook", "liquidations", "rest"):
             samples = sorted(self._source_age_samples.get(source, ()))
             state = self.source_states[source]
@@ -282,12 +327,23 @@ class RollingFeatureEngine:
                 "p50": _percentile(samples, 0.50),
                 "p95": _percentile(samples, 0.95),
                 "latest_message_age": latest_age,
+                "connected": state.connected,
+                "subscribed": state.subscribed,
+                "last_heartbeat_at": (
+                    state.last_heartbeat_at.isoformat()
+                    if state.last_heartbeat_at else None
+                ),
+                "last_event_at": (
+                    state.last_event_at.isoformat() if state.last_event_at else None
+                ),
             }
         return result
 
     def _healthy(self, source: str, timestamp: datetime) -> None:
         state = self.source_states[source]
         state.health = SourceHealth.OK
+        state.connected = True
+        state.last_heartbeat_at = timestamp
         state.last_message_at = timestamp
         state.last_error = None
 
@@ -309,6 +365,8 @@ class BybitPublicWebSocketEngine:
                 async with websockets.connect(
                     self.settings.v2_public_ws_url, open_timeout=10, ping_interval=20,
                 ) as socket:
+                    self.features.mark_transport_connected(True)
+                    self._requested_symbols = symbols
                     topics = [
                         topic for symbol in symbols for topic in (
                             f"tickers.{symbol.value}", f"publicTrade.{symbol.value}",
@@ -323,6 +381,7 @@ class BybitPublicWebSocketEngine:
                 raise
             except Exception as exc:
                 self.reconnects += 1
+                self.features.mark_transport_connected(False)
                 for state in self.features.source_states.values():
                     state.health = SourceHealth.DEGRADED
                     state.last_error = type(exc).__name__
@@ -334,6 +393,35 @@ class BybitPublicWebSocketEngine:
         self.running = False
 
     def handle_message(self, message: dict[str, Any]) -> None:
+        if str(message.get("op") or "") == "subscribe":
+            if bool(message.get("success")):
+                raw_failed = (
+                    message.get("failTopics")
+                    or message.get("fail_topics")
+                    or (
+                        (message.get("data") or {}).get("failTopics")
+                        if isinstance(message.get("data"), dict) else None
+                    )
+                    or []
+                )
+                unsupported: list[Symbol] = []
+                for topic in raw_failed:
+                    if not str(topic).startswith("allLiquidation."):
+                        continue
+                    try:
+                        unsupported.append(Symbol(str(topic).rsplit(".", 1)[-1]))
+                    except ValueError:
+                        continue
+                self.features.mark_liquidation_subscribed(
+                    getattr(self, "_requested_symbols", ()),
+                    unsupported=tuple(unsupported),
+                )
+            else:
+                state = self.features.source_states["liquidations"]
+                state.health = SourceHealth.DEGRADED
+                state.subscribed = False
+                state.last_error = "liquidation subscription rejected"
+            return
         topic = str(message.get("topic") or "")
         data = message.get("data")
         if not topic or data is None:

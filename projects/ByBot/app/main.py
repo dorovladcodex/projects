@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
+from time import perf_counter
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -250,7 +251,17 @@ def health() -> dict[str, str]:
 
 @app.get("/v2/status")
 def v2_status() -> dict[str, object]:
-    return v2_runtime.status()
+    started = perf_counter()
+    succeeded = False
+    try:
+        payload = v2_runtime.status()
+        succeeded = True
+        return payload
+    finally:
+        v2_runtime.record_status_request(
+            latency_ms=(perf_counter() - started) * 1000,
+            succeeded=succeeded,
+        )
 
 
 @app.get("/v2/universe")
