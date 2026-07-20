@@ -57,8 +57,8 @@ def test_exchange_generated_stop_loss_is_metadata_attributed(side: Side) -> None
         "createType": "CreateByStopLoss", "reduceOnly": True,
         "closeOnTrigger": True, "triggerPrice": str(record.stop_loss),
     }, source="test")
-    assert result == "exchange_generated_sl"
-    assert record.close_reason == "exchange_generated_sl"
+    assert result == "stop_loss"
+    assert record.close_reason == "stop_loss"
     assert record.exit_attribution_evidence["order_link_id"] is None
 
 
@@ -68,7 +68,7 @@ def test_exchange_generated_take_profit_is_metadata_attributed() -> None:
         "orderId": "tp-order", "stopOrderType": "TakeProfit",
         "createType": "CreateByTakeProfit", "reduceOnly": True,
         "closeOnTrigger": True,
-    }, source="test") == "exchange_generated_tp"
+    }, source="test") == "take_profit"
 
 
 class _ExecutionRepo:
@@ -107,7 +107,7 @@ def test_position_update_before_close_fill_preserves_exact_attribution() -> None
     service, repository = _service(record)
     service._apply_position_update(record, {"symbol": "WIFUSDT", "size": "0"})
     service._apply_fill(record, _close_fill(), force_close=True)
-    assert repository.record.exit_attribution == "exchange_generated_sl"
+    assert repository.record.exit_attribution == "stop_loss"
     assert "POSITION_FLAT_PENDING_PNL" in repository.events
 
 
@@ -115,7 +115,7 @@ def test_close_fill_before_position_update_preserves_exact_attribution() -> None
     record = _record(); service, repository = _service(record)
     service._apply_fill(record, _close_fill(), force_close=True)
     service._apply_position_update(record, {"symbol": "WIFUSDT", "size": "0"})
-    assert repository.record.exit_attribution == "exchange_generated_sl"
+    assert repository.record.exit_attribution == "stop_loss"
     assert len(repository.record.close_fills) == 1
 
 
@@ -132,7 +132,55 @@ def test_manual_reduce_only_close_is_external() -> None:
     record = _record()
     assert attribute_exchange_close(record, {
         "orderId": "manual", "reduceOnly": True, "createType": "CreateByUser"
-    }, source="test") == "external_close"
+    }, source="test") == "manual_external_close"
+
+
+@pytest.mark.parametrize(
+    "metadata,expected_state,expected_attribution",
+    [
+        (
+            {"stopOrderType": "TakeProfit", "createType": "CreateByTakeProfit"},
+            DemoExecutionState.DEMO_CLOSED,
+            "take_profit",
+        ),
+        (
+            {"stopOrderType": "StopLoss", "createType": "CreateByStopLoss"},
+            DemoExecutionState.DEMO_CLOSED,
+            "stop_loss",
+        ),
+        (
+            {"createType": "CreateByClosing"},
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+            "manual_external_close",
+        ),
+    ],
+)
+def test_exact_exchange_close_terminalizes_directly_from_position_open(
+    metadata: dict[str, str],
+    expected_state: DemoExecutionState,
+    expected_attribution: str,
+) -> None:
+    record = _record()
+    service, repository = _service(record)
+    order = {
+        "symbol": "WIFUSDT", "orderId": "close-order", "side": "Buy",
+        "orderStatus": "Filled", "reduceOnly": True, "closeOnTrigger": True,
+        "qty": "163", "cumExecQty": "163",
+        "createdTime": "1784152925050", "updatedTime": "1784152925050",
+        **metadata,
+    }
+    fill = _close_fill()
+    fill.pop("stopOrderType", None)
+    fill.pop("createType", None)
+    fill.update(metadata)
+
+    assert service._finalize_attributed_flat_close(
+        record, realtime=[], history=[order], executions=[fill],
+        positions=[{"symbol": "WIFUSDT", "size": "0"}],
+    )
+    assert repository.record.state == expected_state
+    assert repository.record.exit_attribution == expected_attribution
+    assert repository.record.close_order_id == "close-order"
 
 
 def test_trade_export_never_has_blank_null_or_unknown_exit() -> None:

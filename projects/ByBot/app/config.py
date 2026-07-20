@@ -139,6 +139,9 @@ class Settings(BaseSettings):
     v2_ws_reconnect_max_seconds: int = Field(default=30, ge=1, le=300)
     v2_rest_metrics_interval_seconds: int = Field(default=60, ge=10, le=3600)
     v2_news_poll_interval_seconds: int = Field(default=180, ge=10, le=3600)
+    v2_run_nominal_end_at: datetime | None = None
+    v2_drain_lead_seconds: int = Field(default=300, ge=0, le=86400)
+    v2_drain_timeout_seconds: int = Field(default=900, ge=30, le=86400)
     v2_liquidation_stale_seconds: int = Field(default=60, ge=5, le=3600)
     v2_demo_account_verification_ttl_seconds: int = Field(
         default=900, ge=30, le=3600

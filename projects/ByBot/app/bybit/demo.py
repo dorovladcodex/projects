@@ -49,8 +49,8 @@ TERMINAL_DEMO_STATES = {
 }
 CANONICAL_EXIT_ATTRIBUTIONS = {
     "take_profit", "stop_loss", "strategy_exit", "stale_signal",
-    "maximum_holding_time", "reconciliation_close", "external_close",
-    "exchange_generated_tp", "exchange_generated_sl", "forced_cleanup",
+    "maximum_holding_time", "reconciliation_close", "manual_external_close",
+    "forced_cleanup",
     "unattributed_external_close",
 }
 
@@ -63,29 +63,50 @@ def canonical_exit_attribution(reason: str | None) -> str:
         "protection_failure": "forced_cleanup",
         "emergency_close": "forced_cleanup",
         "exchange_close": "reconciliation_close",
+        "exchange_generated_tp": "take_profit",
+        "exchange_generated_sl": "stop_loss",
+        "external_close": "manual_external_close",
     }
     value = aliases.get(normalized, normalized)
     return value if value in CANONICAL_EXIT_ATTRIBUTIONS else "unattributed_external_close"
+
+
+def classify_exchange_close(
+    item: dict[str, Any],
+    *,
+    durable_reason: str | None = None,
+    allow_generic_reduce_only: bool = False,
+) -> str | None:
+    """Classify close metadata without using price proximity."""
+    stop_type = str(item.get("stopOrderType") or "").casefold()
+    create_type = str(item.get("createType") or "").casefold()
+    if stop_type == "stoploss" or create_type == "createbystoploss":
+        return "stop_loss"
+    if stop_type == "takeprofit" or create_type == "createbytakeprofit":
+        return "take_profit"
+    if create_type == "createbyclosing":
+        return "manual_external_close"
+    if durable_reason:
+        existing = canonical_exit_attribution(durable_reason)
+        if existing != "unattributed_external_close":
+            return existing
+    if allow_generic_reduce_only and (
+        str(item.get("reduceOnly") or "").lower() == "true"
+        or _decimal(item.get("closedSize"), default="0") > 0
+    ):
+        return "manual_external_close"
+    return None
 
 
 def attribute_exchange_close(
     record: DemoExecutionRecord, item: dict[str, Any], *, source: str,
 ) -> str:
     """Set canonical exit attribution from exchange metadata, never price alone."""
-    existing = canonical_exit_attribution(record.exit_attribution or record.close_reason)
-    has_precise_existing = bool(record.exit_attribution or record.close_reason)
-    stop_type = str(item.get("stopOrderType") or "").casefold()
-    create_type = str(item.get("createType") or "").casefold()
-    if stop_type == "stoploss" or create_type == "createbystoploss":
-        attribution = "exchange_generated_sl"
-    elif stop_type == "takeprofit" or create_type == "createbytakeprofit":
-        attribution = "exchange_generated_tp"
-    elif has_precise_existing:
-        attribution = existing
-    elif bool(item.get("reduceOnly")) or _decimal(item.get("closedSize"), default="0") > 0:
-        attribution = "external_close"
-    else:
-        attribution = "unattributed_external_close"
+    attribution = classify_exchange_close(
+        item,
+        durable_reason=record.exit_attribution or record.close_reason,
+        allow_generic_reduce_only=True,
+    ) or "unattributed_external_close"
     evidence = {
         "source": source,
         "order_id": str(item.get("orderId") or record.close_order_id or "") or None,
@@ -1357,6 +1378,7 @@ class DemoExecutionService:
         history = self.client.get_order_history(symbol=record.symbol)
         executions = self.client.get_executions(symbol=record.symbol)
         positions = self.client.get_positions(symbol=record.symbol)
+        _capture_protection_order_ownership(record, realtime, positions)
 
         def matches(item: dict[str, Any], *, close: bool = False) -> bool:
             ids = (
@@ -1440,9 +1462,13 @@ class DemoExecutionService:
         executions: list[dict[str, Any]],
         positions: list[dict[str, Any]],
     ) -> bool:
-        """Finalize a CLOSING record only from exact, complete REST evidence."""
+        """Finalize an owned position only from exact, complete REST evidence."""
 
-        if record.state != DemoExecutionState.DEMO_CLOSING:
+        if record.state not in {
+            DemoExecutionState.DEMO_POSITION_OPEN,
+            DemoExecutionState.DEMO_CLOSING,
+            DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
+        }:
             return False
         if any(
             str(item.get("symbol") or "") == record.symbol.value
@@ -1460,18 +1486,56 @@ class DemoExecutionService:
             ),
             None,
         )
+        if close_order is None and record.accepted_quantity > 0:
+            entry_time_ms = _record_entry_time_ms(record)
+            expected_side = "SELL" if record.side == Side.BUY else "BUY"
+            all_records = self.repository.load_demo_executions()
+            candidates: list[dict[str, Any]] = []
+            for item in history:
+                order_id = str(item.get("orderId") or "")
+                if (
+                    not order_id
+                    or str(item.get("symbol") or "") != record.symbol.value
+                    or str(item.get("side") or "").upper() != expected_side
+                    or str(item.get("orderStatus") or "") != "Filled"
+                    or str(item.get("reduceOnly") or "").lower() != "true"
+                    or _exchange_event_time_ms(item) < entry_time_ms
+                    or _decimal(
+                        item.get("cumExecQty") or item.get("qty"), default="0"
+                    ) != record.accepted_quantity
+                    or classify_exchange_close(item) is None
+                    or _exchange_identity_used_by_other(
+                        all_records, record, order_id, ""
+                    )
+                ):
+                    continue
+                candidates.append(item)
+            if len(candidates) == 1:
+                close_order = candidates[0]
         if close_order is None or str(close_order.get("orderStatus") or "") != "Filled":
             return False
         entry_time_ms = _record_entry_time_ms(record)
+        selected_close_order_id = str(close_order.get("orderId") or "")
+        expected_close_side = "SELL" if record.side == Side.BUY else "BUY"
+        if (
+            not selected_close_order_id
+            or str(close_order.get("symbol") or "") != record.symbol.value
+            or str(close_order.get("side") or "").upper() != expected_close_side
+            or str(close_order.get("reduceOnly") or "").lower() != "true"
+            or _exchange_event_time_ms(close_order) < entry_time_ms
+            or _decimal(
+                close_order.get("cumExecQty") or close_order.get("qty"), default="0"
+            ) != record.accepted_quantity
+            or classify_exchange_close(
+                close_order,
+                durable_reason=record.exit_attribution or record.close_reason,
+            ) is None
+        ):
+            return False
         attributed = [
             item for item in executions
-            if record.close_order_id
-            and str(item.get("orderId") or "") == record.close_order_id
+            if str(item.get("orderId") or "") == selected_close_order_id
             and _exchange_event_time_ms(item) >= entry_time_ms
-            and (
-                str(item.get("reduceOnly") or "").lower() == "true"
-                or _decimal(item.get("closedSize"), default="0") > 0
-            )
             and (
                 (record.side == Side.BUY and str(item.get("side") or "").upper() == "SELL")
                 or (record.side == Side.SELL and str(item.get("side") or "").upper() == "BUY")
@@ -1496,6 +1560,10 @@ class DemoExecutionService:
         )
         if record.accepted_quantity <= 0 or close_quantity != record.accepted_quantity:
             return False
+        record.close_order_id = selected_close_order_id
+        attribute_exchange_close(
+            record, close_order, source="rest_exact_full_close_order"
+        )
         # _apply_fill owns exact fill persistence and PnL/fee calculation. It
         # may already have processed these rows; either way the durable result
         # must contain the same complete quantity before terminalization.
@@ -1506,9 +1574,17 @@ class DemoExecutionService:
         )
         if durable_close_quantity != record.accepted_quantity:
             return False
+        attribution = canonical_exit_attribution(
+            record.exit_attribution or record.close_reason
+        )
         record.state = (
-            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
-            if record.failure_reason else DemoExecutionState.DEMO_CLOSED
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+            if attribution == "manual_external_close"
+            else DemoExecutionState.DEMO_CLOSED
+            if attribution in {"take_profit", "stop_loss"}
+            else DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+            if record.failure_reason
+            else DemoExecutionState.DEMO_CLOSED
         )
         record.cleanup_result = "remote position flat and bot-owned orders zero"
         record.last_error = None
@@ -2514,6 +2590,17 @@ class DemoExecutionService:
             record.protection_confirmed = True
             record.tp_identifier = str(position.get("takeProfit") or take_profit)
             record.sl_identifier = str(position.get("stopLoss") or stop_loss)
+            record.protection_position_idx = int(position.get("positionIdx") or 0)
+            try:
+                protection_orders = self.client.get_open_orders(symbol=record.symbol)
+                _capture_protection_order_ownership(
+                    record, protection_orders, positions
+                )
+            except Exception:
+                # Position-level TP/SL is authoritative. Order IDs are captured
+                # on the next bounded reconciliation if Bybit has not exposed
+                # the generated conditional orders yet.
+                pass
             record.state = DemoExecutionState.DEMO_POSITION_OPEN
             record.updated_at = datetime.now(timezone.utc)
             record.position_confirmed_at = record.updated_at
@@ -2980,6 +3067,9 @@ def _execution_material_fingerprint(record: DemoExecutionRecord) -> tuple[Any, .
         str(record.average_close_price),
         str(record.realized_exchange_pnl),
         record.protection_confirmed,
+        record.tp_order_id,
+        record.sl_order_id,
+        record.protection_position_idx,
         tuple(fill.execution_id for fill in record.fills),
         tuple(fill.execution_id for fill in record.close_fills),
     )
@@ -3007,7 +3097,12 @@ def _is_execution_owned_open_order(
 
     order_id = str(order.get("orderId") or "")
     order_link = str(order.get("orderLinkId") or "")
-    if order_id and order_id in {execution.order_id, execution.close_order_id}:
+    if order_id and order_id in {
+        execution.order_id,
+        execution.close_order_id,
+        execution.tp_order_id,
+        execution.sl_order_id,
+    }:
         return True
     if order_link and order_link in {
         execution.order_link_id, execution.close_order_link_id,
@@ -3053,6 +3148,21 @@ def _is_owned_bybit_protection_order(
     stop_type = str(order.get("stopOrderType") or "")
     if stop_type not in {"TakeProfit", "StopLoss"}:
         return False
+    expected_create_type = (
+        "CreateByTakeProfit" if stop_type == "TakeProfit" else "CreateByStopLoss"
+    )
+    if str(order.get("createType") or "") != expected_create_type:
+        return False
+    if int(order.get("positionIdx") or 0) != execution.protection_position_idx:
+        return False
+    expected_trigger_direction = (
+        1 if execution.side == Side.BUY and stop_type == "TakeProfit"
+        else 2 if execution.side == Side.BUY
+        else 2 if stop_type == "TakeProfit"
+        else 1
+    )
+    if int(order.get("triggerDirection") or 0) != expected_trigger_direction:
+        return False
     if execution.accepted_quantity <= 0 or _decimal(
         order.get("qty"), default="0"
     ) != execution.accepted_quantity:
@@ -3072,6 +3182,30 @@ def _is_owned_bybit_protection_order(
         execution.take_profit if stop_type == "TakeProfit" else execution.stop_loss
     )
     return _decimal(order.get("triggerPrice"), default="0") == expected_trigger
+
+
+def _capture_protection_order_ownership(
+    execution: DemoExecutionRecord,
+    orders: list[dict[str, Any]],
+    positions: list[dict[str, Any]],
+) -> bool:
+    """Persist exact exchange IDs only after full position-level attribution."""
+
+    changed = False
+    for order in orders:
+        if not _is_owned_bybit_protection_order(order, execution, positions):
+            continue
+        order_id = str(order.get("orderId") or "")
+        if not order_id:
+            continue
+        stop_type = str(order.get("stopOrderType") or "")
+        field = "tp_order_id" if stop_type == "TakeProfit" else "sl_order_id"
+        if getattr(execution, field) != order_id:
+            setattr(execution, field, order_id)
+            changed = True
+    if changed:
+        execution.protection_orders_verified_at = datetime.now(timezone.utc)
+    return changed
 
 
 def _sanitized_error(exc: Exception) -> str:

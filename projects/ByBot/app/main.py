@@ -303,11 +303,7 @@ def v2_report() -> dict[str, object]:
 def v2_stop_new_entries() -> dict[str, object]:
     if settings.app_env.lower() != "demo" or not settings.v2_enabled:
         raise HTTPException(status_code=404, detail="V2 Demo runtime is disabled")
-    v2_runtime.stop_new_entries = True
-    return {
-        "run_id": v2_run_id, "new_entries_stopped": True,
-        "existing_position_management_active": True,
-    }
+    return v2_runtime.begin_draining()
 
 
 @app.get("/status")

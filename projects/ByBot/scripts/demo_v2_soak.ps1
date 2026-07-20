@@ -228,6 +228,8 @@ try {
             -TimeoutSeconds 120 -Stage 'READ-ONLY PREFLIGHT'
         Write-Host 'READ-ONLY PREFLIGHT: PASS'
 
+        $deadline = [DateTime]::UtcNow.AddHours($Hours)
+        Set-ChildEnvironment 'V2_RUN_NOMINAL_END_AT' $deadline.ToString('o')
         Write-Host 'UVICORN: START'
         $stdout = Join-Path $artifactDir 'uvicorn.stdout.log'
         $stderr = Join-Path $artifactDir 'uvicorn.stderr.log'
@@ -246,7 +248,6 @@ try {
         if (-not $status.preflight_ok) { throw ('V2 runtime preflight failed: ' + ($status.preflight_blockers -join '; ')) }
         Write-Host ('V2 STARTED: PASS run_id=' + $runId)
 
-        $deadline = [DateTime]::UtcNow.AddHours($Hours)
         while ([DateTime]::UtcNow -lt $deadline) {
             Start-Sleep -Seconds 30
             if ($script:process.HasExited) {
@@ -263,14 +264,41 @@ try {
         }
 
         $null = Invoke-RestMethod "$base/v2/stop-new-entries" -Method Post -TimeoutSec 5
-        if ($OptionalGracefulShutdown) { Start-Sleep -Seconds 300 }
+        $drainComplete = $false
+        $drainTimedOut = $false
+        $drainBlockers = @()
+        while (-not $drainComplete -and -not $drainTimedOut) {
+            if ($script:process.HasExited) {
+                throw 'FastAPI exited during bounded drain reconciliation.'
+            }
+            try {
+                $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 3
+                Write-Host (
+                    "{0:u} phase={1} active={2} drain_remaining={3}" -f `
+                    [DateTime]::UtcNow,$status.run_phase,`
+                    $status.drain_active_execution_ids.Count,`
+                    $status.drain_seconds_remaining
+                )
+                $drainComplete = [string]$status.run_phase -eq 'FINISHED'
+                $drainTimedOut = [bool]$status.drain_timed_out
+                $drainBlockers = @($status.drain_safety_blockers)
+            } catch {
+                Write-Warning 'Transient drain status failure; retrying while Uvicorn is healthy.'
+            }
+            if (-not $drainComplete -and -not $drainTimedOut) {
+                Start-Sleep -Seconds 10
+            }
+        }
+        if ($drainTimedOut) {
+            Write-Warning ('Bounded drain timed out: ' + ($drainBlockers -join '; '))
+        }
         if ($OptionalForceDemoCleanup) {
             $cleanup = Invoke-RestMethod "$base/demo/cleanup" -Method Post -TimeoutSec 60
             if (-not $cleanup.live_execution_blocked) { throw 'Demo cleanup safety assertion failed.' }
         }
         $report = Invoke-RestMethod "$base/v2/report" -Method Post -TimeoutSec 30
         Stop-Uvicorn
-        $safetyResult = 'PASS'
+        $safetyResult = $(if ($drainTimedOut) { 'FAIL' } else { 'PASS' })
         try {
             Invoke-NativeCommand -FilePath $python `
                 -Arguments @('scripts\demo_kill_switch_diagnostics.py') `
@@ -283,6 +311,12 @@ try {
             -NotePropertyValue $safetyResult -Force
         $report | Add-Member -NotePropertyName final_read_only_diagnostics `
             -NotePropertyValue $(if ($safetyResult -eq 'PASS') { 'PASS' } else { 'FAIL' }) -Force
+        $report | Add-Member -NotePropertyName drain_completed `
+            -NotePropertyValue $drainComplete -Force
+        $report | Add-Member -NotePropertyName drain_timed_out `
+            -NotePropertyValue $drainTimedOut -Force
+        $report | Add-Member -NotePropertyName drain_safety_blockers `
+            -NotePropertyValue $drainBlockers -Force
         $report | ConvertTo-Json -Depth 20 | Set-Content -Encoding UTF8 (Join-Path $artifactDir 'runner-report.json')
         $functionalResult = [string]$report.functional_result
         if (-not $functionalResult) { $functionalResult = 'FAIL' }

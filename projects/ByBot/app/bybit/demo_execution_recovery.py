@@ -11,6 +11,7 @@ from app.bybit.demo_diagnostics import (
     DemoDiagnosticsError,
     ReadOnlyBybitDemoClient,
 )
+from app.bybit.demo import classify_exchange_close
 from app.db.persistence import PersistenceRepository
 from app.models import (
     DemoExecutionRecord,
@@ -59,7 +60,7 @@ class DemoExecutionDiagnosis:
 def exact_close_reconciliation_blockers(
     diagnosis: DemoExecutionDiagnosis,
 ) -> list[str]:
-    """Return fail-closed blockers for the narrow CLOSING maintenance path."""
+    """Return fail-closed blockers for an exact, authoritative full close."""
     record = diagnosis.record
     blockers = list(diagnosis.blockers)
     entry_quantity = sum(
@@ -78,29 +79,59 @@ def exact_close_reconciliation_blockers(
     if record.execution_environment != ExecutionEnvironment.BYBIT_DEMO:
         blockers.append("execution does not belong to BYBIT_DEMO")
     if record.state not in {
+        DemoExecutionState.DEMO_POSITION_OPEN,
         DemoExecutionState.DEMO_CLOSING,
+        DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
         DemoExecutionState.DEMO_CLOSED,
+        DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
     }:
-        blockers.append("durable state is not DEMO_CLOSING")
+        blockers.append("durable state cannot be terminalized from exact close evidence")
     if not record.order_id or not diagnosis.entry_order_history:
         blockers.append("exact entry order is not attributed")
     if not diagnosis.entry_executions:
         blockers.append("exact entry fill is not attributed")
     if entry_quantity <= 0 or entry_quantity != record.accepted_quantity:
         blockers.append("entry filled quantity does not equal owned quantity")
-    if not record.close_order_id or not diagnosis.close_order_history:
+    close_order_ids = {
+        str(item.get("orderId") or "")
+        for item in diagnosis.close_order_history
+        if item.get("orderId")
+    }
+    close_fill_order_ids = {
+        str(item.get("orderId") or "")
+        for item in diagnosis.close_executions
+        if item.get("orderId")
+    }
+    if not diagnosis.close_order_history or len(close_order_ids) != 1:
         blockers.append("exact close order is not attributed")
     if not diagnosis.close_executions:
         blockers.append("exact close fill is not attributed")
+    if close_order_ids != close_fill_order_ids:
+        blockers.append("close order and fill attribution disagree")
     if close_quantity <= 0 or close_quantity != record.accepted_quantity:
         blockers.append("attributed close quantity does not equal owned quantity")
     if active_symbol_position:
         blockers.append("remote position attributable to execution is not zero")
     if diagnosis.bot_owned_open_orders:
         blockers.append("bot-owned open order remains for execution")
-    if diagnosis.proposed_state != DemoExecutionState.DEMO_CLOSED:
-        blockers.append("exact close evidence does not propose DEMO_CLOSED")
+    if diagnosis.close_source in {"take_profit", "stop_loss"}:
+        if diagnosis.proposed_state != DemoExecutionState.DEMO_CLOSED:
+            blockers.append("exchange TP/SL close does not propose DEMO_CLOSED")
+    elif diagnosis.close_source == "manual_external_close":
+        if diagnosis.proposed_state != DemoExecutionState.DEMO_CLOSED_EXTERNALLY:
+            blockers.append(
+                "manual external close does not propose DEMO_CLOSED_EXTERNALLY"
+            )
+    elif diagnosis.proposed_state != DemoExecutionState.DEMO_CLOSED:
+        blockers.append("exact close source is not safely attributed")
     return list(dict.fromkeys(blockers))
+
+
+def _authoritative_close_attribution(
+    order: dict[str, Any], durable_reason: str | None,
+) -> str | None:
+    """Classify an exact exchange close from metadata, never from price."""
+    return classify_exchange_close(order, durable_reason=durable_reason)
 
 
 def diagnose_demo_execution(
@@ -258,7 +289,10 @@ def diagnose_demo_execution(
         and _decimal(item.get("closedSize") or item.get("qty"))
         == entry_qty_for_match
     ]
-    close_source: str | None = record.close_reason if close_fills else None
+    close_source: str | None = (
+        _authoritative_close_attribution(close_history[0], record.close_reason)
+        if close_fills and close_history else None
+    )
     if (
         not close_fills
         and len(external_close_orders) == 1
@@ -267,7 +301,9 @@ def diagnose_demo_execution(
     ):
         close_history = external_close_orders
         close_fills = external_close_fills
-        close_source = "external_or_exchange_triggered_reduce_only"
+        close_source = _authoritative_close_attribution(
+            close_history[0], record.close_reason
+        )
     known_links = {
         link for link in (record.order_link_id, record.close_order_link_id) if link
     }
@@ -329,15 +365,6 @@ def diagnose_demo_execution(
         net = _decimal(matching_closed_pnl[0].get("closedPnl"))
 
     proposed: DemoExecutionState | None = None
-    persisted_exact_close = bool(
-        record.close_order_id
-        and close_history
-        and close_fills
-        and all(
-            str(item.get("orderId") or "") == record.close_order_id
-            for item in [*close_history, *close_fills]
-        )
-    )
     if not record.order_id and not entry_history and not entry_fills:
         conclusion = "submitted no exchange order"
         proposed = DemoExecutionState.DEMO_NOT_SUBMITTED
@@ -353,10 +380,10 @@ def diagnose_demo_execution(
     elif entry_qty >= record.requested_quantity and close_qty >= entry_qty and not active_positions:
         conclusion = "fully filled and later closed"
         proposed = (
-            DemoExecutionState.DEMO_CLOSED
-            if persisted_exact_close
-            else DemoExecutionState.DEMO_CLOSED_EXTERNALLY
-            if close_source == "external_or_exchange_triggered_reduce_only"
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+            if close_source == "manual_external_close"
+            else DemoExecutionState.DEMO_CLOSED
+            if close_source is not None
             else DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION
         )
     elif entry_qty >= record.requested_quantity:
@@ -444,6 +471,18 @@ def apply_demo_execution_repair(
             diagnosis.close_executions[0].get("orderId") or ""
         ) or None
         record.close_reason = diagnosis.close_source or "authoritative_exchange_close"
+        record.exit_attribution = diagnosis.close_source
+        order_evidence = diagnosis.close_order_history[0]
+        record.exit_attribution_evidence = {
+            "source": "read_only_exact_close_reconciliation",
+            "order_id": record.close_order_id,
+            "stop_order_type": str(order_evidence.get("stopOrderType") or "") or None,
+            "create_type": str(order_evidence.get("createType") or "") or None,
+            "reduce_only": str(order_evidence.get("reduceOnly") or "").lower() == "true",
+            "close_on_trigger": str(order_evidence.get("closeOnTrigger") or "").lower() == "true",
+            "owned_quantity": str(record.accepted_quantity),
+        }
+        record.attribution_failure_reason = None
         record.close_fills = [
             DemoFill(
                 execution_id=str(item.get("execId") or ""),

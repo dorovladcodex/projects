@@ -660,12 +660,15 @@ def _canonical_attribution(item: dict[str, Any]) -> str:
     aliases = {
         "invalidated_setup": "strategy_exit", "runner_cleanup": "forced_cleanup",
         "protection_failure": "forced_cleanup", "exchange_close": "reconciliation_close",
+        "exchange_generated_tp": "take_profit",
+        "exchange_generated_sl": "stop_loss",
+        "external_close": "manual_external_close",
     }
     value = aliases.get(value, value)
     allowed = {
         "take_profit", "stop_loss", "strategy_exit", "stale_signal",
-        "maximum_holding_time", "reconciliation_close", "external_close",
-        "exchange_generated_tp", "exchange_generated_sl", "forced_cleanup",
+        "maximum_holding_time", "reconciliation_close", "manual_external_close",
+        "forced_cleanup",
         "unattributed_external_close",
     }
     return value if value in allowed else "unattributed_external_close"

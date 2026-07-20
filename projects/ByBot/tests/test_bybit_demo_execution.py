@@ -454,13 +454,15 @@ def _protected_restart_fixture():
             "symbol": "BTCUSDT", "orderId": "tp", "orderLinkId": "",
             "side": "Sell", "qty": "0.001", "reduceOnly": True,
             "closeOnTrigger": True, "stopOrderType": "TakeProfit",
-            "triggerPrice": "65650",
+            "createType": "CreateByTakeProfit", "positionIdx": 0,
+            "triggerDirection": 1, "triggerPrice": "65650",
         },
         {
             "symbol": "BTCUSDT", "orderId": "sl", "orderLinkId": "",
             "side": "Sell", "qty": "0.001", "reduceOnly": True,
             "closeOnTrigger": True, "stopOrderType": "StopLoss",
-            "triggerPrice": "64675",
+            "createType": "CreateByStopLoss", "positionIdx": 0,
+            "triggerDirection": 2, "triggerPrice": "64675",
         },
     ]
     return demo, repo, client, record
@@ -1598,7 +1600,8 @@ def test_direct_cleanup_cancels_only_owned_protection_and_closes_reduce_only() -
         "symbol": "BTCUSDT", "orderId": "tp", "orderLinkId": "",
         "side": "Sell", "qty": "0.001", "reduceOnly": True,
         "closeOnTrigger": True, "stopOrderType": "TakeProfit",
-        "triggerPrice": "65650",
+        "createType": "CreateByTakeProfit", "positionIdx": 0,
+        "triggerDirection": 1, "triggerPrice": "65650",
     }]
 
     demo.direct_cleanup_execution(str(record.id), "restart failed")

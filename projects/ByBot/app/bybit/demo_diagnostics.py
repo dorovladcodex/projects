@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
 import hmac
 import json
@@ -38,6 +39,12 @@ class DemoDiagnosticsConfig:
     api_key: str
     api_secret: str
     rest_url: str = DEMO_READ_ONLY_REST_URL
+    universe_symbols: tuple[str, ...] = (
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "NEARUSDT",
+        "LTCUSDT", "TONUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
+        "BONKUSDT", "FLOKIUSDT",
+    )
 
     @classmethod
     def load(
@@ -65,11 +72,18 @@ class DemoDiagnosticsConfig:
             raise DemoDiagnosticsError(
                 "read-only diagnostics require exact api-demo.bybit.com domain"
             )
+        raw_symbols = (
+            values.get("V2_UNIVERSE_SYMBOLS")
+            or file_values.get("V2_UNIVERSE_SYMBOLS")
+            or ""
+        )
+        universe_symbols = _parse_symbol_list(raw_symbols) or cls.universe_symbols
         return cls(
             database_url=database_url,
             api_key=required("BYBIT_API_KEY"),
             api_secret=required("BYBIT_API_SECRET"),
             rest_url=rest_url,
+            universe_symbols=universe_symbols,
         )
 
 
@@ -215,6 +229,11 @@ class DemoDiagnosticsResult:
     latest_order_history: list[dict[str, Any]]
     latest_execution_events: list[dict[str, Any]]
     newest_execution: DemoExecutionRecord | None
+    bot_owned_entry_orders: list[dict[str, Any]]
+    bot_owned_close_orders: list[dict[str, Any]]
+    bot_owned_tp_orders: list[dict[str, Any]]
+    bot_owned_sl_orders: list[dict[str, Any]]
+    position_ownership: dict[str, list[str]]
 
     @property
     def passed(self) -> bool:
@@ -468,23 +487,61 @@ def run_demo_diagnostics(
         if len(link.rsplit("-", 2)) == 3
     }
     remote_orders = read_client.get_open_orders()
-    bot_orders = [
-        item for item in remote_orders
-        if _is_bot_owned_order(item, known_links, stored_prefixes)
-    ]
-    unrelated_orders = [item for item in remote_orders if item not in bot_orders]
-
-    positions: dict[str, dict[str, str]] = {}
+    positions: dict[str, dict[str, str]] = {
+        symbol: {
+            "size": "0", "side": "", "position_idx": "0",
+            "take_profit": "", "stop_loss": "",
+        }
+        for symbol in config.universe_symbols
+    }
     active_position_symbols: set[str] = set()
-    for symbol in (Symbol.BTCUSDT, Symbol.ETHUSDT):
-        rows = read_client.get_positions(symbol)
+    configured = set(config.universe_symbols)
+    configured.update(item.symbol.value for item in unresolved)
+    if hasattr(read_client, "get_usdt_positions"):
+        position_rows = read_client.get_usdt_positions()
+    else:
+        position_rows = [
+            row
+            for symbol_value in sorted(configured)
+            for row in read_client.get_positions(Symbol(symbol_value))
+        ]
+    for symbol_value in sorted(configured):
+        rows = [
+            item for item in position_rows
+            if str(item.get("symbol") or "") == symbol_value
+        ]
         active = next((item for item in rows if _positive(item.get("size"))), None)
-        positions[symbol.value] = {
+        positions[symbol_value] = {
             "size": str((active or {}).get("size") or "0"),
             "side": str((active or {}).get("side") or ""),
+            "position_idx": str((active or {}).get("positionIdx") or "0"),
+            "take_profit": str((active or {}).get("takeProfit") or ""),
+            "stop_loss": str((active or {}).get("stopLoss") or ""),
         }
         if active:
-            active_position_symbols.add(symbol.value)
+            active_position_symbols.add(symbol_value)
+
+    classified = classify_demo_open_orders(
+        remote_orders, executions, positions, known_links, stored_prefixes
+    )
+    bot_entry_orders = classified["entry"]
+    bot_close_orders = classified["close"]
+    bot_tp_orders = classified["take_profit"]
+    bot_sl_orders = classified["stop_loss"]
+    bot_orders = [
+        *bot_entry_orders, *bot_close_orders, *bot_tp_orders, *bot_sl_orders,
+    ]
+    unrelated_orders = classified["unrelated"]
+    position_ownership = {
+        symbol: [
+            str(item.id) for item in unresolved
+            if item.symbol.value == symbol
+            and _decimal_value(positions[symbol]["size"]) == item.accepted_quantity
+            and positions[symbol]["side"].upper()
+            == ("BUY" if item.side.value == "BUY" else "SELL")
+        ]
+        for symbol in active_position_symbols
+    }
 
     failures: list[str] = []
     if bot_orders:
@@ -516,6 +573,11 @@ def run_demo_diagnostics(
         latest_order_history=order_history,
         latest_execution_events=execution_events,
         newest_execution=newest,
+        bot_owned_entry_orders=bot_entry_orders,
+        bot_owned_close_orders=bot_close_orders,
+        bot_owned_tp_orders=bot_tp_orders,
+        bot_owned_sl_orders=bot_sl_orders,
+        position_ownership=position_ownership,
     )
 
 
@@ -535,10 +597,27 @@ def format_demo_diagnostics(result: DemoDiagnosticsResult) -> str:
         "ACTIVE INCIDENT EXECUTION ID: " + (str(latest.id) if latest else "none"),
         "LATEST DEMO FAILURE REASON: " + ((latest.failure_reason or "none") if latest else "none"),
         "LATEST DEMO CLEANUP RESULT: " + ((latest.cleanup_result or "none") if latest else "none"),
+        f"REMOTE BOT-OWNED ENTRY ORDERS: {len(result.bot_owned_entry_orders)}",
+        f"REMOTE BOT-OWNED CLOSE ORDERS: {len(result.bot_owned_close_orders)}",
+        f"REMOTE BOT-OWNED TP ORDERS: {len(result.bot_owned_tp_orders)}",
+        f"REMOTE BOT-OWNED SL ORDERS: {len(result.bot_owned_sl_orders)}",
         f"REMOTE BOT-OWNED OPEN ORDERS: {len(result.bot_owned_open_orders)}",
         f"REMOTE UNRELATED OPEN ORDERS: {len(result.unrelated_open_orders)}",
-        "REMOTE BTCUSDT POSITION: " + json.dumps(result.positions["BTCUSDT"]),
-        "REMOTE ETHUSDT POSITION: " + json.dumps(result.positions["ETHUSDT"]),
+        "REMOTE SYMBOLS CHECKED: " + ", ".join(sorted(result.positions)),
+        "REMOTE NON-ZERO POSITIONS: " + (
+            json.dumps({
+                symbol: {
+                    **position,
+                    "execution_ids": result.position_ownership.get(symbol, []),
+                }
+                for symbol, position in result.positions.items()
+                if _positive(position.get("size"))
+            }, sort_keys=True) or "none"
+        ),
+        "REMOTE ORDERS BY SYMBOL AND OWNERSHIP: "
+        + json.dumps(_orders_by_symbol_and_ownership(result), sort_keys=True),
+        "UNRESOLVED EXECUTION OWNERSHIP: "
+        + json.dumps(_unresolved_execution_ownership(result), sort_keys=True),
         "UNRESOLVED DURABLE EXECUTIONS: "
         + (", ".join(str(item.id) for item in result.unresolved_executions) or "none"),
         "READ-ONLY DIAGNOSTICS: " + ("PASS" if result.passed else "FAIL"),
@@ -602,6 +681,184 @@ def _is_bot_owned_order(
     link = str(item.get("orderLinkId") or "")
     return bool(
         link and (link in known_links or any(link.startswith(p) for p in stored_prefixes))
+    )
+
+
+def classify_demo_open_orders(
+    orders: list[dict[str, Any]],
+    executions: list[DemoExecutionRecord],
+    positions: dict[str, dict[str, str]],
+    known_links: set[str] | None = None,
+    stored_prefixes: set[str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Classify every order once using exact IDs or full protection evidence."""
+
+    result = {
+        "entry": [], "close": [], "take_profit": [], "stop_loss": [],
+        "unrelated": [],
+    }
+    links = known_links or set()
+    prefixes = stored_prefixes or set()
+    for order in orders:
+        order_id = str(order.get("orderId") or "")
+        order_link = str(order.get("orderLinkId") or "")
+        if any(
+            (order_id and order_id == item.order_id)
+            or (order_link and order_link == item.order_link_id)
+            for item in executions
+        ):
+            result["entry"].append(order)
+            continue
+        if any(
+            (order_id and order_id == item.close_order_id)
+            or (order_link and order_link == item.close_order_link_id)
+            for item in executions
+        ):
+            result["close"].append(order)
+            continue
+        exact_tp = [item for item in executions if order_id and item.tp_order_id == order_id]
+        exact_sl = [item for item in executions if order_id and item.sl_order_id == order_id]
+        if len(exact_tp) == 1:
+            result["take_profit"].append(order)
+            continue
+        if len(exact_sl) == 1:
+            result["stop_loss"].append(order)
+            continue
+        matches = [
+            item for item in executions
+            if item.state not in RESOLVED_STATES
+            and _matches_generated_protection(order, item, positions)
+        ]
+        if len(matches) == 1:
+            key = (
+                "take_profit"
+                if str(order.get("stopOrderType") or "") == "TakeProfit"
+                else "stop_loss"
+            )
+            result[key].append(order)
+            continue
+        if _is_bot_owned_order(order, links, prefixes):
+            result["entry"].append(order)
+            continue
+        result["unrelated"].append(order)
+    return result
+
+
+def _matches_generated_protection(
+    order: dict[str, Any],
+    execution: DemoExecutionRecord,
+    positions: dict[str, dict[str, str]],
+) -> bool:
+    symbol = execution.symbol.value
+    position = positions.get(symbol) or {}
+    stop_type = str(order.get("stopOrderType") or "")
+    if stop_type not in {"TakeProfit", "StopLoss"}:
+        return False
+    if str(order.get("createType") or "") != (
+        "CreateByTakeProfit" if stop_type == "TakeProfit" else "CreateByStopLoss"
+    ):
+        return False
+    if str(order.get("symbol") or "") != symbol:
+        return False
+    if str(order.get("side") or "").upper() != (
+        "SELL" if execution.side.value == "BUY" else "BUY"
+    ):
+        return False
+    if str(order.get("reduceOnly") or "").lower() != "true":
+        return False
+    if str(order.get("closeOnTrigger") or "").lower() != "true":
+        return False
+    position_idx = int(order.get("positionIdx") or 0)
+    if position_idx != execution.protection_position_idx:
+        return False
+    if position_idx != int(position.get("position_idx") or 0):
+        return False
+    if _decimal_value(order.get("qty")) != execution.accepted_quantity:
+        return False
+    if _decimal_value(position.get("size")) != execution.accepted_quantity:
+        return False
+    if str(position.get("side") or "").upper() != (
+        "BUY" if execution.side.value == "BUY" else "SELL"
+    ):
+        return False
+    expected_trigger = (
+        execution.take_profit if stop_type == "TakeProfit" else execution.stop_loss
+    )
+    if expected_trigger is None or _decimal_value(
+        order.get("triggerPrice")
+    ) != expected_trigger:
+        return False
+    return (
+        execution.take_profit is not None
+        and execution.stop_loss is not None
+        and _decimal_value(position.get("take_profit")) == execution.take_profit
+        and _decimal_value(position.get("stop_loss")) == execution.stop_loss
+    )
+
+
+def _orders_by_symbol_and_ownership(
+    result: DemoDiagnosticsResult,
+) -> dict[str, dict[str, list[str]]]:
+    groups: dict[str, dict[str, list[str]]] = {}
+    for label, rows in (
+        ("entry", result.bot_owned_entry_orders),
+        ("close", result.bot_owned_close_orders),
+        ("take_profit", result.bot_owned_tp_orders),
+        ("stop_loss", result.bot_owned_sl_orders),
+        ("unrelated", result.unrelated_open_orders),
+    ):
+        for row in rows:
+            symbol = str(row.get("symbol") or "UNKNOWN")
+            groups.setdefault(symbol, {}).setdefault(label, []).append(
+                str(row.get("orderId") or "unknown")
+            )
+    return groups
+
+
+def _unresolved_execution_ownership(
+    result: DemoDiagnosticsResult,
+) -> dict[str, dict[str, Any]]:
+    tp_ids = {
+        str(item.get("orderId") or "") for item in result.bot_owned_tp_orders
+    }
+    sl_ids = {
+        str(item.get("orderId") or "") for item in result.bot_owned_sl_orders
+    }
+    return {
+        str(item.id): {
+            "symbol": item.symbol.value,
+            "state": item.state.value,
+            "position_owned": str(item.id) in result.position_ownership.get(
+                item.symbol.value, []
+            ),
+            "protection_confirmed": item.protection_confirmed,
+            "tp_order_id": item.tp_order_id,
+            "sl_order_id": item.sl_order_id,
+            "tp_order_open": bool(item.tp_order_id and item.tp_order_id in tp_ids),
+            "sl_order_open": bool(item.sl_order_id and item.sl_order_id in sl_ids),
+        }
+        for item in result.unresolved_executions
+    }
+
+
+def _decimal_value(value: object) -> Decimal:
+    try:
+        return Decimal(str(value or "0"))
+    except (InvalidOperation, ValueError):
+        raise DemoDiagnosticsError("Bybit returned an invalid numeric value")
+
+
+def _parse_symbol_list(value: str) -> tuple[str, ...]:
+    if not value:
+        return ()
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return tuple(str(item).upper() for item in parsed if str(item).strip())
+    except json.JSONDecodeError:
+        pass
+    return tuple(
+        item.strip().upper() for item in value.split(",") if item.strip()
     )
 
 

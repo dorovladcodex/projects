@@ -39,8 +39,11 @@ class Repo:
 
 
 class ReadClient:
-    def __init__(self, *, close=True, position_size="0", orders=None):
+    def __init__(
+        self, *, close=True, close_kind="manual", position_size="0", orders=None
+    ):
         self.close = close
+        self.close_kind = close_kind
         self.position_size = position_size
         self.orders = list(orders or [])
 
@@ -55,6 +58,17 @@ class ReadClient:
             "createdTime": "1000", "updatedTime": "1000",
         }]
         if self.close:
+            metadata = {
+                "manual": {"createType": "CreateByClosing"},
+                "take_profit": {
+                    "stopOrderType": "TakeProfit",
+                    "createType": "CreateByTakeProfit",
+                },
+                "stop_loss": {
+                    "stopOrderType": "StopLoss",
+                    "createType": "CreateByStopLoss",
+                },
+            }[self.close_kind]
             rows.append({
                 "symbol": symbol.value,
                 "orderId": "external-close", "orderLinkId": "",
@@ -62,6 +76,7 @@ class ReadClient:
                 "cumExecQty": "0.001", "avgPrice": "110",
                 "reduceOnly": True, "closeOnTrigger": True,
                 "createdTime": "2000", "updatedTime": "2000",
+                **metadata,
             })
         return rows
 
@@ -119,8 +134,31 @@ def test_remote_flat_with_attributable_external_close() -> None:
         config(), str(item.id), repository=Repo(item), client=ReadClient()
     )
     assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY
-    assert diagnosis.close_source == "external_or_exchange_triggered_reduce_only"
+    assert diagnosis.close_source == "manual_external_close"
     assert diagnosis.net_realized_pnl == Decimal("-0.02")
+    assert exact_close_reconciliation_blockers(diagnosis) == []
+
+
+def test_take_profit_can_terminalize_directly_from_position_open() -> None:
+    item = record()
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=Repo(item),
+        client=ReadClient(close_kind="take_profit"),
+    )
+    assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED
+    assert diagnosis.close_source == "take_profit"
+    assert exact_close_reconciliation_blockers(diagnosis) == []
+
+
+def test_stop_loss_can_terminalize_directly_from_position_open() -> None:
+    item = record()
+    diagnosis = diagnose_demo_execution(
+        config(), str(item.id), repository=Repo(item),
+        client=ReadClient(close_kind="stop_loss"),
+    )
+    assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED
+    assert diagnosis.close_source == "stop_loss"
+    assert exact_close_reconciliation_blockers(diagnosis) == []
 
 
 def test_remote_flat_without_attributable_close_has_no_fabricated_values() -> None:
@@ -152,7 +190,8 @@ def test_bybit_generated_protection_is_owned_only_on_full_match() -> None:
         "symbol": "BTCUSDT", "side": "Sell", "qty": "0.001",
         "reduceOnly": True, "closeOnTrigger": True,
         "stopOrderType": "TakeProfit", "triggerPrice": "110",
-        "orderLinkId": "",
+        "createType": "CreateByTakeProfit", "positionIdx": 0,
+        "triggerDirection": 1, "orderLinkId": "",
     }
     assert _is_owned_bybit_protection_order(protection, item, position)
     assert not _is_owned_bybit_protection_order(
@@ -219,7 +258,8 @@ def test_exact_persisted_close_reconciles_to_demo_closed() -> None:
     })
     repo = Repo(item)
     diagnosis = diagnose_demo_execution(
-        config(), str(item.id), repository=repo, client=ReadClient()
+        config(), str(item.id), repository=repo,
+        client=ReadClient(close_kind="stop_loss")
     )
 
     assert diagnosis.proposed_state == DemoExecutionState.DEMO_CLOSED
@@ -228,7 +268,8 @@ def test_exact_persisted_close_reconciles_to_demo_closed() -> None:
     repaired, events, _ = repo.repaired
     assert repaired.state == DemoExecutionState.DEMO_CLOSED
     assert repaired.failure_reason is None
-    assert repaired.close_reason == "exchange_generated_sl"
+    assert repaired.close_reason == "stop_loss"
+    assert repaired.exit_attribution == "stop_loss"
     assert repaired.closed_at == datetime.fromtimestamp(2, tz=timezone.utc)
     assert events == [
         "READ_ONLY_RECONCILIATION_COMPLETED",

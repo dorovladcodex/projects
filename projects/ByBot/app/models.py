@@ -195,6 +195,10 @@ class DemoExecutionRecord(BaseModel):
     position_data_stale_protection_confirmed: bool | None = None
     tp_identifier: str | None = None
     sl_identifier: str | None = None
+    tp_order_id: str | None = None
+    sl_order_id: str | None = None
+    protection_position_idx: int = 0
+    protection_orders_verified_at: datetime | None = None
     protection_confirmed: bool = False
     close_order_link_id: str | None = None
     close_order_id: str | None = None

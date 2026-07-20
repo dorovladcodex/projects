@@ -17,6 +17,7 @@ from app.config import Settings
 from app.models import Symbol
 from app.news.service import NewsService
 from app.v2.analytics import V2ReportGenerator
+from app.v2.drain import V2DrainController, V2RunPhase
 from app.v2.execution import V2ExecutionCoordinator
 from app.v2.market import (
     BybitPublicWebSocketEngine, BybitRestMetricsPoller, RollingFeatureEngine,
@@ -67,6 +68,11 @@ class V2Runtime:
         self.last_cycle_at: datetime | None = None
         self.last_error: str | None = None
         self.stop_new_entries = False
+        self.drain = V2DrainController(
+            settings.v2_run_nominal_end_at,
+            lead_seconds=settings.v2_drain_lead_seconds,
+            timeout_seconds=settings.v2_drain_timeout_seconds,
+        )
         self.cycles = 0
         self._last_rest_poll_at: datetime | None = None
         self._execution_pools: dict[Symbol, ThreadPoolExecutor] = {}
@@ -197,6 +203,7 @@ class V2Runtime:
     async def cycle(self) -> None:
         if not self.settings.v2_enabled:
             return
+        self._update_drain_state()
         cycle_id = f"{self.run_id}:{self.cycles + 1}"
         cycle_failures_before = sum(self.failure_occurrences.values())
         now = datetime.now(timezone.utc)
@@ -232,6 +239,7 @@ class V2Runtime:
             if sum(self.failure_occurrences.values()) > cycle_failures_before else None
         )
         self._persist_runtime_metrics()
+        self._update_drain_state()
         self._refresh_status_snapshot()
 
     def refresh_universe_if_due(self) -> None:
@@ -242,6 +250,8 @@ class V2Runtime:
             self.universe.refresh(now=now)
 
     async def _process_news(self, cycle_id: str) -> None:
+        if self.stop_new_entries:
+            return
         executable: list[V2SignalCandidate] = []
         self._increment(
             self.strategy_evaluation_counts, StrategyName.NEWS_MOMENTUM_V2.value
@@ -882,6 +892,9 @@ class V2Runtime:
             source_metric[key] = int(source_metric.get(key) or 0) + 1
 
     def _runtime_metrics_payload(self) -> dict[str, Any]:
+        drain_status = self.drain.evaluate(
+            active_execution_ids=self._active_execution_ids()
+        )
         return {
             "accepted_symbols": [symbol.value for symbol in self.universe.accepted_symbols],
             "enabled_strategies": [
@@ -891,6 +904,25 @@ class V2Runtime:
             "strategy_evaluation_counts": self.strategy_evaluation_counts,
             "strategy_not_applicable_counts": self.strategy_not_applicable_counts,
             "signal_metrics": self._signal_metrics_snapshot(),
+            "run_finalization": {
+                "phase": drain_status.phase.value,
+                "nominal_end_at": (
+                    drain_status.nominal_end_at.isoformat()
+                    if drain_status.nominal_end_at else None
+                ),
+                "drain_started_at": (
+                    drain_status.drain_started_at.isoformat()
+                    if drain_status.drain_started_at else None
+                ),
+                "drain_deadline_at": (
+                    drain_status.drain_deadline_at.isoformat()
+                    if drain_status.drain_deadline_at else None
+                ),
+                "timed_out": drain_status.timed_out,
+                "active_execution_ids": list(
+                    drain_status.active_execution_ids
+                ),
+            },
             "failure_occurrences": self.failure_occurrences,
             "news_metrics": self.news_metrics,
             "news_source_metrics": self.news_aggregator.source_metrics,
@@ -990,6 +1022,7 @@ class V2Runtime:
                 )
 
     def _build_status_snapshot(self) -> dict[str, Any]:
+        drain_status = self._update_drain_state()
         preflight = self.execution.safety_preflight(require_auto_execution=False)
         active_reservations = [row for row in self.portfolio.reservations if row.state in self.portfolio.ACTIVE]
         accepted = [item.value for item in self.universe.accepted_symbols]
@@ -1009,6 +1042,34 @@ class V2Runtime:
             "last_cycle_at": self.last_cycle_at.isoformat() if self.last_cycle_at else None,
             "last_error": self.last_error, "cycles": self.cycles,
             "stop_new_entries": self.stop_new_entries,
+            "run_phase": drain_status.phase.value,
+            "entries_allowed": drain_status.entries_allowed,
+            "nominal_end_at": (
+                drain_status.nominal_end_at.isoformat()
+                if drain_status.nominal_end_at else None
+            ),
+            "drain_started_at": (
+                drain_status.drain_started_at.isoformat()
+                if drain_status.drain_started_at else None
+            ),
+            "drain_deadline_at": (
+                drain_status.drain_deadline_at.isoformat()
+                if drain_status.drain_deadline_at else None
+            ),
+            "seconds_until_drain": drain_status.seconds_until_drain,
+            "seconds_until_nominal_end": drain_status.seconds_until_nominal_end,
+            "drain_seconds_remaining": drain_status.drain_seconds_remaining,
+            "drain_timed_out": drain_status.timed_out,
+            "drain_active_execution_ids": list(
+                drain_status.active_execution_ids
+            ),
+            "drain_safety_blockers": (
+                [
+                    "drain timeout expired with unresolved executions: "
+                    + ", ".join(drain_status.active_execution_ids)
+                ]
+                if drain_status.timed_out else []
+            ),
             "preflight_ok": not preflight, "preflight_blockers": preflight,
             "accepted_symbols": accepted,
             "rejected_symbols": [
@@ -1155,6 +1216,39 @@ class V2Runtime:
         for executor in self._execution_pools.values():
             executor.shutdown(wait=False, cancel_futures=False)
         return report
+
+    def begin_draining(self) -> dict[str, Any]:
+        self.stop_new_entries = True
+        status = self.drain.force_draining()
+        self._persist_runtime_metrics()
+        self._refresh_status_snapshot()
+        return {
+            "run_id": self.run_id,
+            "run_phase": status.phase.value,
+            "new_entries_stopped": True,
+            "existing_position_management_active": True,
+        }
+
+    def _active_execution_ids(self) -> list[str]:
+        terminal = {
+            "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE", "DEMO_FAILED",
+            "DEMO_NOT_SUBMITTED", "DEMO_ORDER_CANCELLED",
+            "DEMO_CLOSED_AFTER_INTERRUPTION", "DEMO_CLOSED_EXTERNALLY",
+            "DEMO_FAILED_FLAT_VERIFIED",
+        }
+        return [
+            str(item.id)
+            for item in self.repository.load_demo_executions()
+            if item.run_id == self.run_id and item.state.value not in terminal
+        ]
+
+    def _update_drain_state(self) -> Any:
+        status = self.drain.evaluate(
+            active_execution_ids=self._active_execution_ids()
+        )
+        if status.phase != V2RunPhase.RUNNING:
+            self.stop_new_entries = True
+        return status
 
 
 async def v2_cycle_loop(runtime: V2Runtime, interval_seconds: int = 5) -> None:
