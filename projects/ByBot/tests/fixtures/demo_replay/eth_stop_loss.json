@@ -1,0 +1,17 @@
+{
+  "execution_id": "8dcc66ac-1e2b-411d-ad17-bd71b7f0c404",
+  "run_id": "demo-v2-20260720T161242643Z",
+  "symbol": "ETHUSDT",
+  "side": "BUY",
+  "entry_order_id": "31115cae-c193-477a-8825-a163a71db4a8",
+  "order_link_id": "bybot-63b741-e-7e481d878e73f02c0fe9",
+  "close_order_id": "f953d9e5-ee1d-41e5-917e-6ef624c76800",
+  "entry_execution_id": "627fb5c0-c8d9-47d6-a307-27cf6e854be1",
+  "close_execution_id": "2be0fac7-24db-4341-84a0-618e7125d36b",
+  "quantity": "0.03",
+  "entry_price": "1917.31",
+  "close_price": "1912.54",
+  "entry_fee": "0.03163562",
+  "close_fee": "0.03155691",
+  "close_source": "stop_loss"
+}

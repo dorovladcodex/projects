@@ -189,6 +189,8 @@ class Settings(BaseSettings):
     max_trades_per_day: int = Field(default=100, ge=1, le=10000)
     v2_symbol_cooldown_seconds: int = Field(default=300, ge=0, le=86400)
     v2_global_entry_cooldown_seconds: int = Field(default=0, ge=0, le=86400)
+    v2_terminalization_warning_seconds: int = Field(default=30, ge=1, le=3600)
+    v2_terminalization_hard_failure_seconds: int = Field(default=120, ge=2, le=7200)
 
     risk_capital_usdt: Decimal = Field(default=Decimal("2000"), gt=0)
     max_total_notional_usdt: Decimal = Field(default=Decimal("500"), gt=0)
@@ -345,6 +347,13 @@ class Settings(BaseSettings):
         read-only inspection.  The credential, domain and explicit authorization
         checks belong to the mutation guard in ``app.bybit.demo``.
         """
+        if (
+            self.v2_terminalization_warning_seconds
+            >= self.v2_terminalization_hard_failure_seconds
+        ):
+            raise ValueError(
+                "V2 terminalization warning threshold must be below hard failure threshold"
+            )
         if self.execution_mode != ExecutionMode.BYBIT_DEMO:
             if self.demo_canary_enabled:
                 raise ValueError("DEMO_CANARY_ENABLED requires BYBIT_DEMO execution mode")

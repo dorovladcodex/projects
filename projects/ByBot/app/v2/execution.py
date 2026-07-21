@@ -186,7 +186,7 @@ class V2ExecutionCoordinator:
         compatibility = self._persist_compatibility_candidate(candidate, quantity, notional)
         if compatibility is None:
             self.portfolio.release(reservation.id, activate_cooldown=False)
-            return self._blocked(candidate, "durable execution candidate could not be persisted")
+            return self._persistence_blocked(candidate)
         result, classification = compatibility
         candidate.risk_approved_at = datetime.now(timezone.utc)
         candidate.execution_dispatched_at = datetime.now(timezone.utc)
@@ -273,7 +273,11 @@ class V2ExecutionCoordinator:
         sentiment = "BULLISH" if candidate.side == StrategySide.LONG else "BEARISH"
         news = NewsItem(
             id=news_id, title=f"{candidate.strategy_name.value} {candidate.symbol.value}",
-            summary=candidate.entry_reason, source="bybot-v2-deterministic-strategy",
+            # This is an execution compatibility record, not a deduplicated
+            # external news event. Include the durable candidate identity so
+            # repeated strategy setups across runs cannot share a content hash.
+            summary=f"{candidate.entry_reason} [candidate_id={candidate.id}]",
+            source="bybot-v2-deterministic-strategy",
             published_at=candidate.created_at, received_at=now, asset_hint=asset,
             importance=float(candidate.confidence),
         )
@@ -320,24 +324,37 @@ class V2ExecutionCoordinator:
             max_allowed_notional=float(notional), estimated_fees=float(fees),
             estimated_slippage=float(slippage), reasons=[],
         )
-        if not self.repository.save_news(news):
-            existing = self.repository.load_news()[0]
-            if not any(item.id == news.id for item in existing):
-                return None
-        self.repository.save_classification(news, classification, candidate.strategy_version, now + timedelta(days=1))
         result = SignalDryRunResult(candidate=v1_candidate, risk_preview=SignalRiskPreview())
-        self.repository.save_signal_result(result)
-        risk_id = self.repository.save_risk_decision(str(candidate.id), decision)
+        risk_id = self.repository.persist_v2_compatibility_bundle(
+            news,
+            classification,
+            result,
+            decision,
+            classifier_version=candidate.strategy_version,
+            cache_expires_at=now + timedelta(days=1),
+        )
         if risk_id is None:
             return None
-        result.risk_preview = SignalRiskPreview(
-            preview_performed=True, approved=True, capped_size=float(quantity),
-            position_notional=float(notional), max_allowed_notional=float(notional),
-            rejection_reasons=[], risk_decision_id=risk_id,
-            estimated_fees=float(fees), estimated_slippage=float(slippage),
-        )
-        self.repository.save_signal_result(result)
         return result, classification
+
+    def _persistence_blocked(self, candidate: V2SignalCandidate) -> dict[str, Any]:
+        error_code = self.repository.last_error_code or "DB_COMPATIBILITY_BUNDLE_FAILED"
+        reason = "durable execution candidate could not be persisted"
+        candidate.state = "PERSISTENCE_BLOCKED"
+        candidate.rejection_reason = reason
+        self.repository.save_v2_signal_candidate(candidate)
+        self.last_error = f"{reason} ({error_code})"
+        return {
+            "execution_attempted": False,
+            "candidate_id": str(candidate.id),
+            "state": candidate.state,
+            "reason": reason,
+            "rejection_code": error_code,
+            "processing_stage": "compatibility_persistence",
+            "handled_persistence_rejection": True,
+            "exchange_environment": "BYBIT_DEMO",
+            "exchange_order_submitted": False,
+        }
 
     def _blocked(self, candidate: V2SignalCandidate, reason: str) -> dict[str, Any]:
         candidate.state = "EXECUTION_BLOCKED"

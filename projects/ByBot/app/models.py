@@ -204,6 +204,7 @@ class DemoExecutionRecord(BaseModel):
     close_order_id: str | None = None
     close_fills: list[DemoFill] = Field(default_factory=list)
     average_close_price: Decimal | None = Field(default=None, gt=0)
+    gross_realized_pnl: Decimal | None = None
     realized_exchange_pnl: Decimal | None = None
     maximum_favorable_excursion: Decimal = Decimal("0")
     maximum_adverse_excursion: Decimal = Decimal("0")
@@ -217,6 +218,9 @@ class DemoExecutionRecord(BaseModel):
     failure_reason: str | None = None
     cleanup_result: str | None = None
     last_reconciliation_at: datetime | None = None
+    terminalization_warning_at: datetime | None = None
+    terminalization_hard_failure_at: datetime | None = None
+    terminalization_blockers: list[str] = Field(default_factory=list)
     last_error: str | None = None
     signal_created_at: datetime | None = None
     candidate_persisted_at: datetime | None = None

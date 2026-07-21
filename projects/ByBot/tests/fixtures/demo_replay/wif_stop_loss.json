@@ -1,0 +1,17 @@
+{
+  "execution_id": "4f3f19db-cb7f-4f6a-bc31-e3612004d8d8",
+  "run_id": "demo-v2-20260720T161242643Z",
+  "symbol": "WIFUSDT",
+  "side": "SELL",
+  "entry_order_id": "1c6c6e48-ede6-49f7-b07c-6a4d7dd27bad",
+  "order_link_id": "bybot-63b741-e-6fe490b8d94f1df37cd4",
+  "close_order_id": "eec57557-8515-4daa-886b-e433cb46683e",
+  "entry_execution_id": "07a936c3-3c9b-40a3-bc4b-7d09b945c096",
+  "close_execution_id": "bb7c5bac-3ae4-42ef-b107-01b9e216011d",
+  "quantity": "160",
+  "entry_price": "0.15572",
+  "close_price": "0.1561",
+  "entry_fee": "0.01370336",
+  "close_fee": "0.0137368",
+  "close_source": "stop_loss"
+}

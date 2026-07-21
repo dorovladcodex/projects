@@ -77,6 +77,13 @@ class V2Runtime:
         self._last_rest_poll_at: datetime | None = None
         self._execution_pools: dict[Symbol, ThreadPoolExecutor] = {}
         restored = repository.load_v2_run_runtime(run_id) if hasattr(repository, "load_v2_run_runtime") else {}
+        self.run_valid = bool(restored.get("run_valid", True))
+        self.run_invalid_reasons: list[str] = list(
+            restored.get("run_invalid_reasons") or []
+        )
+        self._terminalization_incident_ids: set[str] = set(
+            restored.get("terminalization_incident_ids") or []
+        )
         self.last_news_model_usage: NewsModelUsage | None = None
         restored_usage = restored.get("last_news_model_usage")
         if restored_usage:
@@ -106,6 +113,7 @@ class V2Runtime:
                 "risk_rejections": 0,
                 "portfolio_rejections": 0,
                 "pre_execution_admissions": 0,
+                "persistence_rejections": 0,
                 "execution_policy_rejections": 0,
                 "cooldown_rejections": 0,
                 "admitted_signals": 0,
@@ -228,6 +236,7 @@ class V2Runtime:
         except Exception as exc:
             self._record_failure(exc, stage="news_pipeline", cycle_id=cycle_id)
         try:
+            self._enforce_terminalization_invariants()
             self._sync_reservations()
             self._monitor_positions()
         except Exception as exc:
@@ -238,9 +247,9 @@ class V2Runtime:
             "cycle contained isolated failures"
             if sum(self.failure_occurrences.values()) > cycle_failures_before else None
         )
-        self._persist_runtime_metrics()
+        await asyncio.to_thread(self._persist_runtime_metrics)
         self._update_drain_state()
-        self._refresh_status_snapshot()
+        await asyncio.to_thread(self._refresh_status_snapshot)
 
     def refresh_universe_if_due(self) -> None:
         now = datetime.now(timezone.utc)
@@ -282,6 +291,9 @@ class V2Runtime:
             if row.name == StrategyName.NEWS_MOMENTUM_V2
         )
         for item, symbols, _fingerprint in rows:
+            # Large feed batches must leave scheduling points for status and
+            # shutdown requests while synchronous persistence is in progress.
+            await asyncio.sleep(0)
             decision: dict[str, Any] = {
                 "news_id": str(item.id), "llm_used": False, "model": None,
                 "sentiment": None, "importance": item.importance,
@@ -381,6 +393,7 @@ class V2Runtime:
             if source_metric is not None:
                 source_metric["trade_eligible_items"] = source_metric.get("trade_eligible_items", 0) + 1
             for symbol in symbols:
+                await asyncio.sleep(0)
                 if symbol not in self.universe.accepted_symbols:
                     decision["market_confirmation_result"][symbol.value] = "symbol_not_accepted"
                     continue
@@ -438,6 +451,9 @@ class V2Runtime:
             return
         dispatches: list[tuple[V2SignalCandidate, asyncio.Future[Any]]] = []
         for symbol in self.universe.accepted_symbols:
+            # Candidate persistence is synchronous and can involve multiple DB
+            # round trips. Cooperatively yield between full-universe items.
+            await asyncio.sleep(0)
             metric = self._symbol_metric(symbol)
             metric["cycles_attempted"] += 1
             symbol_failed = False
@@ -458,6 +474,7 @@ class V2Runtime:
             metric["latest_feature_timestamp"] = feature.timestamp.isoformat()
             self._update_liquidation_symbol_status(feature)
             for strategy in self.strategies:
+                await asyncio.sleep(0)
                 if not strategy.enabled or strategy.name == StrategyName.NEWS_MOMENTUM_V2:
                     continue
                 if not strategy.applies_to(symbol):
@@ -649,8 +666,59 @@ class V2Runtime:
                 )
             elif isinstance(result, dict) and result.get("handled_policy_rejection"):
                 self._record_execution_policy_rejection(candidate, result)
+            elif isinstance(result, dict) and result.get("handled_persistence_rejection"):
+                self._record_execution_persistence_rejection(candidate, result)
             elif isinstance(result, dict) and result.get("execution_id"):
                 self._record_signal_metric("admitted_signals", candidate)
+
+    def _record_execution_persistence_rejection(
+        self,
+        candidate: V2SignalCandidate,
+        result: dict[str, Any],
+    ) -> None:
+        occurred_at = datetime.now(timezone.utc)
+        error_code = str(result.get("rejection_code") or "DB_COMPATIBILITY_BUNDLE_FAILED")
+        self._record_signal_metric("persistence_rejections", candidate)
+        reason = "execution compatibility persistence failed"
+        if reason not in self.run_invalid_reasons:
+            self.run_invalid_reasons.append(reason)
+        self.run_valid = False
+        incident = V2Incident(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"bybot-v2-persistence-rejection:{self.run_id}:{candidate.id}",
+            ),
+            run_id=self.run_id,
+            event_type="EXECUTION_PERSISTENCE_REJECTED",
+            symbol=candidate.symbol,
+            candidate_id=candidate.id,
+            error_category=error_code,
+            payload={
+                "candidate_id": str(candidate.id),
+                "symbol": candidate.symbol.value,
+                "strategy": candidate.strategy_name.value,
+                "processing_stage": "compatibility_persistence",
+                "error_code": error_code,
+                "exchange_mutation_performed": False,
+            },
+            occurred_at=occurred_at,
+        )
+        self.repository.save_v2_incident(incident)
+        self.logger.error(
+            "V2 execution compatibility persistence rejected candidate: %s",
+            error_code,
+            extra={
+                "event_timestamp": occurred_at,
+                "run_id": self.run_id,
+                "candidate_id": str(candidate.id),
+                "strategy": candidate.strategy_name.value,
+                "symbol": candidate.symbol.value,
+                "event_type": "EXECUTION_PERSISTENCE_REJECTED",
+                "execution_environment": "BYBIT_DEMO",
+                "error_category": error_code,
+                "processing_stage": "compatibility_persistence",
+            },
+        )
 
     def _record_execution_policy_rejection(
         self,
@@ -896,6 +964,11 @@ class V2Runtime:
             active_execution_ids=self._active_execution_ids()
         )
         return {
+            "run_valid": self.run_valid,
+            "run_invalid_reasons": list(self.run_invalid_reasons),
+            "terminalization_incident_ids": sorted(
+                self._terminalization_incident_ids
+            ),
             "accepted_symbols": [symbol.value for symbol in self.universe.accepted_symbols],
             "enabled_strategies": [
                 strategy.name.value for strategy in self.strategies if strategy.enabled
@@ -1021,6 +1094,61 @@ class V2Runtime:
                     closed_at=record.closed_at or record.updated_at,
                 )
 
+    def sync_terminal_executions(self) -> None:
+        """Release terminal reservations/cooldowns once and refresh cached status."""
+        self._enforce_terminalization_invariants()
+        self._sync_reservations()
+        self._persist_runtime_metrics()
+        self._refresh_status_snapshot()
+
+    def _enforce_terminalization_invariants(self) -> dict[str, Any]:
+        """Retry exact flat closes and fail the run closed after the hard bound."""
+        service = self.execution.demo_execution
+        retry = getattr(service, "retry_stuck_terminalizations", None)
+        result = retry() if callable(retry) else {
+            "retried": [], "resolved": [], "hard_failures": {},
+        }
+        hard_failures = dict(result.get("hard_failures") or {})
+        for execution_id, blockers in hard_failures.items():
+            normalized = list(dict.fromkeys(str(item) for item in blockers))
+            reason = (
+                f"execution {execution_id} exceeded the terminalization hard "
+                f"limit: {'; '.join(normalized)}"
+            )
+            self.run_valid = False
+            self.stop_new_entries = True
+            if reason not in self.run_invalid_reasons:
+                self.run_invalid_reasons.append(reason)
+            if execution_id in self._terminalization_incident_ids:
+                continue
+            incident_id = uuid5(
+                NAMESPACE_URL,
+                f"bybot-v2-terminalization-hard-failure:{self.run_id}:{execution_id}",
+            )
+            persisted = self.repository.save_v2_incident(V2Incident(
+                id=incident_id,
+                run_id=self.run_id,
+                event_type="V2_TERMINALIZATION_HARD_FAILURE",
+                execution_id=execution_id,
+                error_category="terminalization_invariant",
+                payload={
+                    "execution_id": execution_id,
+                    "blockers": normalized,
+                    "warning_threshold_seconds": (
+                        self.settings.v2_terminalization_warning_seconds
+                    ),
+                    "hard_failure_threshold_seconds": (
+                        self.settings.v2_terminalization_hard_failure_seconds
+                    ),
+                    "run_invalid": True,
+                    "new_entries_stopped": True,
+                    "reconciliation_continues": True,
+                },
+            ))
+            if persisted is not False:
+                self._terminalization_incident_ids.add(execution_id)
+        return result
+
     def _build_status_snapshot(self) -> dict[str, Any]:
         drain_status = self._update_drain_state()
         preflight = self.execution.safety_preflight(require_auto_execution=False)
@@ -1042,8 +1170,14 @@ class V2Runtime:
             "last_cycle_at": self.last_cycle_at.isoformat() if self.last_cycle_at else None,
             "last_error": self.last_error, "cycles": self.cycles,
             "stop_new_entries": self.stop_new_entries,
+            "run_valid": self.run_valid,
+            "run_invalid_reasons": list(self.run_invalid_reasons),
             "run_phase": drain_status.phase.value,
-            "entries_allowed": drain_status.entries_allowed,
+            "entries_allowed": bool(
+                drain_status.entries_allowed
+                and not self.stop_new_entries
+                and self.run_valid
+            ),
             "nominal_end_at": (
                 drain_status.nominal_end_at.isoformat()
                 if drain_status.nominal_end_at else None
@@ -1108,6 +1242,24 @@ class V2Runtime:
             "kill_switch_reasons": list(dict.fromkeys(
                 self.portfolio.kill_switch_reasons + self.execution.demo_execution.kill_switch_reasons
             )),
+            "terminalization_retry_warnings": (
+                getattr(
+                    self.execution.demo_execution,
+                    "terminalization_retry_warnings", 0,
+                )
+            ),
+            "last_terminalization_warning": (
+                getattr(
+                    self.execution.demo_execution,
+                    "last_terminalization_warning", None,
+                )
+            ),
+            "terminalization_hard_failures": dict(
+                getattr(
+                    self.execution.demo_execution,
+                    "terminalization_hard_failures", {},
+                )
+            ),
             "websocket_reconnects": self.websocket.reconnects,
             "critical_stale_data_incidents": self.features.stale_incidents,
             "stale_data_incidents": self.features.stale_incidents,
@@ -1198,6 +1350,10 @@ class V2Runtime:
             int(metrics.get("risk_rejections") or 0),
             sum(item.state == "EXECUTION_BLOCKED" for item in self.candidates),
         )
+        metrics["persistence_rejections"] = max(
+            int(metrics.get("persistence_rejections") or 0),
+            sum(item.state == "PERSISTENCE_BLOCKED" for item in self.candidates),
+        )
         metrics["completed_trades"] = sum(
             item.state.value in {
                 "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE",
@@ -1212,6 +1368,13 @@ class V2Runtime:
         self.stop_new_entries = True
         self._persist_runtime_metrics()
         report = self.reporter.generate(self.run_id)
+        report["run_valid"] = self.run_valid
+        report["run_invalid_reasons"] = list(self.run_invalid_reasons)
+        if not self.run_valid:
+            report["functional_result"] = "FAIL"
+            blockers = list(report.get("functional_blockers") or [])
+            blockers.extend(self.run_invalid_reasons)
+            report["functional_blockers"] = list(dict.fromkeys(blockers))
         self.repository.finish_v2_run(self.run_id, report)
         for executor in self._execution_pools.values():
             executor.shutdown(wait=False, cancel_futures=False)

@@ -147,3 +147,40 @@ def test_runner_requires_final_read_only_diagnostics_for_safety_pass() -> None:
     assert "FINAL READ-ONLY DIAGNOSTICS" in source
     assert "SAFETY RESULT: ' + $safetyResult" in source
     assert "unresolved durable execution or remote-state disagreement" in source
+
+
+def test_process_tree_accepts_child_of_launcher(tmp_path: Path) -> None:
+    result = _run_helper_harness(
+        tmp_path,
+        "$parent = (Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID)).ParentProcessId\n"
+        "$ok = Test-ProcessInTree -ProcessId $PID -RootProcessId $parent\n"
+        "if (-not $ok) { throw 'child process was not recognized in launcher tree' }\n"
+        "Write-Output 'PROCESS_TREE=PASS'",
+    )
+    assert result.returncode == 0, _combined(result)
+    assert "PROCESS_TREE=PASS" in result.stdout
+
+
+def test_stop_uvicorn_captures_tree_and_has_forced_fallback() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    body = source.split("function Stop-Uvicorn", 1)[1].split(
+        "function Get-ProcessTreeIds", 1
+    )[0]
+    assert "Get-ProcessTreeIds" in body
+    assert "'/T', '/F'" in body
+    assert "$script:process = $null" in body
+
+
+def test_owner_check_uses_bound_integer_pid_without_nullable_value() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    body = source.split("function Assert-SingleUvicornOwner", 1)[1].split(
+        "function Invoke-FinalValidation", 1
+    )[0]
+    assert "$PSBoundParameters.ContainsKey('ExpectedPid')" in body
+    assert "ExpectedPid.Value" not in body
+    assert "RootProcessId $ExpectedPid" in body
+
+
+def test_runner_allows_bounded_four_minute_startup_reconciliation() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "for ($i=0; $i -lt 240; $i++)" in source

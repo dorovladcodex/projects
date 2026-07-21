@@ -579,6 +579,154 @@ class PersistenceRepository:
             self._failed(exc)
             return None
 
+    def persist_v2_compatibility_bundle(
+        self,
+        news: NewsItem,
+        classification: NewsClassification,
+        result: SignalDryRunResult,
+        decision: RiskDecision,
+        *,
+        classifier_version: str,
+        cache_expires_at: datetime,
+    ) -> int | None:
+        """Persist the V1-compatible V2 execution inputs atomically.
+
+        The Demo execution state machine still consumes the proven V1 models.
+        A candidate must never reach it with only a subset of its synthetic
+        news, classification, signal and approved risk decision committed.
+        """
+        if not self.available:
+            self.last_error_code = "DB_UNAVAILABLE"
+            return None
+        self.last_error = None
+        self.last_error_code = None
+        validated_news = NewsItem.model_validate(news.model_dump(mode="json"))
+        candidate = result.candidate
+        payload = validated_news.model_dump(mode="json")
+        content_hash = news_content_hash(validated_news)
+        try:
+            with Session(self.engine) as session, session.begin():
+                news_row = session.get(NewsItemRow, str(validated_news.id))
+                hash_owner = session.scalar(
+                    select(NewsItemRow).where(NewsItemRow.content_hash == content_hash)
+                )
+                if hash_owner is not None and hash_owner.id != str(validated_news.id):
+                    self.last_error = "NewsContentCollision"
+                    self.last_error_code = "DB_NEWS_CONTENT_COLLISION"
+                    return None
+                if news_row is None:
+                    session.add(NewsItemRow(
+                        id=str(validated_news.id),
+                        normalized_url=normalize_url(validated_news.url),
+                        content_hash=content_hash,
+                        title=validated_news.title,
+                        summary=validated_news.summary,
+                        source=validated_news.source,
+                        published_at=validated_news.published_at,
+                        asset_hint=validated_news.asset_hint.value,
+                        raw_category=validated_news.raw_category,
+                        importance=validated_news.importance,
+                        is_quarantined=False,
+                        payload=payload,
+                        received_at=validated_news.received_at,
+                    ))
+
+                classification_payload = classification.model_dump(mode="json")
+                classification_row = session.scalar(
+                    select(NewsClassificationRow).where(
+                        NewsClassificationRow.news_id == str(validated_news.id)
+                    )
+                )
+                if classification_row is None:
+                    session.add(NewsClassificationRow(
+                        news_id=str(validated_news.id),
+                        payload=classification_payload,
+                        classified_at=classification.classified_at,
+                    ))
+                else:
+                    classification_row.payload = classification_payload
+                    classification_row.classified_at = classification.classified_at
+
+                cache_row = session.scalar(select(ClassifierCacheRow).where(
+                    ClassifierCacheRow.cache_key == classifier_cache_key(validated_news),
+                    ClassifierCacheRow.classifier_version == classifier_version,
+                ))
+                if cache_row is None:
+                    session.add(ClassifierCacheRow(
+                        cache_key=classifier_cache_key(validated_news),
+                        classifier_version=classifier_version,
+                        payload=classification_payload,
+                        expires_at=cache_expires_at,
+                    ))
+                else:
+                    cache_row.payload = classification_payload
+                    cache_row.expires_at = cache_expires_at
+
+                signal_row = session.get(SignalCandidateRow, str(candidate.id))
+                signal_values = {
+                    "news_id": str(candidate.news_id),
+                    "execution_environment": candidate.execution_environment.value,
+                    "symbol": candidate.symbol.value if candidate.symbol else "NONE",
+                    "state": candidate.state.value,
+                    "active": candidate.state == CandidateLifecycleState.PENDING_CONFIRMATION,
+                    "expires_at": candidate.expires_at,
+                    "payload": candidate.model_dump(mode="json"),
+                    "risk_preview": result.risk_preview.model_dump(mode="json"),
+                    "risk_decision_id": result.risk_preview.risk_decision_id,
+                    "run_id": candidate.run_id,
+                    "created_at": candidate.created_at,
+                }
+                if signal_row is None:
+                    signal_row = SignalCandidateRow(id=str(candidate.id), **signal_values)
+                    session.add(signal_row)
+                    session.flush()
+                else:
+                    for key, value in signal_values.items():
+                        setattr(signal_row, key, value)
+
+                risk_row = session.scalar(
+                    select(RiskDecisionRow)
+                    .where(
+                        RiskDecisionRow.candidate_id == str(candidate.id),
+                        RiskDecisionRow.approved.is_(True),
+                    )
+                    .order_by(RiskDecisionRow.id.desc())
+                )
+                if risk_row is None:
+                    risk_row = RiskDecisionRow(
+                        candidate_id=str(candidate.id),
+                        approved=decision.approved,
+                        capped_size=float(decision.capped_size),
+                        position_notional=float(decision.position_notional),
+                        max_allowed_notional=float(decision.max_allowed_notional),
+                        estimated_fees=float(decision.estimated_fees),
+                        estimated_slippage=float(decision.estimated_slippage),
+                        rejection_reasons=list(decision.reasons),
+                        payload=decision.model_dump(mode="json"),
+                        created_at=decision.decided_at,
+                    )
+                    session.add(risk_row)
+                    session.flush()
+
+                result.risk_preview = SignalRiskPreview(
+                    preview_performed=True,
+                    approved=True,
+                    capped_size=float(decision.capped_size),
+                    position_notional=float(decision.position_notional),
+                    max_allowed_notional=float(decision.max_allowed_notional),
+                    rejection_reasons=[],
+                    risk_decision_id=risk_row.id,
+                    estimated_fees=float(decision.estimated_fees),
+                    estimated_slippage=float(decision.estimated_slippage),
+                )
+                signal_row.risk_preview = result.risk_preview.model_dump(mode="json")
+                signal_row.risk_decision_id = risk_row.id
+                session.flush()
+                return risk_row.id
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return None
+
     def ensure_approved_risk_decision(
         self, candidate_id: str, preview: SignalRiskPreview
     ) -> int | None:
@@ -1320,11 +1468,31 @@ class PersistenceRepository:
             return False
         try:
             with Session(self.engine) as session, session.begin():
-                existing = session.get(DemoExecutionRow, str(record.id))
-                row = _demo_execution_row(record)
+                existing = session.scalar(
+                    select(DemoExecutionRow)
+                    .where(DemoExecutionRow.id == str(record.id))
+                    .with_for_update()
+                )
                 if existing is None:
-                    session.add(row)
+                    session.add(_demo_execution_row(record))
                 else:
+                    terminal_values = {
+                        DemoExecutionState.DEMO_CLOSED.value,
+                        DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE.value,
+                        DemoExecutionState.DEMO_FAILED.value,
+                        DemoExecutionState.DEMO_NOT_SUBMITTED.value,
+                        DemoExecutionState.DEMO_ORDER_CANCELLED.value,
+                        DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION.value,
+                        DemoExecutionState.DEMO_CLOSED_EXTERNALLY.value,
+                        DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED.value,
+                    }
+                    if (
+                        existing.state in terminal_values
+                        and record.state.value not in terminal_values
+                    ):
+                        return True
+                    _preserve_demo_execution_exchange_identity(record, existing)
+                    row = _demo_execution_row(record)
                     for column in (
                         "execution_environment", "risk_decision_id", "run_id",
                         "order_link_id", "order_id", "symbol", "side", "state",
@@ -1351,6 +1519,56 @@ class PersistenceRepository:
         except SQLAlchemyError as exc:
             self._failed(exc)
             return False
+
+    def terminalize_demo_execution(
+        self, record: DemoExecutionRecord, *, event_type: str
+    ) -> str:
+        """Atomically persist one terminal transition and its unique audit event."""
+        terminal_states = {
+            DemoExecutionState.DEMO_CLOSED,
+            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+        }
+        if not self.available or record.state not in terminal_states:
+            return "FAILED"
+        try:
+            with Session(self.engine) as session, session.begin():
+                existing = session.scalar(
+                    select(DemoExecutionRow)
+                    .where(DemoExecutionRow.id == str(record.id))
+                    .with_for_update()
+                )
+                if existing is None:
+                    return "FAILED"
+                if DemoExecutionState(existing.state) in terminal_states:
+                    return "ALREADY_TERMINAL"
+                _preserve_demo_execution_exchange_identity(record, existing)
+                row = _demo_execution_row(record)
+                for column in (
+                    "state", "accepted_quantity", "average_fill_price",
+                    "close_order_link_id", "close_order_id",
+                    "realized_exchange_pnl", "payload", "updated_at",
+                ):
+                    setattr(existing, column, getattr(row, column))
+                candidate = session.get(
+                    SignalCandidateRow, str(record.candidate_id)
+                )
+                if candidate is not None:
+                    _set_candidate_demo_state(candidate, record.state)
+                session.add(DemoExecutionEventRow(
+                    id=str(uuid4()), execution_id=str(record.id),
+                    event_key=f"terminal:{record.id}:{record.state.value}",
+                    event_type=event_type,
+                    payload=record.model_dump(mode="json"),
+                    occurred_at=record.updated_at,
+                ))
+                session.flush()
+            return "APPLIED"
+        except IntegrityError:
+            return "ALREADY_TERMINAL"
+        except (SQLAlchemyError, ValueError) as exc:
+            self._failed(exc)
+            return "FAILED"
 
     def repair_demo_execution(
         self,
@@ -2272,6 +2490,18 @@ class PersistenceRepository:
     def finish_v2_run(self, run_id: str, payload: dict[str, Any]) -> bool:
         if not self.available:
             return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                row = session.get(V2RunRow, run_id)
+                if row is None:
+                    return False
+                row.finished_at = datetime.now(timezone.utc)
+                row.status = "FINISHED"
+                row.payload = payload
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
 
     def update_v2_run_runtime(self, run_id: str, payload: dict[str, Any]) -> bool:
         if not self.available:
@@ -2299,18 +2529,6 @@ class PersistenceRepository:
         except SQLAlchemyError as exc:
             self._failed(exc)
             return {}
-        try:
-            with Session(self.engine) as session, session.begin():
-                row = session.get(V2RunRow, run_id)
-                if row is None:
-                    return False
-                row.finished_at = datetime.now(timezone.utc)
-                row.status = "FINISHED"
-                row.payload = payload
-            return True
-        except SQLAlchemyError as exc:
-            self._failed(exc)
-            return False
 
     def save_v2_incident(self, incident: V2Incident) -> bool:
         if not self.available:
@@ -2372,6 +2590,27 @@ class PersistenceRepository:
             "database operation failed: type=%s message=%s",
             type(exc).__name__,
             _sanitize_database_error(str(exc)),
+        )
+
+
+def _preserve_demo_execution_exchange_identity(
+    record: DemoExecutionRecord, existing: DemoExecutionRow,
+) -> None:
+    """Never let sparse/stale lifecycle payloads erase exact exchange IDs."""
+    payload = existing.payload or {}
+    if not record.order_id:
+        record.order_id = existing.order_id or payload.get("order_id")
+    if not record.order_link_id:
+        record.order_link_id = existing.order_link_id or str(
+            payload.get("order_link_id") or ""
+        )
+    if not record.close_order_id:
+        record.close_order_id = existing.close_order_id or payload.get(
+            "close_order_id"
+        )
+    if not record.close_order_link_id:
+        record.close_order_link_id = (
+            existing.close_order_link_id or payload.get("close_order_link_id")
         )
 
 

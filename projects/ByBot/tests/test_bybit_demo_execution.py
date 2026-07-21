@@ -98,7 +98,8 @@ class MemoryRepository:
         return True
 
     def get_demo_execution(self, candidate_id):
-        return self.records.get(candidate_id)
+        record = self.records.get(candidate_id)
+        return record.model_copy(deep=True) if record is not None else None
 
     def reserve_demo_execution(self, record):
         existing = self.records.get(str(record.candidate_id))
@@ -108,9 +109,45 @@ class MemoryRepository:
         return record
 
     def save_demo_execution(self, record, *, event_type):
+        existing = self.records.get(str(record.candidate_id))
+        terminal = {
+            DemoExecutionState.DEMO_CLOSED,
+            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+            DemoExecutionState.DEMO_FAILED,
+            DemoExecutionState.DEMO_NOT_SUBMITTED,
+            DemoExecutionState.DEMO_ORDER_CANCELLED,
+            DemoExecutionState.DEMO_CLOSED_AFTER_INTERRUPTION,
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+            DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
+        }
+        if (
+            existing is not None and existing.state in terminal
+            and record.state not in terminal
+        ):
+            return True
+        if existing is not None:
+            record.order_id = record.order_id or existing.order_id
+            record.order_link_id = record.order_link_id or existing.order_link_id
+            record.close_order_id = record.close_order_id or existing.close_order_id
+            record.close_order_link_id = (
+                record.close_order_link_id or existing.close_order_link_id
+            )
         self.records[str(record.candidate_id)] = record.model_copy(deep=True)
         self.saved_events.append((event_type, record.state.value))
         return True
+
+    def terminalize_demo_execution(self, record, *, event_type):
+        existing = self.records.get(str(record.candidate_id))
+        terminal = {
+            DemoExecutionState.DEMO_CLOSED,
+            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+        }
+        if existing is not None and existing.state in terminal:
+            return "ALREADY_TERMINAL"
+        self.records[str(record.candidate_id)] = record.model_copy(deep=True)
+        self.saved_events.append((event_type, record.state.value))
+        return "APPLIED"
 
     def load_demo_executions(self):
         return [item.model_copy(deep=True) for item in self.records.values()]
@@ -1451,6 +1488,54 @@ def test_demo_execution_and_kill_switch_survive_repository_restart(tmp_path) -> 
     assert loaded is not None and loaded.id == record.id
     assert loaded.state == DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED
     assert restored.load_demo_kill_switch()["reasons"] == ["test incident"]
+
+
+def test_atomic_terminalization_is_idempotent_and_rejects_stale_regression(
+    tmp_path,
+) -> None:
+    repository = PersistenceRepository(f"sqlite:///{tmp_path / 'terminal.db'}")
+    candidate, _, preview, _ = candidate_bundle()
+    repository.save_signal_result(
+        SignalDryRunResult(candidate=candidate, risk_preview=preview)
+    )
+    opened = DemoExecutionRecord(
+        candidate_id=candidate.id, run_id="terminal-run",
+        order_link_id="terminal-entry", order_id="entry-order",
+        close_order_id="close-order", state=DemoExecutionState.DEMO_CLOSING,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"),
+        accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("100"),
+    )
+    assert repository.reserve_demo_execution(opened) is not None
+    terminal = opened.model_copy(deep=True)
+    terminal.state = DemoExecutionState.DEMO_CLOSED
+    terminal.exit_attribution = "stop_loss"
+    terminal.close_reason = "stop_loss"
+    terminal.gross_realized_pnl = Decimal("-0.10")
+    terminal.exchange_fees = Decimal("0.02")
+    terminal.realized_exchange_pnl = Decimal("-0.12")
+    terminal.closed_at = datetime.now(timezone.utc)
+    terminal.updated_at = terminal.closed_at
+
+    assert repository.terminalize_demo_execution(
+        terminal, event_type="DEMO_CLOSE_TERMINALIZED"
+    ) == "APPLIED"
+    assert repository.terminalize_demo_execution(
+        terminal, event_type="DEMO_CLOSE_TERMINALIZED"
+    ) == "ALREADY_TERMINAL"
+    stale = opened.model_copy(update={"updated_at": datetime.now(timezone.utc)})
+    assert repository.save_demo_execution(stale, event_type="STALE_REPLAY")
+
+    restored = repository.get_demo_execution(str(candidate.id))
+    assert restored.state == DemoExecutionState.DEMO_CLOSED
+    assert restored.gross_realized_pnl == Decimal("-0.10")
+    assert restored.realized_exchange_pnl == Decimal("-0.12")
+    events = repository.load_demo_execution_events(str(opened.id))
+    assert [row["event_type"] for row in events].count(
+        "DEMO_CLOSE_TERMINALIZED"
+    ) == 1
+    assert "STALE_REPLAY" not in [row["event_type"] for row in events]
 
 
 def test_entry_replay_after_close_started_cannot_regress_state() -> None:

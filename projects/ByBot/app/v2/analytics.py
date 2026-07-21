@@ -182,6 +182,7 @@ class V2ReportGenerator:
         )
         signal_metrics.setdefault("portfolio_rejections", 0)
         signal_metrics.setdefault("pre_execution_admissions", 0)
+        signal_metrics.setdefault("persistence_rejections", 0)
         signal_metrics.setdefault("execution_policy_rejections", 0)
         signal_metrics.setdefault("cooldown_rejections", 0)
         signal_metrics.setdefault(
@@ -231,6 +232,10 @@ class V2ReportGenerator:
             else "PASS_WITH_WARNINGS" if analytics_warnings
             else "PASS"
         )
+        persistence_rejections = int(signal_metrics.get("persistence_rejections") or 0)
+        if persistence_rejections:
+            blockers.append("execution compatibility persistence failed")
+            blockers = list(dict.fromkeys(blockers))
         return {
             "run_id": run_id, "generated_at": generated_at.isoformat(),
             "functional_result": "FAIL" if blockers else "PASS",
@@ -258,6 +263,7 @@ class V2ReportGenerator:
             "pre_execution_admissions": signal_metrics.get(
                 "pre_execution_admissions", 0
             ),
+            "persistence_rejections": persistence_rejections,
             "execution_policy_rejections": signal_metrics.get(
                 "execution_policy_rejections", 0
             ),

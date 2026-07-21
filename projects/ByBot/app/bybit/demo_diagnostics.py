@@ -585,6 +585,7 @@ def format_demo_diagnostics(result: DemoDiagnosticsResult) -> str:
     latest = result.latest_execution
     newest = result.newest_execution
     reasons = result.kill_switch.get("reasons") or []
+    active_incident = latest if result.kill_switch.get("active") else None
     lines = [
         f"DEMO KILL SWITCH ACTIVE: {str(bool(result.kill_switch.get('active'))).lower()}",
         "DEMO KILL SWITCH REASONS: " + ("; ".join(reasons) or "none"),
@@ -594,7 +595,8 @@ def format_demo_diagnostics(result: DemoDiagnosticsResult) -> str:
         + str(result.kill_switch.get("activation_count") or 0),
         "LATEST DEMO EXECUTION ID: " + (str(newest.id) if newest else "none"),
         "LATEST DEMO EXECUTION STATE: " + (newest.state.value if newest else "none"),
-        "ACTIVE INCIDENT EXECUTION ID: " + (str(latest.id) if latest else "none"),
+        "ACTIVE INCIDENT EXECUTION ID: "
+        + (str(active_incident.id) if active_incident else "none"),
         "LATEST DEMO FAILURE REASON: " + ((latest.failure_reason or "none") if latest else "none"),
         "LATEST DEMO CLEANUP RESULT: " + ((latest.cleanup_result or "none") if latest else "none"),
         f"REMOTE BOT-OWNED ENTRY ORDERS: {len(result.bot_owned_entry_orders)}",

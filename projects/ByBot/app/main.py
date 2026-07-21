@@ -250,7 +250,9 @@ def health() -> dict[str, str]:
 
 
 @app.get("/v2/status")
-def v2_status() -> dict[str, object]:
+async def v2_status() -> dict[str, object]:
+    # This path only copies an in-memory snapshot. Keeping it on the event loop
+    # avoids Starlette thread-pool starvation while RSS/LLM work uses to_thread.
     started = perf_counter()
     succeeded = False
     try:
@@ -1087,6 +1089,8 @@ async def demo_private_stream_loop() -> None:
         demo_execution_service.websocket_reconnects = demo_private_websocket.reconnects
         await asyncio.to_thread(demo_execution_service.handle_private_event, event)
         signal_candidate_service.sync_demo_states()
+        if settings.v2_enabled:
+            await asyncio.to_thread(v2_runtime.sync_terminal_executions)
 
 
 async def demo_reconciliation_loop() -> None:
@@ -1098,3 +1102,5 @@ async def demo_reconciliation_loop() -> None:
         finally:
             demo_execution_service.reconciliation_in_progress = False
         signal_candidate_service.sync_demo_states()
+        if settings.v2_enabled:
+            await asyncio.to_thread(v2_runtime.sync_terminal_executions)

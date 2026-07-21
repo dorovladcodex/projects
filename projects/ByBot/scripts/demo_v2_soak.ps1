@@ -15,6 +15,11 @@ $mutex = New-Object System.Threading.Mutex($false, 'Global\ByBotDemoV2Soak')
 $hasMutex = $false
 $process = $null
 $saved = @{}
+$finalValidationRan = $false
+$finalDiagnosticsPass = $false
+$finalAnalysisPass = $false
+$uvicornCleanupPass = $true
+$analysisMarkdownPath = Join-Path $artifactDir 'analysis\analysis.md'
 
 function Invoke-NativeCommand {
     param(
@@ -173,9 +178,152 @@ function Set-ChildEnvironment([string]$Name, [string]$Value) {
 
 function Stop-Uvicorn {
     if ($null -ne $script:process) {
-        if (-not $script:process.HasExited) { $script:process.Kill(); $script:process.WaitForExit() }
-        $script:process.Dispose(); $script:process = $null
+        $rootPid = $script:process.Id
+        try {
+            $treeIds = @(Get-ProcessTreeIds -RootProcessId $rootPid)
+        } catch {
+            $treeIds = @($rootPid)
+        }
+        try {
+            if (-not $script:process.HasExited) {
+                $graceful = Start-Process -FilePath 'taskkill.exe' `
+                    -ArgumentList @('/PID', [string]$rootPid, '/T') `
+                    -PassThru -WindowStyle Hidden
+                $graceful.WaitForExit()
+                $graceful.Dispose()
+                [void]$script:process.WaitForExit(5000)
+            }
+        } catch {
+            Write-Warning ('Graceful Uvicorn stop did not complete: ' + $_.Exception.Message)
+        }
+        $remaining = @(
+            $treeIds | Where-Object {
+                Get-Process -Id $_ -ErrorAction SilentlyContinue
+            }
+        )
+        if ($remaining.Count -gt 0) {
+            try {
+                $forced = Start-Process -FilePath 'taskkill.exe' `
+                    -ArgumentList @('/PID', [string]$rootPid, '/T', '/F') `
+                    -PassThru -WindowStyle Hidden
+                $forced.WaitForExit()
+                $forced.Dispose()
+            } catch {
+                foreach ($processId in $remaining) {
+                    Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        try { $script:process.WaitForExit() } catch { }
+        try { $script:process.Dispose() } catch { }
+        $script:process = $null
+        Start-Sleep -Milliseconds 500
+        $survivors = @(
+            $treeIds | Where-Object {
+                Get-Process -Id $_ -ErrorAction SilentlyContinue
+            }
+        )
+        if ($survivors.Count -gt 0) {
+            Write-Warning ('Uvicorn process-tree cleanup left PIDs: ' + ($survivors -join ','))
+        }
     }
+}
+
+function Get-ProcessTreeIds {
+    param([int]$RootProcessId)
+    $result = New-Object System.Collections.Generic.List[int]
+    $pending = New-Object System.Collections.Generic.Queue[int]
+    $pending.Enqueue($RootProcessId)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        if ($result.Contains($current)) { continue }
+        $result.Add($current)
+        $children = @(Get-CimInstance Win32_Process -Filter (
+            'ParentProcessId=' + $current
+        ) -ErrorAction SilentlyContinue)
+        foreach ($child in $children) { $pending.Enqueue([int]$child.ProcessId) }
+    }
+    return @($result)
+}
+
+function Test-ProcessInTree {
+    param([int]$ProcessId, [int]$RootProcessId)
+    $current = $ProcessId
+    $seen = @{}
+    while ($current -gt 0 -and -not $seen.ContainsKey($current)) {
+        if ($current -eq $RootProcessId) { return $true }
+        $seen[$current] = $true
+        $row = Get-CimInstance Win32_Process -Filter (
+            'ProcessId=' + $current
+        ) -ErrorAction SilentlyContinue
+        if ($null -eq $row) { return $false }
+        $current = [int]$row.ParentProcessId
+    }
+    return $false
+}
+
+function Get-UvicornPortOwners {
+    $owners = @()
+    try {
+        $owners = @(Get-NetTCPConnection -LocalPort 8137 -State Listen `
+            -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique)
+    } catch {
+        $lines = @(netstat.exe -ano -p tcp 2>$null)
+        foreach ($line in $lines) {
+            if ($line -match '^\s*TCP\s+\S+:8137\s+\S+\s+LISTENING\s+(\d+)\s*$') {
+                $owners += [int]$Matches[1]
+            }
+        }
+        $owners = @($owners | Select-Object -Unique)
+    }
+    return @($owners)
+}
+
+function Assert-SingleUvicornOwner {
+    param([int]$ExpectedPid)
+    $hasExpectedPid = $PSBoundParameters.ContainsKey('ExpectedPid')
+    $owners = @(Get-UvicornPortOwners)
+    if (-not $hasExpectedPid) {
+        if ($owners.Count -ne 0) {
+            throw ('Port 8137 already has a listener; refusing duplicate Uvicorn: pid=' + ($owners -join ','))
+        }
+        return
+    }
+    $ownedByTree = $false
+    if ($owners.Count -eq 1) {
+        $ownedByTree = Test-ProcessInTree `
+            -ProcessId ([int]$owners[0]) -RootProcessId $ExpectedPid
+    }
+    if ($owners.Count -ne 1 -or -not $ownedByTree) {
+        throw ('Port 8137 ownership mismatch: expected-tree-root=' + $ExpectedPid + '; actual=' + ($owners -join ','))
+    }
+}
+
+function Invoke-FinalValidation {
+    if ($script:finalValidationRan) { return }
+    $script:finalValidationRan = $true
+    Stop-Uvicorn
+    try { Assert-SingleUvicornOwner } catch {
+        Write-Warning ('Uvicorn cleanup ownership check failed: ' + $_.Exception.Message)
+        $script:uvicornCleanupPass = $false
+    }
+    try {
+        Invoke-NativeCommand -FilePath $script:python `
+            -Arguments @((Join-Path $script:root 'scripts\demo_kill_switch_diagnostics.py')) `
+            -TimeoutSeconds 120 -Stage 'FINAL READ-ONLY DIAGNOSTICS'
+        $script:finalDiagnosticsPass = $script:uvicornCleanupPass
+    } catch {
+        Write-Warning ('Final read-only diagnostics failed: ' + $_.Exception.Message)
+    }
+    try {
+        Invoke-NativeCommand -FilePath $script:python `
+            -Arguments @((Join-Path $script:root 'scripts\analyze_demo_v2_run.py'), '--run-id', $script:runId) `
+            -TimeoutSeconds 180 -Stage 'FINAL RUN ANALYSIS'
+        $script:finalAnalysisPass = $true
+    } catch {
+        Write-Warning ('Final run analysis failed: ' + $_.Exception.Message)
+    }
+    Write-Host ('ANALYSIS: ' + $script:analysisMarkdownPath)
 }
 
 if (-not $AllowDemoOrders) { throw 'Explicit -AllowDemoOrders is required.' }
@@ -231,6 +379,7 @@ try {
         $deadline = [DateTime]::UtcNow.AddHours($Hours)
         Set-ChildEnvironment 'V2_RUN_NOMINAL_END_AT' $deadline.ToString('o')
         Write-Host 'UVICORN: START'
+        Assert-SingleUvicornOwner
         $stdout = Join-Path $artifactDir 'uvicorn.stdout.log'
         $stderr = Join-Path $artifactDir 'uvicorn.stderr.log'
         $script:process = Start-Process -FilePath $python -ArgumentList @(
@@ -239,11 +388,12 @@ try {
 
         $base = 'http://127.0.0.1:8137'
         $ready = $false
-        for ($i=0; $i -lt 90; $i++) {
+        for ($i=0; $i -lt 240; $i++) {
             if ($script:process.HasExited) { throw "FastAPI exited before readiness: $($script:process.ExitCode)" }
             try { $null = Invoke-RestMethod "$base/health" -TimeoutSec 2; $ready = $true; break } catch { Start-Sleep -Seconds 1 }
         }
         if (-not $ready) { throw 'FastAPI did not become ready.' }
+        Assert-SingleUvicornOwner -ExpectedPid $script:process.Id
         $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 5
         if (-not $status.preflight_ok) { throw ('V2 runtime preflight failed: ' + ($status.preflight_blockers -join '; ')) }
         Write-Host ('V2 STARTED: PASS run_id=' + $runId)
@@ -255,6 +405,7 @@ try {
                 Stop-Uvicorn
                 $script:process = Start-Process -FilePath $python -ArgumentList @('-m','uvicorn','app.main:app','--host','127.0.0.1','--port','8137') -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
                 Start-Sleep -Seconds 5
+                Assert-SingleUvicornOwner -ExpectedPid $script:process.Id
             }
             try {
                 $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 3
@@ -297,20 +448,23 @@ try {
             if (-not $cleanup.live_execution_blocked) { throw 'Demo cleanup safety assertion failed.' }
         }
         $report = Invoke-RestMethod "$base/v2/report" -Method Post -TimeoutSec 30
-        Stop-Uvicorn
-        $safetyResult = $(if ($drainTimedOut) { 'FAIL' } else { 'PASS' })
-        try {
-            Invoke-NativeCommand -FilePath $python `
-                -Arguments @('scripts\demo_kill_switch_diagnostics.py') `
-                -TimeoutSeconds 120 -Stage 'FINAL READ-ONLY DIAGNOSTICS'
-        } catch {
-            $safetyResult = 'FAIL'
-            Write-Warning ('Final read-only diagnostics failed: ' + $_.Exception.Message)
-        }
+        Invoke-FinalValidation
+        $cycleFailuresZero = [int]$status.total_cycle_failures -eq 0
+        $runFinished = [string]$status.run_phase -eq 'FINISHED'
+        $safetyResult = $(if (
+            -not $drainTimedOut -and $script:finalDiagnosticsPass -and `
+            $script:finalAnalysisPass -and $cycleFailuresZero -and $runFinished
+        ) { 'PASS' } else { 'FAIL' })
         $report | Add-Member -NotePropertyName safety_result `
             -NotePropertyValue $safetyResult -Force
         $report | Add-Member -NotePropertyName final_read_only_diagnostics `
-            -NotePropertyValue $(if ($safetyResult -eq 'PASS') { 'PASS' } else { 'FAIL' }) -Force
+            -NotePropertyValue $(if ($script:finalDiagnosticsPass) { 'PASS' } else { 'FAIL' }) -Force
+        $report | Add-Member -NotePropertyName final_run_analysis `
+            -NotePropertyValue $(if ($script:finalAnalysisPass) { 'PASS' } else { 'FAIL' }) -Force
+        $report | Add-Member -NotePropertyName final_cycle_failures_zero `
+            -NotePropertyValue $cycleFailuresZero -Force
+        $report | Add-Member -NotePropertyName final_run_phase_finished `
+            -NotePropertyValue $runFinished -Force
         $report | Add-Member -NotePropertyName drain_completed `
             -NotePropertyValue $drainComplete -Force
         $report | Add-Member -NotePropertyName drain_timed_out `
@@ -332,6 +486,9 @@ try {
     } finally { Pop-Location }
 } finally {
     Stop-Uvicorn
+    try { Invoke-FinalValidation } catch {
+        Write-Warning ('Final validation cleanup warning: ' + $_.Exception.Message)
+    }
     foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
     if ($hasMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()

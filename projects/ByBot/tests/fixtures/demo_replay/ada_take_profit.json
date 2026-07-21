@@ -1,0 +1,18 @@
+{
+  "execution_id": "9e93498f-bb36-4ce0-83ba-279cf9531ef6",
+  "run_id": "demo-v2-20260720T215238048Z",
+  "symbol": "ADAUSDT",
+  "side": "SELL",
+  "entry_order_id": "0f0cf20e-96de-4da7-a7f0-81f87625352e",
+  "order_link_id": "bybot-348b72-e-58236173d2c87823eca6",
+  "close_order_id": "b6c39b63-330d-435f-ba1b-80848e7be016",
+  "entry_execution_id": "c93a1234-7db2-4aa0-8f88-b911932095d2",
+  "close_execution_id": "c1873c9a-5d5b-4e6c-bfff-1a7c06c1fabf",
+  "quantity": "290",
+  "entry_price": "0.172",
+  "close_price": "0.1714",
+  "entry_fee": "0.027434",
+  "close_fee": "0.0273383",
+  "close_source": "take_profit",
+  "sparse_entry_fill_order_id": true
+}

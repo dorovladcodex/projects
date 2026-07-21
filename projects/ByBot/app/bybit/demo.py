@@ -11,6 +11,7 @@ import hmac
 import json
 import time
 from time import perf_counter
+from threading import RLock
 from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -770,6 +771,11 @@ class DemoExecutionService:
         self.sleep_resume_reconciliations = 0
         self._submit_started_monotonic: dict[UUID, float] = {}
         self._ack_received_monotonic: dict[UUID, float] = {}
+        self._execution_locks_guard = RLock()
+        self._execution_locks: dict[UUID, RLock] = {}
+        self.terminalization_retry_warnings = 0
+        self.last_terminalization_warning: str | None = None
+        self.terminalization_hard_failures: dict[str, list[str]] = {}
         if self.enabled:
             require_demo_execution(settings)
             if client is None:
@@ -1360,14 +1366,35 @@ class DemoExecutionService:
                 if record is None:
                     continue
                 attributed_close = True
-            if topic == "execution":
-                self._apply_fill(record, item, force_close=attributed_close)
-            elif topic == "order":
-                self._apply_order_update(record, item, force_close=attributed_close)
-            elif topic == "position":
-                self._apply_position_update(record, item)
+            with self._execution_lock(record.id):
+                if topic == "execution":
+                    self._apply_fill(record, item, force_close=attributed_close)
+                elif topic == "order":
+                    self._apply_order_update(record, item, force_close=attributed_close)
+                elif topic == "position":
+                    self._apply_position_update(record, item)
+                if self._ws_close_requires_terminal_reconciliation(
+                    topic, item, record
+                ):
+                    try:
+                        self._reconcile_execution_rest(record)
+                    except DemoExchangeError as exc:
+                        self._mark_terminalization_retry(record, exc)
 
     def _reconcile_execution_rest(
+        self, record: DemoExecutionRecord
+    ) -> DemoExecutionRecord:
+        with self._execution_lock(record.id):
+            loader = getattr(self.repository, "get_demo_execution", None)
+            latest = loader(str(record.candidate_id)) if callable(loader) else None
+            if latest is not None:
+                if latest.state in TERMINAL_DEMO_STATES:
+                    return latest
+                if _aware(latest.updated_at) >= _aware(record.updated_at):
+                    record = latest
+            return self._reconcile_execution_rest_locked(record)
+
+    def _reconcile_execution_rest_locked(
         self, record: DemoExecutionRecord
     ) -> DemoExecutionRecord:
         """Reconcile one execution from all authoritative symbol-scoped REST data."""
@@ -1447,6 +1474,21 @@ class DemoExecutionService:
             executions=executions,
             positions=positions,
         )
+        if (
+            not finalized
+            and record.state == DemoExecutionState.DEMO_CLOSING
+            and record.close_fills
+            and record.closed_at is not None
+            and not any(
+                str(item.get("symbol") or "") == record.symbol.value
+                and _decimal(item.get("size"), default="0") > 0
+                for item in positions
+            )
+        ):
+            self._record_terminalization_invariant(
+                record, realtime=realtime, history=history,
+                executions=executions, positions=positions,
+            )
         record.last_reconciliation_at = datetime.now(timezone.utc)
         record.updated_at = record.last_reconciliation_at
         if not finalized and _execution_material_fingerprint(record) != starting_fingerprint:
@@ -1590,10 +1632,161 @@ class DemoExecutionService:
         record.last_error = None
         record.closed_at = max(fill.executed_at for fill in record.close_fills)
         record.updated_at = datetime.now(timezone.utc)
-        self.repository.save_demo_execution(
-            record, event_type="REST_FLAT_CLOSE_FINALIZED"
+        terminalizer = getattr(
+            self.repository, "terminalize_demo_execution", None
         )
+        if callable(terminalizer):
+            result = terminalizer(
+                record, event_type="DEMO_CLOSE_TERMINALIZED"
+            )
+            if result == "FAILED":
+                raise RuntimeError("durable Demo terminalization failed")
+        else:
+            self.repository.save_demo_execution(
+                record, event_type="DEMO_CLOSE_TERMINALIZED"
+            )
         return True
+
+    def _execution_lock(self, execution_id: UUID) -> RLock:
+        with self._execution_locks_guard:
+            return self._execution_locks.setdefault(execution_id, RLock())
+
+    @staticmethod
+    def _ws_close_requires_terminal_reconciliation(
+        topic: str, item: dict[str, Any], record: DemoExecutionRecord,
+    ) -> bool:
+        if record.state != DemoExecutionState.DEMO_CLOSING:
+            return False
+        if topic == "execution":
+            exec_id = str(item.get("execId") or "")
+            return bool(
+                exec_id
+                and any(fill.execution_id == exec_id for fill in record.close_fills)
+            )
+        if topic == "order":
+            return str(item.get("orderStatus") or "") == "Filled"
+        if topic == "position":
+            return bool(
+                record.close_fills
+                and _decimal(item.get("size"), default="0") == 0
+            )
+        return False
+
+    def _mark_terminalization_retry(
+        self, record: DemoExecutionRecord, exc: DemoExchangeError,
+    ) -> None:
+        warning = f"close terminalization retry required: {_sanitized_error(exc)}"
+        self.last_error = warning
+        self.last_terminalization_warning = warning
+        if record.last_error == warning:
+            return
+        self.terminalization_retry_warnings += 1
+        record.last_error = warning
+        record.last_reconciliation_at = datetime.now(timezone.utc)
+        record.updated_at = record.last_reconciliation_at
+        self.repository.save_demo_execution(
+            record, event_type="CLOSE_TERMINALIZATION_RETRY_REQUIRED"
+        )
+
+    def _record_terminalization_invariant(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        realtime: list[dict[str, Any]],
+        history: list[dict[str, Any]],
+        executions: list[dict[str, Any]],
+        positions: list[dict[str, Any]],
+        now: datetime | None = None,
+    ) -> None:
+        current = now or datetime.now(timezone.utc)
+        evidence_at = record.closed_at or record.updated_at
+        age = max(0.0, (current - _aware(evidence_at)).total_seconds())
+        if age < self.settings.v2_terminalization_warning_seconds:
+            return
+        close_order = next((
+            item for item in history
+            if record.close_order_id
+            and str(item.get("orderId") or "") == record.close_order_id
+        ), None)
+        attributed_qty = sum((
+            _decimal(item.get("execQty"), default="0")
+            for item in executions
+            if record.close_order_id
+            and str(item.get("orderId") or "") == record.close_order_id
+            and _exchange_event_time_ms(item) >= _record_entry_time_ms(record)
+        ), Decimal("0"))
+        blockers: list[str] = []
+        if any(
+            str(item.get("symbol") or "") == record.symbol.value
+            and _decimal(item.get("size"), default="0") > 0
+            for item in positions
+        ):
+            blockers.append("remote position is not flat")
+        if any(_is_execution_owned_open_order(item, record) for item in realtime):
+            blockers.append("owned close/protection order remains open")
+        if close_order is None:
+            blockers.append("exact close order is unavailable")
+        elif str(close_order.get("orderStatus") or "") != "Filled":
+            blockers.append("exact close order is not Filled")
+        if attributed_qty != record.accepted_quantity:
+            blockers.append(
+                "attributed close quantity does not equal owned entry quantity"
+            )
+        if not blockers:
+            blockers.append("atomic terminal persistence did not complete")
+        record.terminalization_blockers = list(dict.fromkeys(blockers))
+        event_type = None
+        if record.terminalization_warning_at is None:
+            record.terminalization_warning_at = current
+            event_type = "CLOSE_TERMINALIZATION_WARNING"
+            self.terminalization_retry_warnings += 1
+        if (
+            age >= self.settings.v2_terminalization_hard_failure_seconds
+            and record.terminalization_hard_failure_at is None
+        ):
+            record.terminalization_hard_failure_at = current
+            event_type = "CLOSE_TERMINALIZATION_HARD_FAILURE"
+        warning = (
+            f"close terminalization unresolved after {int(age)}s: "
+            + "; ".join(record.terminalization_blockers)
+        )
+        record.last_error = warning
+        record.last_reconciliation_at = current
+        record.updated_at = current
+        self.last_error = warning
+        self.last_terminalization_warning = warning
+        if record.terminalization_hard_failure_at is not None:
+            self.terminalization_hard_failures[str(record.id)] = list(
+                record.terminalization_blockers
+            )
+        if event_type:
+            self.repository.save_demo_execution(record, event_type=event_type)
+
+    def retry_stuck_terminalizations(
+        self, *, now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Retry aged CLOSING records with read-only REST reconciliation."""
+        current = now or datetime.now(timezone.utc)
+        retried: list[str] = []
+        resolved: list[str] = []
+        for record in self.repository.load_demo_executions():
+            if (
+                record.state != DemoExecutionState.DEMO_CLOSING
+                or not record.close_fills
+                or current - _aware(record.closed_at or record.updated_at)
+                < timedelta(seconds=self.settings.v2_terminalization_warning_seconds)
+            ):
+                continue
+            retried.append(str(record.id))
+            reconciled = self._reconcile_execution_rest(record)
+            if reconciled.state in TERMINAL_DEMO_STATES:
+                resolved.append(str(record.id))
+        return {
+            "retried_execution_ids": retried,
+            "resolved_execution_ids": resolved,
+            "hard_failures": dict(self.terminalization_hard_failures),
+            "exchange_mutations_performed": False,
+        }
 
     def reconcile(self) -> dict[str, Any]:
         if not self.enabled or self.client is None:
@@ -1616,13 +1809,17 @@ class DemoExecutionService:
         closed_pnl = self.client.get_closed_pnl(settle_coin="USDT")
         self.last_reconciliation_at = datetime.now(timezone.utc)
         local = self.repository.load_demo_executions()
+        unexpected_errors: list[Exception] = []
         for record in list(local):
             if record.state in TERMINAL_DEMO_STATES:
                 continue
             try:
                 self._reconcile_execution_rest(record)
+            except DemoExchangeError as exc:
+                self._mark_terminalization_retry(record, exc)
             except Exception as exc:
                 self.last_error = _sanitized_error(exc)
+                unexpected_errors.append(exc)
         local = self.repository.load_demo_executions()
         positions = self.client.get_positions(settle_coin="USDT")
         local_links = {
@@ -1801,7 +1998,7 @@ class DemoExecutionService:
                     )
                 record.updated_at = datetime.now(timezone.utc)
                 self.repository.save_demo_execution(record, event_type="REST_POSITION_RECONCILED")
-        return {
+        result = {
             "status": "OK" if not self.kill_switch_active else "BLOCKED",
             "remote_orders": len(remote_orders),
             "bot_owned_open_orders": self.bot_owned_open_orders,
@@ -1816,6 +2013,11 @@ class DemoExecutionService:
                 "PASS" if self.usdt_position_reconciliation_ok else "UNAVAILABLE"
             ),
         }
+        if unexpected_errors:
+            raise RuntimeError(
+                "unexpected Demo reconciliation programming failure"
+            ) from unexpected_errors[0]
+        return result
 
     def cleanup_bot_owned(self) -> dict[str, int]:
         if not self.enabled or self.client is None:
@@ -2242,6 +2444,11 @@ class DemoExecutionService:
                 if self.last_reconciliation_at else None
             ),
             "sleep_resume_reconciliations": self.sleep_resume_reconciliations,
+            "terminalization_retry_warnings": self.terminalization_retry_warnings,
+            "last_terminalization_warning": self.last_terminalization_warning,
+            "terminalization_hard_failures": dict(
+                self.terminalization_hard_failures
+            ),
             "rest_reconciliation_watermark_ms": self._discard_ws_before_ms,
         }
 
@@ -2492,9 +2699,12 @@ class DemoExecutionService:
             )
             close_average = close_value / close_qty
             direction = Decimal("1") if record.side == Side.BUY else Decimal("-1")
-            record.paper_shadow_pnl = (
+            record.gross_realized_pnl = (
                 (close_average - record.average_fill_price)
-                * close_qty * direction - record.exchange_fees
+                * close_qty * direction
+            )
+            record.paper_shadow_pnl = (
+                record.gross_realized_pnl - record.exchange_fees
             )
             record.realized_exchange_pnl = record.paper_shadow_pnl
         record.updated_at = datetime.now(timezone.utc)

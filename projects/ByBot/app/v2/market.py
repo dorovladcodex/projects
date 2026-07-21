@@ -294,7 +294,13 @@ class RollingFeatureEngine:
             source_age_seconds=source_ages,
             stale_evidence=stale_evidence,
             liquidation_last_valid_at=liquidation_time,
-            liquidation_data_age_seconds=source_ages["liquidations"],
+            # Per-symbol liquidation age must derive from that symbol's last
+            # valid event. Generic source-message age remains available in
+            # source_age_seconds and must never stand in for symbol recency.
+            liquidation_data_age_seconds=(
+                max(0.0, (current - liquidation_time).total_seconds())
+                if liquidation_time else None
+            ),
             liquidation_data_valid=symbol not in self.invalid_liquidation_symbols,
             # Subscription initialization is intentionally independent from
             # event recency: a healthy stream can legitimately emit zero

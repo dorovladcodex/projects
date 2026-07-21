@@ -391,6 +391,63 @@ def test_signal_metrics_distinguish_pre_execution_and_policy_rejection(tmp_path)
     assert report["admitted_signals"] == 0
 
 
+def test_persistence_rejection_is_not_reported_as_risk_rejection(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["LTCUSDT"],
+        "symbol_cycle_metrics": {
+            "LTCUSDT": {
+                "cycles_attempted": 1, "cycles_succeeded": 1,
+                "cycles_failed": 0,
+            }
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 1},
+        "signal_metrics": {
+            "raw_candidates": 1,
+            "threshold_passes": 1,
+            "pre_execution_admissions": 1,
+            "persistence_rejections": 1,
+            "risk_rejections": 0,
+            "admitted_signals": 0,
+        },
+    }
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, []), str(tmp_path)
+    ).generate("r")
+
+    assert report["functional_result"] == "FAIL"
+    assert report["persistence_rejections"] == 1
+    assert report["risk_rejections"] == 0
+    assert "execution compatibility persistence failed" in report["functional_blockers"]
+
+
+def test_runtime_marks_persistence_rejection_as_run_invalid(tmp_path) -> None:
+    app, repository, _ = runtime(tmp_path, (Symbol.LTCUSDT,))
+    strategy = next(
+        item for item in app.strategies
+        if item.name == StrategyName.VOLUME_BREAKOUT
+    )
+    candidate = strategy.evaluate(feature(Symbol.LTCUSDT))
+
+    async def collect() -> None:
+        future = asyncio.get_running_loop().create_future()
+        future.set_result({
+            "handled_persistence_rejection": True,
+            "rejection_code": "DB_NEWS_CONTENT_COLLISION",
+        })
+        await app._collect_dispatches([(candidate, future)], "runtime-test:db")
+
+    asyncio.run(collect())
+
+    assert app.run_valid is False
+    assert app.signal_metrics["persistence_rejections"] == 1
+    assert app.signal_metrics["risk_rejections"] == 0
+    incident = next(iter(repository.incidents.values()))
+    assert incident.event_type == "EXECUTION_PERSISTENCE_REJECTED"
+    assert incident.error_category == "DB_NEWS_CONTENT_COLLISION"
+    assert incident.payload["exchange_mutation_performed"] is False
+
+
 def test_unexpected_execution_exception_remains_cycle_failure(tmp_path) -> None:
     app, repo, _ = runtime(tmp_path, (Symbol.LTCUSDT,))
     strategy = next(
@@ -409,6 +466,24 @@ def test_unexpected_execution_exception_remains_cycle_failure(tmp_path) -> None:
     incident = next(iter(repo.incidents.values()))
     assert incident.event_type == "V2_CYCLE_FAILURE"
     assert incident.payload["message"] == "unexpected execution defect"
+
+
+def test_market_strategy_batch_yields_to_status_and_shutdown_tasks(tmp_path) -> None:
+    app, _, _ = runtime(tmp_path, (Symbol.BTCUSDT, Symbol.ETHUSDT))
+
+    async def scenario() -> None:
+        scheduled = asyncio.Event()
+
+        async def status_task() -> None:
+            await asyncio.sleep(0)
+            scheduled.set()
+
+        observer = asyncio.create_task(status_task())
+        await app._process_market_strategies("runtime-test:yield")
+        assert scheduled.is_set()
+        await observer
+
+    asyncio.run(scenario())
 
 
 def test_meme_strategy_scope_is_configuration_driven(tmp_path) -> None:

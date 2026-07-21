@@ -1,0 +1,17 @@
+{
+  "execution_id": "005c8e54-e603-4076-8bb1-8f9f46e92966",
+  "run_id": "demo-v2-20260720T161242643Z",
+  "symbol": "LINKUSDT",
+  "side": "BUY",
+  "entry_order_id": "464a299b-ef7b-4ac0-9503-b9bac5bd9b29",
+  "order_link_id": "bybot-63b741-e-51b62ebe58faf8201cb9",
+  "close_order_id": "44b68d6c-63f5-4646-85e0-53bb2d7d0f70",
+  "entry_execution_id": "cfe80eed-d2d3-4070-ba95-28a80d699985",
+  "close_execution_id": "c412badc-08c6-4219-a6ee-b351b44f75f5",
+  "quantity": "5.8",
+  "entry_price": "8.579",
+  "close_price": "8.579",
+  "entry_fee": "0.02736701",
+  "close_fee": "0.02736701",
+  "close_source": "stop_loss"
+}

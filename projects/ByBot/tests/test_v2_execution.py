@@ -14,7 +14,7 @@ from app.bybit.demo import (
     demo_symbol_cooldown_window,
 )
 from app.models import (
-    BotEvent, DemoExecutionRecord, DemoExecutionState, Side, Symbol,
+    Asset, BotEvent, DemoExecutionRecord, DemoExecutionState, NewsItem, Side, Symbol,
 )
 from app.v2.execution import V2ExecutionCoordinator
 from app.v2.models import (
@@ -143,6 +143,42 @@ def test_two_symbols_can_execute_independently() -> None:
         assert service.execute(candidate)["execution_attempted"]
     assert len(demo.calls) == 2
     assert {call[0].symbol for call in demo.calls} == {Symbol.BTCUSDT, Symbol.ETHUSDT}
+
+
+def test_historical_synthetic_news_hash_does_not_block_new_candidate() -> None:
+    service, repository, demo = coordinator()
+    candidate = _admitted_candidate(service, repository, Symbol.NEARUSDT)
+    historical = NewsItem(
+        title=f"{candidate.strategy_name.value} {candidate.symbol.value}",
+        summary=candidate.entry_reason,
+        source="bybot-v2-deterministic-strategy",
+        published_at=candidate.created_at - timedelta(days=1),
+        asset_hint=Asset.MARKET,
+        importance=float(candidate.confidence),
+    )
+    assert repository.save_news(historical)
+
+    result = service.execute(candidate)
+
+    assert result["execution_attempted"] is True
+    assert result["execution_id"] is not None
+    assert len(demo.calls) == 1
+
+
+def test_compatibility_bundle_is_idempotent_for_same_candidate() -> None:
+    service, repository, _ = coordinator()
+    candidate = _admitted_candidate(service, repository, Symbol.WIFUSDT)
+    first = service._persist_compatibility_candidate(
+        candidate, Decimal("0.5"), Decimal("50")
+    )
+    second = service._persist_compatibility_candidate(
+        candidate, Decimal("0.5"), Decimal("50")
+    )
+
+    assert first is not None and second is not None
+    assert first[0].risk_preview.risk_decision_id == second[0].risk_preview.risk_decision_id
+    results = repository.load_signal_results()
+    assert [row.candidate.id for row in results].count(candidate.id) == 1
 
 
 def test_duplicate_entry_is_blocked_before_second_adapter_call() -> None:

@@ -86,10 +86,24 @@ def exact_close_reconciliation_blockers(
         DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
     }:
         blockers.append("durable state cannot be terminalized from exact close evidence")
-    if not record.order_id or not diagnosis.entry_order_history:
+    entry_order_ids = {
+        str(item.get("orderId") or "")
+        for item in diagnosis.entry_order_history
+        if item.get("orderId")
+    }
+    entry_fill_order_ids = {
+        str(item.get("orderId") or "")
+        for item in diagnosis.entry_executions
+        if item.get("orderId")
+    }
+    if not diagnosis.entry_order_history or len(entry_order_ids) != 1:
         blockers.append("exact entry order is not attributed")
     if not diagnosis.entry_executions:
         blockers.append("exact entry fill is not attributed")
+    if entry_order_ids != entry_fill_order_ids:
+        blockers.append("entry order and fill attribution disagree")
+    if record.order_id and entry_order_ids != {record.order_id}:
+        blockers.append("persisted entry order ID conflicts with exchange evidence")
     if entry_quantity <= 0 or entry_quantity != record.accepted_quantity:
         blockers.append("entry filled quantity does not equal owned quantity")
     close_order_ids = {
@@ -496,6 +510,7 @@ def apply_demo_execution_repair(
             for item in diagnosis.close_executions
         ]
         record.realized_exchange_pnl = diagnosis.net_realized_pnl
+        record.gross_realized_pnl = diagnosis.gross_realized_pnl
         record.exchange_fees = diagnosis.entry_fees + diagnosis.close_fees
         record.average_close_price = _weighted_average(diagnosis.close_executions)
         record.closed_at = max(
