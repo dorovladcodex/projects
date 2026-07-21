@@ -28,6 +28,7 @@ class StrategyName(str, Enum):
     OI_FUNDING_SQUEEZE = "OIFundingSqueezeStrategy"
     LIQUIDATION_MOMENTUM = "LiquidationMomentumStrategy"
     MEME_TREND = "MemeTrendStrategy"
+    RANGE_MEAN_REVERSION = "RangeMeanReversionStrategy"
 
 
 class ReservationState(str, Enum):
@@ -115,16 +116,25 @@ class MarketFeatureSnapshot(BaseModel):
     spread_bps: Decimal = Field(ge=0)
     bid_depth_usdt: Decimal = Field(default=Decimal("0"), ge=0)
     ask_depth_usdt: Decimal = Field(default=Decimal("0"), ge=0)
+    bid_depth_10bps_usdt: Decimal = Field(default=Decimal("0"), ge=0)
+    ask_depth_10bps_usdt: Decimal = Field(default=Decimal("0"), ge=0)
     price_momentum: dict[str, Decimal] = Field(default_factory=dict)
     breakout_distance_bps: dict[str, Decimal] = Field(default_factory=dict)
     volume_acceleration: dict[str, Decimal] = Field(default_factory=dict)
     trade_imbalance: dict[str, Decimal] = Field(default_factory=dict)
+    order_flow_imbalance: dict[str, Decimal] = Field(default_factory=dict)
     orderbook_imbalance: Decimal = Decimal("0")
+    microprice: Decimal | None = Field(default=None, gt=0)
+    microprice_deviation_bps: Decimal = Decimal("0")
     realized_volatility: dict[str, Decimal] = Field(default_factory=dict)
+    observation_count: dict[str, int] = Field(default_factory=dict)
+    window_coverage_seconds: dict[str, Decimal] = Field(default_factory=dict)
     atr_bps: Decimal = Decimal("0")
     distance_from_high_bps: Decimal = Decimal("0")
     distance_from_low_bps: Decimal = Decimal("0")
     relative_strength_vs_btc_bps: Decimal = Decimal("0")
+    rolling_correlation_vs_btc: Decimal | None = Field(default=None, ge=-1, le=1)
+    btc_beta: Decimal | None = None
     funding_rate: Decimal | None = None
     funding_deviation_bps: Decimal | None = None
     open_interest: Decimal | None = None
@@ -158,6 +168,8 @@ class ScoreComponents(BaseModel):
     estimated_slippage_penalty: Decimal
     correlation_penalty: Decimal
     portfolio_exposure_penalty: Decimal
+    regime_score: Decimal = Decimal("0")
+    uncertainty_penalty: Decimal = Decimal("0")
     final_score: Decimal
 
 
@@ -176,14 +188,22 @@ class V2SignalCandidate(BaseModel):
     raw_strategy_score: Decimal
     confidence: Decimal = Field(ge=0, le=1)
     estimated_edge_bps: Decimal
+    edge_proxy_bps: Decimal = Decimal("0")
+    edge_calibrated: bool = False
+    expected_funding_bps: Decimal = Decimal("0")
     expected_fees_bps: Decimal
     expected_slippage_bps: Decimal
     entry_reason: str
     rejection_reason: str | None = None
+    setup_valid: bool = True
+    setup_rejection_reasons: list[str] = Field(default_factory=list)
     threshold: Decimal
     distance_to_threshold: Decimal
     news_ids: list[str] = Field(default_factory=list)
     score_components: ScoreComponents | None = None
+    rank_in_cycle: int | None = Field(default=None, ge=1)
+    meta_label_probability: Decimal | None = Field(default=None, ge=0, le=1)
+    meta_label_status: str = "UNCALIBRATED"
     admitted: bool = False
     state: str = "GENERATED"
     stop_loss_pct: Decimal = Field(gt=0)
@@ -212,6 +232,8 @@ class PortfolioReservation(BaseModel):
     correlation_group: str
     notional_usdt: Decimal = Field(gt=0)
     risk_usdt: Decimal = Field(gt=0)
+    side: StrategySide | None = None
+    btc_beta: Decimal | None = None
     state: ReservationState = ReservationState.RESERVED
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     released_at: datetime | None = None

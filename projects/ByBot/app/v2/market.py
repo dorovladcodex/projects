@@ -39,6 +39,12 @@ class LiquidationPoint:
     side: str
 
 
+@dataclass(frozen=True)
+class OrderFlowPoint:
+    timestamp: datetime
+    normalized_imbalance: Decimal
+
+
 class RollingFeatureEngine:
     """Deterministic per-symbol numeric windows fed by WS or tests."""
 
@@ -55,6 +61,12 @@ class RollingFeatureEngine:
         self._book_levels: dict[
             Symbol, tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]]
         ] = {}
+        self._book_update_ids: dict[Symbol, int] = {}
+        self._book_sequences: dict[Symbol, int] = {}
+        self.executable_depth: dict[Symbol, tuple[Decimal, Decimal]] = {}
+        self.order_flow: dict[Symbol, deque[OrderFlowPoint]] = defaultdict(
+            lambda: deque(maxlen=limit)
+        )
         self.tickers: dict[Symbol, dict[str, Any]] = {}
         self.funding: dict[Symbol, tuple[Decimal, datetime]] = {}
         self.open_interest: dict[Symbol, deque[tuple[datetime, Decimal]]] = defaultdict(
@@ -91,7 +103,29 @@ class RollingFeatureEngine:
     def ingest_orderbook(
         self, symbol: Symbol, bids: list[list[object]], asks: list[list[object]],
         timestamp: datetime, *, snapshot: bool = True,
+        update_id: int | None = None, sequence: int | None = None,
     ) -> None:
+        if update_id == 1:
+            snapshot = True
+        if not snapshot:
+            prior_update = self._book_update_ids.get(symbol)
+            prior_sequence = self._book_sequences.get(symbol)
+            if (
+                (update_id is not None and prior_update is not None and update_id <= prior_update)
+                or (sequence is not None and prior_sequence is not None and sequence <= prior_sequence)
+            ):
+                state = self.source_states["orderbook"]
+                state.health = SourceHealth.DEGRADED
+                state.last_error = "out-of-order orderbook delta rejected"
+                return
+        previous_best: tuple[Decimal, Decimal, Decimal, Decimal] | None = None
+        if symbol in self._book_levels:
+            old_bids, old_asks = self._book_levels[symbol]
+            if old_bids and old_asks:
+                old_bid = max(old_bids); old_ask = min(old_asks)
+                previous_best = (
+                    old_bid, old_bids[old_bid], old_ask, old_asks[old_ask]
+                )
         if snapshot or symbol not in self._book_levels:
             bid_levels: dict[Decimal, Decimal] = {}
             ask_levels: dict[Decimal, Decimal] = {}
@@ -109,7 +143,38 @@ class RollingFeatureEngine:
             return
         bid_depth = sum((price * quantity for price, quantity in bid_levels.items()), Decimal("0"))
         ask_depth = sum((price * quantity for price, quantity in ask_levels.items()), Decimal("0"))
+        bid_floor = bid * (Decimal("1") - Decimal("0.001"))
+        ask_ceiling = ask * (Decimal("1") + Decimal("0.001"))
+        bid_depth_10bps = sum(
+            (price * quantity for price, quantity in bid_levels.items() if price >= bid_floor),
+            Decimal("0"),
+        )
+        ask_depth_10bps = sum(
+            (price * quantity for price, quantity in ask_levels.items() if price <= ask_ceiling),
+            Decimal("0"),
+        )
         self.books[symbol] = (bid, ask, bid_depth, ask_depth, timestamp)
+        if previous_best is not None and not snapshot:
+            old_bid, old_bid_qty, old_ask, old_ask_qty = previous_best
+            bid_qty = bid_levels[bid]; ask_qty = ask_levels[ask]
+            event = Decimal("0")
+            if bid >= old_bid:
+                event += bid_qty
+            if bid <= old_bid:
+                event -= old_bid_qty
+            if ask <= old_ask:
+                event -= ask_qty
+            if ask >= old_ask:
+                event += old_ask_qty
+            denominator = max(old_bid_qty + old_ask_qty, Decimal("0.00000001"))
+            self.order_flow[symbol].append(
+                OrderFlowPoint(timestamp, max(Decimal("-5"), min(Decimal("5"), event / denominator)))
+            )
+        self.executable_depth[symbol] = (bid_depth_10bps, ask_depth_10bps)
+        if update_id is not None:
+            self._book_update_ids[symbol] = update_id
+        if sequence is not None:
+            self._book_sequences[symbol] = sequence
         self._healthy("orderbook", timestamp)
 
     def ingest_liquidation(
@@ -191,6 +256,10 @@ class RollingFeatureEngine:
             "orderbook": book_time,
             "trades": trade_time,
             "liquidations": liquidation_time,
+            "funding": self.funding.get(symbol, (None, None))[1],
+            "open_interest": (
+                self.open_interest[symbol][-1][0] if self.open_interest[symbol] else None
+            ),
         }
         source_ages = {
             source: max(0.0, (current - timestamp).total_seconds())
@@ -237,24 +306,51 @@ class RollingFeatureEngine:
         acceleration: dict[str, Decimal] = {}
         imbalance: dict[str, Decimal] = {}
         volatility: dict[str, Decimal] = {}
+        order_flow: dict[str, Decimal] = {}
+        observation_count: dict[str, int] = {}
+        window_coverage: dict[str, Decimal] = {}
         for label, seconds in WINDOWS.items():
             window = [p for p in self.trades[symbol] if current - p.timestamp <= timedelta(seconds=seconds)]
             momentum[label] = _momentum(window, last)
             breakout[label] = _breakout_distance(window, last)
-            acceleration[label] = _volume_acceleration(window, current, seconds)
+            acceleration[label] = min(
+                _volume_acceleration(window, current, seconds),
+                self.settings.v2_max_volume_acceleration,
+            )
             imbalance[label] = _trade_imbalance(window)
             volatility[label] = _volatility(window)
+            ofi_rows = [
+                item.normalized_imbalance for item in self.order_flow[symbol]
+                if current - item.timestamp <= timedelta(seconds=seconds)
+            ]
+            order_flow[label] = (
+                sum(ofi_rows, Decimal("0")) / Decimal(len(ofi_rows))
+                if ofi_rows else Decimal("0")
+            )
+            observation_count[label] = len(window)
+            window_coverage[label] = (
+                Decimal(str(max(0.0, (window[-1].timestamp - window[0].timestamp).total_seconds())))
+                if len(window) >= 2 else Decimal("0")
+            )
         book_total = bid_depth + ask_depth
         book_imbalance = (
             (bid_depth - ask_depth) / book_total if book_total > 0 else Decimal("0")
         )
         spread_bps = (ask - bid) / ((ask + bid) / 2) * Decimal("10000")
+        top_bid_qty = self._book_levels[symbol][0].get(bid, Decimal("0"))
+        top_ask_qty = self._book_levels[symbol][1].get(ask, Decimal("0"))
+        top_total = top_bid_qty + top_ask_qty
+        microprice = (
+            (ask * top_bid_qty + bid * top_ask_qty) / top_total
+            if top_total > 0 else (bid + ask) / Decimal("2")
+        )
         prices = [point.price for point in self.trades[symbol] if current - point.timestamp <= timedelta(minutes=15)]
         local_high = max(prices, default=last); local_low = min(prices, default=last)
         liqs = [point for point in self.liquidations[symbol] if current - point.timestamp <= timedelta(minutes=5)]
-        # A Bybit liquidation Buy closes a short; Sell closes a long.
-        short_liq = sum((p.notional for p in liqs if p.side == "BUY"), Decimal("0"))
-        long_liq = sum((p.notional for p in liqs if p.side == "SELL"), Decimal("0"))
+        # Bybit `S` is the liquidated position side: Buy means a LONG was
+        # liquidated; Sell means a SHORT was liquidated.
+        long_liq = sum((p.notional for p in liqs if p.side == "BUY"), Decimal("0"))
+        short_liq = sum((p.notional for p in liqs if p.side == "SELL"), Decimal("0"))
         liq_total = short_liq + long_liq
         liquidation_state = self.source_states["liquidations"]
         subscribed = symbol in self.liquidation_subscriptions
@@ -272,17 +368,39 @@ class RollingFeatureEngine:
         if btc_snapshot and symbol != Symbol.BTCUSDT:
             relative = momentum["5m"] - btc_snapshot.price_momentum.get("5m", Decimal("0"))
         market_regime = _regime(momentum["15m"], volatility["15m"])
+        bid_depth_10bps, ask_depth_10bps = self.executable_depth.get(
+            symbol, (bid_depth, ask_depth)
+        )
+        correlation, beta = _btc_relationship(
+            list(self.trades[symbol]),
+            list(self.trades[Symbol.BTCUSDT]),
+            current,
+        ) if symbol != Symbol.BTCUSDT else (Decimal("1"), Decimal("1"))
         return MarketFeatureSnapshot(
             symbol=symbol, timestamp=current, fresh=fresh, stale_reasons=stale_reasons,
             last_price=last, bid_price=bid, ask_price=ask, spread_bps=spread_bps,
             bid_depth_usdt=bid_depth, ask_depth_usdt=ask_depth,
+            bid_depth_10bps_usdt=bid_depth_10bps,
+            ask_depth_10bps_usdt=ask_depth_10bps,
             price_momentum=momentum, breakout_distance_bps=breakout,
             volume_acceleration=acceleration, trade_imbalance=imbalance,
-            orderbook_imbalance=book_imbalance, realized_volatility=volatility,
-            atr_bps=_atr_bps(prices, last),
+            order_flow_imbalance=order_flow,
+            orderbook_imbalance=book_imbalance,
+            microprice=microprice,
+            microprice_deviation_bps=(microprice / last - Decimal("1")) * Decimal("10000"),
+            realized_volatility=volatility,
+            observation_count=observation_count,
+            window_coverage_seconds=window_coverage,
+            atr_bps=_atr_bps([
+                point for point in self.trades[symbol]
+                if current - point.timestamp <= timedelta(minutes=15)
+            ], last),
             distance_from_high_bps=(last - local_high) / last * Decimal("10000"),
             distance_from_low_bps=(last - local_low) / last * Decimal("10000"),
-            relative_strength_vs_btc_bps=relative, funding_rate=funding_rate,
+            relative_strength_vs_btc_bps=relative,
+            rolling_correlation_vs_btc=correlation,
+            btc_beta=beta,
+            funding_rate=funding_rate,
             funding_deviation_bps=funding_deviation,
             open_interest=self.open_interest[symbol][-1][1] if self.open_interest[symbol] else None,
             open_interest_change_pct=oi_change,
@@ -453,6 +571,8 @@ class BybitPublicWebSocketEngine:
             self.features.ingest_orderbook(
                 symbol, rows[0].get("b") or [], rows[0].get("a") or [], timestamp,
                 snapshot=str(message.get("type") or "").lower() == "snapshot",
+                update_id=(int(rows[0]["u"]) if rows[0].get("u") is not None else None),
+                sequence=(int(rows[0]["seq"]) if rows[0].get("seq") is not None else None),
             )
         elif topic.startswith("allLiquidation."):
             for row in rows:
@@ -543,7 +663,9 @@ def _volume_acceleration(points: list[TradePoint], now: datetime, seconds: int) 
     midpoint = now - timedelta(seconds=seconds / 2)
     recent = sum((p.quantity for p in points if p.timestamp >= midpoint), Decimal("0"))
     old = sum((p.quantity for p in points if p.timestamp < midpoint), Decimal("0"))
-    return recent / old if old > 0 else (Decimal("1") if recent > 0 else Decimal("0"))
+    if old <= 0:
+        return Decimal("0")
+    return recent / old
 
 
 def _trade_imbalance(points: list[TradePoint]) -> Decimal:
@@ -554,17 +676,78 @@ def _trade_imbalance(points: list[TradePoint]) -> Decimal:
 
 
 def _volatility(points: list[TradePoint]) -> Decimal:
-    if len(points) < 3:
+    prices = _time_bar_closes(points, seconds=1)
+    if len(prices) < 3:
         return Decimal("0")
-    returns = [float(points[i].price / points[i - 1].price - 1) for i in range(1, len(points))]
+    returns = [float(prices[i] / prices[i - 1] - 1) for i in range(1, len(prices))]
     return Decimal(str(pstdev(returns) * 10000))
 
 
-def _atr_bps(prices: list[Decimal], last: Decimal) -> Decimal:
-    if len(prices) < 2:
+def _atr_bps(points: list[TradePoint], last: Decimal) -> Decimal:
+    bars = _time_bars(points, seconds=60)
+    if len(bars) < 2:
         return Decimal("0")
-    moves = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
-    return sum(moves, Decimal("0")) / Decimal(len(moves)) / last * Decimal("10000")
+    true_ranges: list[Decimal] = []
+    previous_close = bars[0][3]
+    for _open, high, low, close in bars[1:]:
+        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+        previous_close = close
+    return (
+        sum(true_ranges, Decimal("0")) / Decimal(len(true_ranges)) / last * Decimal("10000")
+        if true_ranges else Decimal("0")
+    )
+
+
+def _time_bars(
+    points: list[TradePoint], *, seconds: int
+) -> list[tuple[Decimal, Decimal, Decimal, Decimal]]:
+    buckets: dict[int, list[Decimal]] = {}
+    for point in sorted(points, key=lambda item: item.timestamp):
+        key = int(point.timestamp.timestamp()) // seconds
+        buckets.setdefault(key, []).append(point.price)
+    return [
+        (values[0], max(values), min(values), values[-1])
+        for _, values in sorted(buckets.items())
+    ]
+
+
+def _time_bar_closes(points: list[TradePoint], *, seconds: int) -> list[Decimal]:
+    return [bar[3] for bar in _time_bars(points, seconds=seconds)]
+
+
+def _btc_relationship(
+    symbol_points: list[TradePoint], btc_points: list[TradePoint], now: datetime,
+) -> tuple[Decimal | None, Decimal | None]:
+    def returns_by_bucket(points: list[TradePoint]) -> dict[int, Decimal]:
+        rows = [
+            point for point in points if now - point.timestamp <= timedelta(minutes=15)
+        ]
+        closes: dict[int, Decimal] = {}
+        for point in sorted(rows, key=lambda item: item.timestamp):
+            closes[int(point.timestamp.timestamp()) // 60] = point.price
+        keys = sorted(closes)
+        return {
+            keys[index]: closes[keys[index]] / closes[keys[index - 1]] - Decimal("1")
+            for index in range(1, len(keys))
+            if closes[keys[index - 1]] > 0
+        }
+
+    symbol_returns = returns_by_bucket(symbol_points)
+    btc_returns = returns_by_bucket(btc_points)
+    keys = sorted(set(symbol_returns).intersection(btc_returns))
+    if len(keys) < 3:
+        return None, None
+    xs = [float(btc_returns[key]) for key in keys]
+    ys = [float(symbol_returns[key]) for key in keys]
+    mean_x = sum(xs) / len(xs); mean_y = sum(ys) / len(ys)
+    covariance = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / len(xs)
+    variance_x = sum((x - mean_x) ** 2 for x in xs) / len(xs)
+    variance_y = sum((y - mean_y) ** 2 for y in ys) / len(ys)
+    if variance_x <= 0 or variance_y <= 0:
+        return None, None
+    correlation = covariance / ((variance_x * variance_y) ** 0.5)
+    beta = covariance / variance_x
+    return Decimal(str(max(-1.0, min(1.0, correlation)))), Decimal(str(beta))
 
 
 def _series_change(

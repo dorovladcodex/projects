@@ -140,6 +140,7 @@ v2_portfolio_service = PortfolioRiskService(settings, persistence)
 v2_execution_coordinator = V2ExecutionCoordinator(
     settings, persistence, v2_universe_service, v2_portfolio_service,
     demo_execution_service, run_id=v2_run_id,
+    market_snapshot_provider=lambda symbol: v2_feature_engine.snapshot(symbol),
 )
 v2_runtime = V2Runtime(
     settings, persistence, v2_universe_service, v2_feature_engine,

@@ -143,6 +143,12 @@ class Settings(BaseSettings):
     v2_drain_lead_seconds: int = Field(default=300, ge=0, le=86400)
     v2_drain_timeout_seconds: int = Field(default=900, ge=30, le=86400)
     v2_liquidation_stale_seconds: int = Field(default=60, ge=5, le=3600)
+    v2_rest_data_stale_seconds: int = Field(default=180, ge=10, le=3600)
+    v2_min_feature_observations: int = Field(default=8, ge=2, le=1000)
+    v2_min_feature_coverage_pct: Decimal = Field(default=Decimal("60"), ge=0, le=100)
+    v2_min_liquidation_events: int = Field(default=1, ge=1, le=1000)
+    v2_min_liquidation_notional_usdt: Decimal = Field(default=Decimal("1000"), ge=0)
+    v2_max_volume_acceleration: Decimal = Field(default=Decimal("10"), gt=1, le=1000)
     v2_demo_account_verification_ttl_seconds: int = Field(
         default=900, ge=30, le=3600
     )
@@ -177,8 +183,25 @@ class Settings(BaseSettings):
         "DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
     )
     v2_cycle_failure_repeat_limit: int = Field(default=3, ge=1, le=100)
+    v2_max_entries_per_cycle: int = Field(default=2, ge=1, le=20)
+    v2_max_signal_submit_age_seconds: int = Field(default=5, ge=1, le=60)
+    v2_max_price_deviation_bps: Decimal = Field(default=Decimal("10"), gt=0, le=1000)
+    v2_max_book_participation_pct: Decimal = Field(default=Decimal("5"), gt=0, le=100)
+    v2_max_empirical_edge_bps: Decimal = Field(default=Decimal("250"), gt=0, le=10000)
+    v2_min_calibration_samples: int = Field(default=200, ge=20, le=100000)
+    v2_meta_label_min_probability: Decimal = Field(default=Decimal("0.58"), ge=0.5, le=1)
+    v2_regime_routing_enabled: bool = True
+    v2_range_mean_reversion_enabled: bool = False
+    v2_setup_invalidation_bps: Decimal = Field(default=Decimal("20"), ge=0, le=1000)
+    v2_trailing_update_min_bps: Decimal = Field(default=Decimal("5"), gt=0, le=1000)
+    v2_trailing_update_interval_seconds: int = Field(default=15, ge=1, le=3600)
+    v2_break_even_cost_buffer_bps: Decimal = Field(default=Decimal("3"), ge=0, le=1000)
     v2_strategy_default_threshold: float = Field(default=0.62, ge=0, le=1)
     v2_meme_strategy_threshold: float = Field(default=0.70, ge=0, le=1)
+    v2_range_strategy_threshold: float = Field(default=0.68, ge=0, le=1)
+    v2_high_volatility_threshold_addition: Decimal = Field(
+        default=Decimal("0.05"), ge=0, le=0.5
+    )
     v2_min_expected_edge_bps: Decimal = Field(default=Decimal("8"), ge=0)
 
     max_concurrent_positions: int = Field(default=8, ge=1, le=50)
@@ -194,10 +217,11 @@ class Settings(BaseSettings):
 
     risk_capital_usdt: Decimal = Field(default=Decimal("2000"), gt=0)
     max_total_notional_usdt: Decimal = Field(default=Decimal("500"), gt=0)
-    max_portfolio_risk_pct: Decimal = Field(default=Decimal("4"), gt=0, le=100)
-    v2_max_daily_loss_pct: Decimal = Field(default=Decimal("8"), gt=0, le=100)
-    v2_max_weekly_loss_pct: Decimal = Field(default=Decimal("15"), gt=0, le=100)
-    v2_max_drawdown_pct: Decimal = Field(default=Decimal("20"), gt=0, le=100)
+    max_portfolio_risk_pct: Decimal = Field(default=Decimal("1.5"), gt=0, le=100)
+    v2_per_trade_risk_pct: Decimal = Field(default=Decimal("0.25"), gt=0, le=5)
+    v2_max_daily_loss_pct: Decimal = Field(default=Decimal("2"), gt=0, le=100)
+    v2_max_weekly_loss_pct: Decimal = Field(default=Decimal("5"), gt=0, le=100)
+    v2_max_drawdown_pct: Decimal = Field(default=Decimal("10"), gt=0, le=100)
     core_position_notional_usdt: Decimal = Field(default=Decimal("75"), gt=0)
     alt_position_notional_usdt: Decimal = Field(default=Decimal("50"), gt=0)
     meme_position_notional_usdt: Decimal = Field(default=Decimal("25"), gt=0)
@@ -420,14 +444,14 @@ class Settings(BaseSettings):
     def v2_leverage_for_symbol(self, symbol: str) -> Decimal:
         if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}:
             return self.core_leverage
-        if symbol in {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
+        if symbol in {"DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
             return self.meme_leverage
         return self.alt_leverage
 
     def v2_target_notional_for_symbol(self, symbol: str) -> Decimal:
         if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}:
             return self.core_position_notional_usdt
-        if symbol in {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
+        if symbol in {"DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
             return self.meme_position_notional_usdt
         return self.alt_position_notional_usdt
 

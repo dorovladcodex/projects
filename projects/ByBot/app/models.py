@@ -208,6 +208,8 @@ class DemoExecutionRecord(BaseModel):
     realized_exchange_pnl: Decimal | None = None
     maximum_favorable_excursion: Decimal = Decimal("0")
     maximum_adverse_excursion: Decimal = Decimal("0")
+    trailing_stop_updated_at: datetime | None = None
+    trailing_stop_update_count: int = Field(default=0, ge=0)
     entry_slippage: Decimal | None = None
     exit_slippage: Decimal | None = None
     paper_shadow_pnl: Decimal | None = None

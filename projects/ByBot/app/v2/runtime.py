@@ -26,6 +26,7 @@ from app.v2.logging import configure_v2_logging
 from app.v2.models import NewsModelUsage, StrategyName, V2Incident, V2SignalCandidate
 from app.v2.news import V2ExternalTrendService, V2NewsAggregator
 from app.v2.portfolio import PortfolioRiskService, correlation_group
+from app.v2.research import CalibrationObservation, EmpiricalEdgeCalibrator
 from app.v2.scoring import AdmissionContext, CommonScoringPipeline
 from app.v2.strategies import MemeTrendContext, NewsStrategyContext, build_v2_strategies
 from app.v2.universe import SymbolUniverseService
@@ -64,6 +65,10 @@ class V2Runtime:
             if settings.v2_enabled else logging.getLogger("bybot.v2.disabled")
         )
         self.candidates: list[V2SignalCandidate] = repository.load_v2_signal_candidates(run_id)
+        self.edge_calibrator = EmpiricalEdgeCalibrator(
+            settings.v2_min_calibration_samples
+        )
+        self._restore_calibration_history()
         self.started_at = datetime.now(timezone.utc)
         self.last_cycle_at: datetime | None = None
         self.last_error: str | None = None
@@ -77,6 +82,11 @@ class V2Runtime:
         self._last_rest_poll_at: datetime | None = None
         self._execution_pools: dict[Symbol, ThreadPoolExecutor] = {}
         restored = repository.load_v2_run_runtime(run_id) if hasattr(repository, "load_v2_run_runtime") else {}
+        self.failure_circuit_breaker_active = bool(
+            restored.get("failure_circuit_breaker_active", False)
+        )
+        if self.failure_circuit_breaker_active:
+            self.stop_new_entries = True
         self.run_valid = bool(restored.get("run_valid", True))
         self.run_invalid_reasons: list[str] = list(
             restored.get("run_invalid_reasons") or []
@@ -444,12 +454,16 @@ class V2Runtime:
             if not decision["candidate_ids"] and not decision["rejection_reason"]:
                 decision["rejection_reason"] = "no_accepted_symbol_with_fresh_market_confirmation"
             self._persist_news_audit("V2_NEWS_DECISION_AUDIT", decision)
-        await self._execute_concurrently(executable, cycle_id)
+        await self._execute_concurrently(
+            self._select_ranked_candidates(executable), cycle_id
+        )
 
     async def _process_market_strategies(self, cycle_id: str) -> None:
         if self.stop_new_entries:
             return
+        executable: list[V2SignalCandidate] = []
         dispatches: list[tuple[V2SignalCandidate, asyncio.Future[Any]]] = []
+        dispatched_count = 0
         for symbol in self.universe.accepted_symbols:
             # Candidate persistence is synchronous and can involve multiple DB
             # round trips. Cooperatively yield between full-universe items.
@@ -503,9 +517,24 @@ class V2Runtime:
                 self._increment(self.strategy_evaluation_counts, strategy.name.value)
                 try:
                     if strategy.name == StrategyName.MEME_TREND:
+                        trend_available = bool(
+                            self.external_trends
+                            and self.external_trends.health.value == "OK"
+                            and self.external_trends.last_updated_at is not None
+                            and (
+                                datetime.now(timezone.utc)
+                                - self.external_trends.last_updated_at
+                            ).total_seconds()
+                            <= self.settings.v2_rest_data_stale_seconds
+                        )
                         candidate = strategy.evaluate(feature, meme=MemeTrendContext(
                             Decimal(str(self.external_trends.score(symbol)))
-                            if self.external_trends else Decimal("0")
+                            if self.external_trends else Decimal("0"),
+                            available=trend_available,
+                            observed_at=(
+                                self.external_trends.last_updated_at
+                                if self.external_trends else None
+                            ),
                         ))
                     else:
                         candidate = strategy.evaluate(feature)
@@ -513,9 +542,7 @@ class V2Runtime:
                     metric["candidates_generated"] += 1
                     if admitted.admitted:
                         metric["candidates_admitted"] += 1
-                        dispatched = self._dispatch_now(admitted)
-                        if dispatched is not None:
-                            dispatches.append((admitted, dispatched))
+                        executable.append(admitted)
                     else:
                         metric["candidates_rejected"] += 1
                 except Exception as exc:
@@ -526,13 +553,30 @@ class V2Runtime:
                         symbol=symbol, strategy=strategy.name.value,
                         input_field=_input_field_for_exception(exc),
                     )
+            if (
+                executable
+                and self.settings.v2_auto_demo_execution
+                and dispatched_count < self.settings.v2_max_entries_per_cycle
+            ):
+                remaining = self.settings.v2_max_entries_per_cycle - dispatched_count
+                for selected in self._select_ranked_candidates(
+                    executable, limit=remaining
+                ):
+                    dispatched = self._dispatch_now(selected)
+                    if dispatched is not None:
+                        dispatches.append((selected, dispatched))
+                        dispatched_count += 1
+                executable = []
             if symbol_failed:
                 metric["cycles_failed"] += 1
             else:
                 metric["cycles_succeeded"] += 1
                 metric["latest_success_timestamp"] = datetime.now(timezone.utc).isoformat()
                 metric["latest_failure_category"] = None
-        await self._collect_dispatches(dispatches, cycle_id)
+        if self.settings.v2_auto_demo_execution:
+            await self._collect_dispatches(dispatches, cycle_id)
+        else:
+            self._select_ranked_candidates(executable)
 
     def _feature(self, symbol: Symbol) -> Any | None:
         btc = None
@@ -545,9 +589,38 @@ class V2Runtime:
 
     def _admit(self, candidate: V2SignalCandidate) -> V2SignalCandidate:
         candidate.run_id = self.run_id
+        estimate = self.edge_calibrator.estimate(candidate)
+        candidate.meta_label_status = estimate.status
+        candidate.meta_label_probability = estimate.win_probability_lower_bound
+        if estimate.ready and estimate.expected_net_edge_bps is not None:
+            candidate.edge_calibrated = True
+            candidate.estimated_edge_bps = min(
+                self.settings.v2_max_empirical_edge_bps,
+                max(
+                    Decimal("0"),
+                    estimate.expected_net_edge_bps
+                    + candidate.expected_fees_bps
+                    + candidate.expected_slippage_bps
+                    + candidate.expected_funding_bps,
+                ),
+            )
         self._record_signal_metric("raw_candidates", candidate)
         notional = self.settings.v2_target_notional_for_symbol(candidate.symbol.value)
-        portfolio_reasons = self.portfolio.block_reasons(candidate.symbol, notional)
+        risk_usdt = notional * candidate.stop_loss_pct / Decimal("100")
+        try:
+            portfolio_reasons = self.portfolio.block_reasons(
+                candidate.symbol,
+                notional,
+                risk_usdt=risk_usdt,
+                side=candidate.side,
+                btc_beta=candidate.feature_snapshot.btc_beta,
+            )
+        except TypeError:
+            # Lightweight read-only test/report portfolios may implement the
+            # original two-argument protocol.
+            portfolio_reasons = self.portfolio.block_reasons(
+                candidate.symbol, notional
+            )
         status = self.universe.get(candidate.symbol)
         exposure = sum(
             row.notional_usdt for row in self.portfolio.reservations
@@ -617,6 +690,71 @@ class V2Runtime:
             },
         )
         return candidate
+
+    def _restore_calibration_history(self) -> None:
+        loader = getattr(self.repository, "load_demo_executions", None)
+        candidate_loader = getattr(
+            self.repository, "load_v2_signal_candidates", None
+        )
+        if not callable(loader) or not callable(candidate_loader):
+            return
+        try:
+            candidates = {
+                str(item.id): item for item in candidate_loader(None)
+            }
+            observations: list[CalibrationObservation] = []
+            for record in loader():
+                candidate = candidates.get(str(record.candidate_id))
+                opened_at = (
+                    record.first_fill_at
+                    or record.exchange_fill_at
+                    or record.position_confirmed_at
+                    or record.created_at
+                )
+                if (
+                    candidate is None
+                    or record.closed_at is None
+                    or record.realized_exchange_pnl is None
+                    or record.average_fill_price is None
+                    or record.accepted_quantity <= 0
+                ):
+                    continue
+                notional = record.average_fill_price * record.accepted_quantity
+                if notional <= 0:
+                    continue
+                observations.append(CalibrationObservation(
+                    strategy=candidate.strategy_name.value,
+                    symbol=candidate.symbol.value,
+                    regime=candidate.market_regime,
+                    net_return_bps=(
+                        record.realized_exchange_pnl / notional * Decimal("10000")
+                    ),
+                    opened_at=opened_at,
+                    closed_at=record.closed_at,
+                ))
+            self.edge_calibrator.fit(observations)
+        except Exception:
+            # Calibration is a shadow enhancement. Any restore uncertainty
+            # leaves the deterministic gates intact and never enables a trade.
+            self.edge_calibrator.fit([])
+
+    def _select_ranked_candidates(
+        self, candidates: list[V2SignalCandidate], *, limit: int | None = None,
+    ) -> list[V2SignalCandidate]:
+        ranked = self.scoring.rank(candidates)
+        selection_limit = (
+            self.settings.v2_max_entries_per_cycle if limit is None else limit
+        )
+        selected = ranked[:selection_limit]
+        for candidate in ranked[selection_limit:]:
+            candidate.admitted = False
+            candidate.state = "RANKING_REJECTED"
+            candidate.rejection_reason = (
+                "not selected by current-cycle net-edge ranking"
+            )
+        for candidate in ranked:
+            self.repository.save_v2_signal_candidate(candidate)
+        return selected
 
     async def _execute_concurrently(
         self, candidates: list[V2SignalCandidate], cycle_id: str
@@ -894,6 +1032,12 @@ class V2Runtime:
             error_category=type(exc).__name__, payload=payload, occurred_at=now,
         )
         self.repository.save_v2_incident(incident)
+        if count >= self.settings.v2_cycle_failure_repeat_limit:
+            self.failure_circuit_breaker_active = True
+            self.stop_new_entries = True
+            reason = f"repeated V2 failure circuit breaker: {stage}/{fingerprint}"
+            if reason not in self.run_invalid_reasons:
+                self.run_invalid_reasons.append(reason)
         self.logger.exception(
             "V2 isolated failure: %s", message,
             exc_info=(type(exc), exc, exc.__traceback__),
@@ -997,6 +1141,7 @@ class V2Runtime:
                 ),
             },
             "failure_occurrences": self.failure_occurrences,
+            "failure_circuit_breaker_active": self.failure_circuit_breaker_active,
             "news_metrics": self.news_metrics,
             "news_source_metrics": self.news_aggregator.source_metrics,
             "stale_metrics": {
@@ -1027,6 +1172,19 @@ class V2Runtime:
             "strategy_ineligible_evaluations": 0,
             "cycle_failure_repeat_limit": self.settings.v2_cycle_failure_repeat_limit,
             "cycles": self.cycles,
+            "portfolio_risk": {
+                "kill_switch_active": self.portfolio.kill_switch_active,
+                "kill_switch_reasons": list(self.portfolio.kill_switch_reasons),
+                "daily_pnl": str(getattr(self.portfolio, "daily_pnl", 0)),
+                "weekly_pnl": str(getattr(self.portfolio, "weekly_pnl", 0)),
+                "cumulative_realized_pnl": str(
+                    getattr(self.portfolio, "cumulative_realized_pnl", 0)
+                ),
+                "unrealized_pnl": str(getattr(self.portfolio, "unrealized_pnl", 0)),
+                "equity": str(getattr(self.portfolio, "equity", self.settings.risk_capital_usdt)),
+                "peak_equity": str(getattr(self.portfolio, "peak_equity", self.settings.risk_capital_usdt)),
+                "drawdown_pct": str(getattr(self.portfolio, "current_drawdown_pct", 0)),
+            },
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -1036,12 +1194,16 @@ class V2Runtime:
             saver(self.run_id, self._runtime_metrics_payload())
 
     def _monitor_positions(self) -> None:
+        prices: dict[Symbol, Decimal] = {}
+        open_records: list[Any] = []
         for record in self.repository.load_demo_executions():
             if record.run_id != self.run_id or record.state.value != "DEMO_POSITION_OPEN":
                 continue
+            open_records.append(record)
             feature = self.features.snapshot(record.symbol)
             if feature is None:
                 continue
+            prices[record.symbol] = feature.last_price
             if not feature.fresh:
                 self.stale_metrics["position_stale_observations"] += 1
                 self.repository.save_v2_incident(V2Incident(
@@ -1075,7 +1237,25 @@ class V2Runtime:
                 stale_exit_threshold_seconds=float(
                     self.settings.v2_position_data_stale_exit_seconds
                 ),
+                setup_valid=self._position_setup_still_valid(record, feature),
             )
+        marker = getattr(self.portfolio, "mark_to_market", None)
+        if callable(marker):
+            marker(open_records, prices)
+
+    def _position_setup_still_valid(self, record: Any, feature: Any) -> bool:
+        direction = Decimal("1") if record.side.value == "BUY" else Decimal("-1")
+        momentum = direction * feature.price_momentum.get("1m", Decimal("0"))
+        if momentum < -self.settings.v2_setup_invalidation_bps:
+            return False
+        if record.strategy_name == StrategyName.OI_FUNDING_SQUEEZE.value:
+            return (
+                feature.open_interest_change_pct is not None
+                and feature.funding_deviation_bps is not None
+            )
+        if record.strategy_name == StrategyName.RANGE_MEAN_REVERSION.value:
+            return feature.market_regime == "RANGE"
+        return True
 
     def _sync_reservations(self) -> None:
         terminal = {
@@ -1089,6 +1269,9 @@ class V2Runtime:
                 continue
             record = records.get(str(reservation.execution_id))
             if record and record.state.value in terminal:
+                ledger = getattr(self.portfolio, "apply_execution_result", None)
+                if callable(ledger):
+                    ledger(record)
                 self.portfolio.release(
                     reservation.id,
                     closed_at=record.closed_at or record.updated_at,

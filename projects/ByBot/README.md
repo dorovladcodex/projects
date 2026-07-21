@@ -14,12 +14,28 @@ and run-scoped reports. Orders can target only the exact authenticated Bybit Dem
 domain through the explicit runner. Live, mainnet and testnet execution remain
 blocked.
 
+V2 admission is side-aware and regime-routed. OI/funding and liquidation
+strategies require their own fresh inputs, edge proxies are bounded by the
+planned exit, current-cycle opportunities are ranked by net edge, and sizing is
+risk-, liquidity- and portfolio-capped. The optional RANGE mean-reversion
+challenger is disabled by default until it has enough out-of-sample evidence.
+
 Read-only validation (no order submission):
 
 ```powershell
 .\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe .\scripts\demo_v2_preflight.py
 ```
+
+Read-only alpha evidence check for a completed run:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\v2_alpha_validation.py `
+  --artifacts .\artifacts\demo-v2\<run_id>
+```
+
+Exit code `2` means the run has insufficient evidence; the command never
+initializes exchange mutation code.
 
 Operator-authorized commands are documented in `docs/RUNBOOK.md`; automated
 development never starts the burn-in or soak.

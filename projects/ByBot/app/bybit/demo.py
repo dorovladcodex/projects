@@ -314,6 +314,7 @@ class DemoExchangeClient(Protocol):
 
     def verify_credentials(self) -> bool: ...
     def get_account_info(self) -> dict[str, Any]: ...
+    def get_fee_rate(self, symbol: Symbol) -> tuple[Decimal, Decimal]: ...
     def get_instrument(self, symbol: Symbol) -> InstrumentRules: ...
     def get_positions(
         self, symbol: Symbol | str | None = None, settle_coin: str | None = None
@@ -486,6 +487,24 @@ class BybitDemoRestClient:
         data = self._request("GET", "/v5/account/info", {})
         result = data.get("result")
         return result if isinstance(result, dict) else {}
+
+    def get_fee_rate(self, symbol: Symbol) -> tuple[Decimal, Decimal]:
+        data = self._request(
+            "GET", "/v5/account/fee-rate",
+            {"category": "linear", "symbol": symbol.value},
+        )
+        rows = (data.get("result") or {}).get("list") or []
+        row = next(
+            (item for item in rows if str(item.get("symbol") or symbol.value) == symbol.value),
+            None,
+        )
+        if row is None:
+            raise DemoExchangeError("fee rate is unavailable for symbol")
+        maker = _decimal(row.get("makerFeeRate")) * Decimal("10000")
+        taker = _decimal(row.get("takerFeeRate")) * Decimal("10000")
+        if maker < 0 or taker < 0:
+            raise DemoExchangeError("negative fee rate is not supported")
+        return maker, taker
 
     def get_instrument(self, symbol: Symbol) -> InstrumentRules:
         data = self._request(
@@ -763,6 +782,8 @@ class DemoExecutionService:
         self.usdt_order_reconciliation_ok = False
         self.usdt_position_reconciliation_ok = False
         self.leverage_normalized = False
+        self._fee_rate_cache: dict[Symbol, tuple[Decimal, Decimal, datetime]] = {}
+
         self.account_margin_mode: str | None = None
         self.last_reconciliation_at: datetime | None = None
         self.reconciliation_in_progress = False
@@ -787,6 +808,22 @@ class DemoExecutionService:
                     raise DemoSafetyError("Demo run boundary could not be persisted")
                 self.run_started_at = persisted_run["started_at"]
         self.restore()
+
+    def estimated_round_trip_fee_bps(self, symbol: Symbol) -> Decimal:
+        """Read the authenticated fee tier; fail safely to configured taker cost."""
+        current = datetime.now(timezone.utc)
+        cached = self._fee_rate_cache.get(symbol)
+        if cached and current - cached[2] <= timedelta(minutes=15):
+            return cached[1] * Decimal("2")
+        loader = getattr(self.client, "get_fee_rate", None)
+        if not callable(loader):
+            return self.settings.v2_taker_fee_bps * Decimal("2")
+        try:
+            maker, taker = loader(symbol)
+        except Exception:
+            return self.settings.v2_taker_fee_bps * Decimal("2")
+        self._fee_rate_cache[symbol] = (maker, taker, current)
+        return taker * Decimal("2")
 
     def restore(self) -> None:
         loader = getattr(self.repository, "load_demo_kill_switch", None)
@@ -1016,6 +1053,7 @@ class DemoExecutionService:
         maximum_holding_seconds: int | None = None,
         latency_timeline: dict[str, datetime | None] | None = None,
         instrument_rules: InstrumentRules | None = None,
+        pre_submit_market_guard: Callable[[], Decimal] | None = None,
     ) -> DemoExecutionRecord | None:
         if not self.enabled or self.client is None:
             return None
@@ -1219,6 +1257,10 @@ class DemoExecutionService:
             protection_plan_completed_at=timeline.get("protection_plan_completed_at"),
             execution_stage_durations_ms=durations,
         )
+        if pre_submit_market_guard is not None:
+            entry_reference = Decimal(str(pre_submit_market_guard()))
+            validate_order_notional(quantity, entry_reference, rules)
+            record.reference_entry_price = entry_reference
         database_started = start("database_execution_state")
         record.database_execution_state_started_at = timeline["database_execution_state_started_at"]
         reserved = self.repository.reserve_demo_execution(record)
@@ -1922,8 +1964,16 @@ class DemoExecutionService:
                 if owned.accepted_quantity > 0 and remote_size != owned.accepted_quantity:
                     self.reconciliation_incidents += 1
                     self._activate_kill_switch("remote Demo position quantity mismatch")
-                elif datetime.now(timezone.utc) - _aware(owned.created_at) >= timedelta(
-                    minutes=self.settings.paper_position_timeout_minutes
+                elif datetime.now(timezone.utc) - _aware(
+                    owned.first_fill_at
+                    or owned.exchange_fill_at
+                    or owned.position_confirmed_at
+                    or owned.created_at
+                ) >= timedelta(
+                    seconds=(
+                        owned.maximum_holding_seconds
+                        or self.settings.paper_position_timeout_minutes * 60
+                    )
                 ):
                     self._submit_reduce_only_close(owned, remote_size, "maximum_holding_time")
                 elif not _protection_present(position):
@@ -2309,8 +2359,14 @@ class DemoExecutionService:
         record.maximum_favorable_excursion = max(record.maximum_favorable_excursion, move)
         record.maximum_adverse_excursion = min(record.maximum_adverse_excursion, move)
         close_reason: str | None = None
+        opened_at = (
+            record.first_fill_at
+            or record.exchange_fill_at
+            or record.position_confirmed_at
+            or record.created_at
+        )
         if record.maximum_holding_seconds and (
-            current - _aware(record.created_at)
+            current - _aware(opened_at)
         ).total_seconds() >= record.maximum_holding_seconds:
             close_reason = "maximum_holding_time"
         elif not data_fresh:
@@ -2356,6 +2412,11 @@ class DemoExecutionService:
             and record.stop_loss is not None
             and record.protection_confirmed
             and move > Decimal("0")
+            and (
+                record.trailing_stop_updated_at is None
+                or (current - _aware(record.trailing_stop_updated_at)).total_seconds()
+                >= self.settings.v2_trailing_update_interval_seconds
+            )
         ):
             positions = [
                 item for item in self.client.get_positions(record.symbol)
@@ -2377,18 +2438,59 @@ class DemoExecutionService:
                     record.stop_loss_pct or Decimal("0")
                 ) / Decimal("100")
                 if move >= break_even_trigger:
-                    proposed = (
-                        max(proposed, record.average_fill_price)
+                    costs = (
+                        self.settings.v2_taker_fee_bps * Decimal("2")
+                        + self.settings.v2_slippage_bps * Decimal("2")
+                        + self.settings.v2_break_even_cost_buffer_bps
+                    ) / Decimal("10000")
+                    cost_adjusted_break_even = (
+                        record.average_fill_price * (Decimal("1") + costs)
                         if record.side == Side.BUY
-                        else min(proposed, record.average_fill_price)
+                        else record.average_fill_price * (Decimal("1") - costs)
+                    )
+                    proposed = (
+                        max(proposed, cost_adjusted_break_even)
+                        if record.side == Side.BUY
+                        else min(proposed, cost_adjusted_break_even)
                     )
                 improves = (
                     proposed > record.stop_loss if record.side == Side.BUY
                     else proposed < record.stop_loss
                 )
+                minimum_step = (
+                    record.stop_loss
+                    * self.settings.v2_trailing_update_min_bps
+                    / Decimal("10000")
+                )
+                improves = improves and abs(proposed - record.stop_loss) >= minimum_step
                 if improves:
-                    self.client.set_trading_stop(record.symbol, record.take_profit, proposed)
+                    try:
+                        self.client.set_trading_stop(
+                            record.symbol, record.take_profit, proposed
+                        )
+                    except DemoExchangeError as exc:
+                        if "not modified" not in str(exc).lower():
+                            raise
+                    verified_positions = self.client.get_positions(record.symbol)
+                    verified = next(
+                        (
+                            item for item in verified_positions
+                            if _decimal(item.get("size"), default="0")
+                            == record.accepted_quantity
+                            and str(item.get("side") or "").upper()
+                            == record.side.value
+                        ),
+                        None,
+                    )
+                    if verified is None or not _protection_matches(
+                        verified, record.take_profit, proposed
+                    ):
+                        raise DemoSafetyError(
+                            "updated trailing protection could not be verified"
+                        )
                     record.stop_loss = proposed
+                    record.trailing_stop_updated_at = current
+                    record.trailing_stop_update_count += 1
                     record.updated_at = current
                     self.repository.save_demo_execution(record, event_type="V2_TRAILING_STOP_UPDATED")
         record.updated_at = current

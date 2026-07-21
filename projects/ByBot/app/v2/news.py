@@ -458,6 +458,7 @@ class V2ExternalTrendService:
         self.scores: dict[Symbol, float] = {}
         self.health = SourceHealth.UNAVAILABLE
         self.last_error: str | None = None
+        self.last_updated_at: datetime | None = None
 
     async def poll(self) -> None:
         try:
@@ -477,7 +478,10 @@ class V2ExternalTrendService:
                 for symbol in Symbol:
                     if symbol.value.removesuffix("USDT") == symbol_text:
                         scores[symbol] = max(-1.0, min(1.0, scores.get(symbol, 0) + change / 100))
-            self.scores = scores; self.health = SourceHealth.OK; self.last_error = None
+            self.scores = scores
+            self.health = SourceHealth.OK
+            self.last_error = None
+            self.last_updated_at = datetime.now(timezone.utc)
         except Exception as exc:
             self.health = SourceHealth.DEGRADED; self.last_error = type(exc).__name__
 

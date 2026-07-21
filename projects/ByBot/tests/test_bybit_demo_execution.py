@@ -1096,7 +1096,8 @@ def test_restart_rest_reconciliation_recovers_filled_entry() -> None:
     client.executions = [{
         "execId": "rest-exec", "orderId": record.order_id,
         "orderLinkId": record.order_link_id, "execQty": "0.010",
-        "execPrice": "65000", "execFee": "0.3", "execTime": "1783900000000",
+        "execPrice": "65000", "execFee": "0.3",
+        "execTime": str(int(datetime.now(timezone.utc).timestamp() * 1000)),
     }]
     client.positions = [{
         "symbol": "BTCUSDT", "size": "0.010", "side": "Buy",

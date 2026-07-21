@@ -2382,7 +2382,7 @@ class PersistenceRepository:
                     return None
                 if sum(row.correlation_group == reservation.correlation_group for row in active) >= settings.max_positions_per_correlation_group:
                     return None
-                meme_symbols = {"PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}
+                meme_symbols = {"DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}
                 if reservation.symbol.value in meme_symbols and sum(row.symbol in meme_symbols for row in active) >= settings.max_meme_positions:
                     return None
                 if sum(Decimal(str(row.notional_usdt)) for row in active) + reservation.notional_usdt > settings.max_total_notional_usdt:

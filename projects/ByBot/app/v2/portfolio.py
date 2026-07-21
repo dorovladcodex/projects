@@ -8,7 +8,7 @@ from threading import RLock
 from typing import Any, Iterator
 
 from app.config import Settings
-from app.models import Symbol
+from app.models import DemoExecutionRecord, Side, Symbol
 from app.v2.models import (
     PortfolioReservation, ReservationState, StrategyName, UniverseInstrument,
 )
@@ -54,6 +54,11 @@ class PortfolioRiskService:
         self.current_drawdown_pct = Decimal("0")
         self.daily_pnl = Decimal("0")
         self.weekly_pnl = Decimal("0")
+        self.cumulative_realized_pnl = Decimal("0")
+        self.unrealized_pnl = Decimal("0")
+        self.equity = settings.risk_capital_usdt
+        self.peak_equity = settings.risk_capital_usdt
+        self.realized_events: dict[str, dict[str, str]] = {}
         self.restore()
 
     def restore(self) -> None:
@@ -115,6 +120,26 @@ class PortfolioRiskService:
         self.daily_pnl = Decimal(str(state.get("daily_pnl", "0")))
         self.weekly_pnl = Decimal(str(state.get("weekly_pnl", "0")))
         self.current_drawdown_pct = Decimal(str(state.get("current_drawdown_pct", "0")))
+        self.cumulative_realized_pnl = Decimal(
+            str(state.get("cumulative_realized_pnl", "0"))
+        )
+        self.unrealized_pnl = Decimal(str(state.get("unrealized_pnl", "0")))
+        self.equity = Decimal(
+            str(state.get("equity", self.settings.risk_capital_usdt))
+        )
+        self.peak_equity = Decimal(
+            str(state.get("peak_equity", max(self.settings.risk_capital_usdt, self.equity)))
+        )
+        self.realized_events = {
+            str(key): {str(k): str(v) for k, v in dict(value).items()}
+            for key, value in dict(state.get("realized_events") or {}).items()
+        }
+        now = datetime.now(timezone.utc)
+        self.symbol_cooldown_until = {
+            symbol: until for symbol, until in self.symbol_cooldown_until.items()
+            if until > now
+        }
+        self._recompute_account(now=now)
         if recovered_reservation:
             self._persist_state()
 
@@ -125,6 +150,7 @@ class PortfolioRiskService:
 
     def block_reasons(
         self, symbol: Symbol, notional: Decimal, *, risk_usdt: Decimal | None = None,
+        side: Any | None = None, btc_beta: Decimal | None = None,
         now: datetime | None = None,
     ) -> list[str]:
         current = now or datetime.now(timezone.utc)
@@ -146,6 +172,16 @@ class PortfolioRiskService:
         projected_risk = sum(item.risk_usdt for item in active) + (risk_usdt or Decimal("0"))
         if risk_usdt is not None and projected_risk > self.settings.risk_capital_usdt * self.settings.max_portfolio_risk_pct / Decimal("100"):
             reasons.append("maximum portfolio risk reached")
+        if side is not None and btc_beta is not None:
+            direction = Decimal("1") if str(getattr(side, "value", side)).upper() in {"LONG", "BUY"} else Decimal("-1")
+            projected_beta_notional = sum(
+                row.notional_usdt
+                * (Decimal("1") if str(getattr(row.side, "value", row.side)).upper() in {"LONG", "BUY"} else Decimal("-1"))
+                * (row.btc_beta if row.btc_beta is not None else Decimal("1"))
+                for row in active
+            ) + notional * direction * btc_beta
+            if abs(projected_beta_notional) > self.settings.max_total_notional_usdt:
+                reasons.append("maximum directional BTC-beta exposure reached")
         cooldown = self.symbol_cooldown_until.get(symbol)
         if cooldown and cooldown > current:
             reasons.append("symbol cooldown is active")
@@ -170,14 +206,18 @@ class PortfolioRiskService:
     def reserve(
         self, *, run_id: str, candidate_id: Any, symbol: Symbol,
         strategy_name: StrategyName, notional: Decimal, risk_usdt: Decimal,
+        side: Any | None = None, btc_beta: Decimal | None = None,
     ) -> PortfolioReservation | None:
         with self._global_lock, self.symbol_lock(symbol):
-            if self.block_reasons(symbol, notional, risk_usdt=risk_usdt):
+            if self.block_reasons(
+                symbol, notional, risk_usdt=risk_usdt, side=side, btc_beta=btc_beta
+            ):
                 return None
             reservation = PortfolioReservation(
                 run_id=run_id, candidate_id=candidate_id, symbol=symbol,
                 strategy_name=strategy_name, correlation_group=correlation_group(symbol),
                 notional_usdt=notional, risk_usdt=risk_usdt,
+                side=side, btc_beta=btc_beta,
             )
             saver = getattr(self.repository, "reserve_v2_portfolio", None)
             if callable(saver):
@@ -227,8 +267,12 @@ class PortfolioRiskService:
             self._persist_state()
 
     def apply_realized_pnl(self, pnl: Decimal, peak_equity: Decimal, equity: Decimal) -> None:
+        """Backward-compatible manual ledger update used by older callers."""
         self.daily_pnl += pnl
         self.weekly_pnl += pnl
+        self.cumulative_realized_pnl += pnl
+        self.equity = equity
+        self.peak_equity = max(self.peak_equity, peak_equity, equity)
         self.current_drawdown_pct = (
             (peak_equity - equity) / peak_equity * Decimal("100") if peak_equity > 0 else Decimal("0")
         )
@@ -244,6 +288,80 @@ class PortfolioRiskService:
             self.kill_switch_active = True
             self.kill_switch_reasons.extend(reason for reason in reasons if reason not in self.kill_switch_reasons)
         self._persist_state()
+
+    def apply_execution_result(self, record: DemoExecutionRecord) -> bool:
+        """Credit one terminal execution exactly once to the durable ledger."""
+        execution_id = str(record.id)
+        if execution_id in self.realized_events:
+            return False
+        if record.realized_exchange_pnl is None or record.closed_at is None:
+            return False
+        self.realized_events[execution_id] = {
+            "pnl": str(record.realized_exchange_pnl),
+            "closed_at": record.closed_at.isoformat(),
+            "fees": str(record.exchange_fees),
+            "symbol": record.symbol.value,
+        }
+        self._recompute_account(now=datetime.now(timezone.utc))
+        self._persist_state()
+        return True
+
+    def mark_to_market(
+        self, records: list[DemoExecutionRecord], prices: dict[Symbol, Decimal],
+        *, now: datetime | None = None,
+    ) -> None:
+        unrealized = Decimal("0")
+        for record in records:
+            if (
+                record.state.value != "DEMO_POSITION_OPEN"
+                or record.average_fill_price is None
+                or record.accepted_quantity <= 0
+                or record.symbol not in prices
+            ):
+                continue
+            direction = Decimal("1") if record.side == Side.BUY else Decimal("-1")
+            unrealized += (
+                prices[record.symbol] - record.average_fill_price
+            ) * record.accepted_quantity * direction
+        self.unrealized_pnl = unrealized
+        self._recompute_account(now=now or datetime.now(timezone.utc))
+        self._persist_state()
+
+    def _recompute_account(self, *, now: datetime) -> None:
+        events: list[tuple[datetime, Decimal]] = []
+        for value in self.realized_events.values():
+            try:
+                events.append((datetime.fromisoformat(value["closed_at"]), Decimal(value["pnl"])))
+            except (KeyError, ValueError):
+                continue
+        self.cumulative_realized_pnl = sum((pnl for _, pnl in events), Decimal("0"))
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = day_start - timedelta(days=day_start.weekday())
+        self.daily_pnl = sum((pnl for stamp, pnl in events if stamp >= day_start), Decimal("0"))
+        self.weekly_pnl = sum((pnl for stamp, pnl in events if stamp >= week_start), Decimal("0"))
+        self.equity = (
+            self.settings.risk_capital_usdt
+            + self.cumulative_realized_pnl
+            + self.unrealized_pnl
+        )
+        self.peak_equity = max(self.peak_equity, self.equity, self.settings.risk_capital_usdt)
+        self.current_drawdown_pct = (
+            (self.peak_equity - self.equity) / self.peak_equity * Decimal("100")
+            if self.peak_equity > 0 else Decimal("0")
+        )
+        reasons: list[str] = []
+        capital = self.settings.risk_capital_usdt
+        if self.daily_pnl <= -(capital * self.settings.v2_max_daily_loss_pct / 100):
+            reasons.append("maximum daily net loss reached")
+        if self.weekly_pnl <= -(capital * self.settings.v2_max_weekly_loss_pct / 100):
+            reasons.append("maximum weekly net loss reached")
+        if self.current_drawdown_pct >= self.settings.v2_max_drawdown_pct:
+            reasons.append("maximum portfolio drawdown reached")
+        if reasons:
+            self.kill_switch_active = True
+            self.kill_switch_reasons.extend(
+                reason for reason in reasons if reason not in self.kill_switch_reasons
+            )
 
     def _transition(
         self, reservation_id: Any, state: ReservationState, *, execution_id: Any = None,
@@ -270,6 +388,11 @@ class PortfolioRiskService:
                 "kill_switch_reasons": list(self.kill_switch_reasons),
                 "daily_pnl": str(self.daily_pnl), "weekly_pnl": str(self.weekly_pnl),
                 "current_drawdown_pct": str(self.current_drawdown_pct),
+                "cumulative_realized_pnl": str(self.cumulative_realized_pnl),
+                "unrealized_pnl": str(self.unrealized_pnl),
+                "equity": str(self.equity),
+                "peak_equity": str(self.peak_equity),
+                "realized_events": self.realized_events,
             })
 
 

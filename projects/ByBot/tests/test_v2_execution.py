@@ -23,7 +23,7 @@ from app.v2.models import (
 )
 from app.v2.portfolio import PortfolioRiskService
 from app.v2.scoring import CommonScoringPipeline
-from app.v2.strategies import NewsStrategyContext, build_v2_strategies
+from app.v2.strategies import MemeTrendContext, NewsStrategyContext, build_v2_strategies
 
 
 def demo_settings() -> Settings:
@@ -68,7 +68,11 @@ def features(symbol: Symbol, direction: int = 1) -> MarketFeatureSnapshot:
         realized_volatility={key: Decimal("10") for key in windows},
         atr_bps=Decimal("25"), relative_strength_vs_btc_bps=sign * Decimal("40"),
         open_interest_change_pct=Decimal("3"), funding_deviation_bps=-sign * Decimal("5"),
-        liquidation_imbalance=sign * Decimal("0.9"), volume_24h=Decimal("1000000"),
+        liquidation_imbalance=sign * Decimal("0.9"),
+        liquidation_event_count_5m=2,
+        liquidation_notional_5m=Decimal("5000"),
+        liquidation_data_age_seconds=1,
+        volume_24h=Decimal("1000000"),
         market_regime="TRENDING_UP" if direction > 0 else "TRENDING_DOWN",
         source_health={"ticker": SourceHealth.OK, "trades": SourceHealth.OK, "orderbook": SourceHealth.OK},
     )
@@ -206,12 +210,18 @@ def test_kill_switch_blocks_without_exchange_mutation() -> None:
 
 
 def test_all_strategies_are_wired_to_same_demo_coordinator() -> None:
-    for strategy in build_v2_strategies(demo_settings()):
+    for strategy in (
+        item for item in build_v2_strategies(demo_settings()) if item.enabled
+    ):
         service, repository, demo = coordinator()
         symbol = Symbol.PEPEUSDT if strategy.name == StrategyName.MEME_TREND else Symbol.BTCUSDT
         snapshot = features(symbol)
         if strategy.name == StrategyName.NEWS_MOMENTUM_V2:
             candidate = strategy.evaluate(snapshot, news=NewsStrategyContext("BULLISH", Decimal("1"), Decimal("1"), ("n",)))
+        elif strategy.name == StrategyName.MEME_TREND:
+            candidate = strategy.evaluate(
+                snapshot, meme=MemeTrendContext(Decimal("1"), available=True)
+            )
         else:
             candidate = strategy.evaluate(snapshot)
         candidate.raw_strategy_score = Decimal("1"); candidate.confidence = Decimal("1")

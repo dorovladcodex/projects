@@ -1,5 +1,23 @@
 # ByBot project state
 
+## V2 alpha-safety status
+
+- Liquidation side follows Bybit's documented position-side semantics.
+- Scoring is side-aware and regime-aware; zero evidence no longer earns a
+  positive magnitude score.
+- OI/funding, liquidation, meme-trend and rolling-history inputs have explicit
+  setup gates.
+- Edge proxies are bounded by the strategy TP and retained separately from
+  empirical calibration.
+- Candidate admission ranks current-cycle opportunities and limits dispatches.
+- Demo sizing uses risk capital / stop distance, then notional and near-touch
+  liquidity caps.
+- The durable portfolio ledger credits each terminal execution once and tracks
+  realized/unrealized PnL, equity, peak equity and UTC daily/weekly limits.
+- A shadow empirical calibrator remains non-authoritative until its minimum
+  sample count is reached. `scripts/v2_alpha_validation.py` creates a read-only
+  bootstrap evidence report.
+
 ## Completed
 
 - FastAPI health/status, mock and Bybit REST public market data with safe failure.

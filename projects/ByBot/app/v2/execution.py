@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 
 from app.bybit.demo import DemoExecutionService, DemoSafetyError, require_demo_execution
@@ -80,6 +80,7 @@ class V2ExecutionCoordinator:
         universe: SymbolUniverseService, portfolio: PortfolioRiskService,
         demo_execution: DemoExecutionService,
         *, run_id: str,
+        market_snapshot_provider: Callable[[Any], Any | None] | None = None,
     ) -> None:
         self.settings = settings
         self.repository = repository
@@ -87,6 +88,7 @@ class V2ExecutionCoordinator:
         self.portfolio = portfolio
         self.demo_execution = demo_execution
         self.run_id = run_id
+        self.market_snapshot_provider = market_snapshot_provider
         self._locks = {symbol: RLock() for symbol in universe.statuses}
         self.last_error: str | None = None
 
@@ -145,15 +147,45 @@ class V2ExecutionCoordinator:
             return self._blocked(candidate, "symbol is not in the validated universe")
         if not candidate.feature_snapshot.fresh:
             return self._blocked(candidate, "mandatory market data is stale")
+        fee_loader = getattr(
+            self.demo_execution, "estimated_round_trip_fee_bps", None
+        )
+        if callable(fee_loader):
+            candidate.expected_fees_bps = Decimal(
+                str(fee_loader(candidate.symbol))
+            )
+        total_cost = (
+            candidate.expected_fees_bps
+            + candidate.expected_slippage_bps
+            + candidate.expected_funding_bps
+        )
+        if candidate.estimated_edge_bps <= (
+            total_cost + self.settings.v2_min_expected_edge_bps
+        ):
+            return self._blocked(
+                candidate, "latest account costs invalidate expected net edge"
+            )
         target_notional = self.settings.v2_target_notional_for_symbol(candidate.symbol.value)
         active_notional = sum(
             row.notional_usdt for row in self.portfolio.reservations
             if row.state in self.portfolio.ACTIVE
         )
-        max_for_position = min(
-            target_notional,
-            self.settings.max_total_notional_usdt - active_notional,
+        directional_depth = (
+            candidate.feature_snapshot.ask_depth_10bps_usdt
+            or candidate.feature_snapshot.ask_depth_usdt
+            if candidate.side == StrategySide.LONG
+            else candidate.feature_snapshot.bid_depth_10bps_usdt
+            or candidate.feature_snapshot.bid_depth_usdt
         )
+        max_for_position = calculate_risk_target_notional(
+            self.settings,
+            stop_loss_pct=candidate.stop_loss_pct,
+            category_target_notional=target_notional,
+            executable_depth_usdt=directional_depth,
+            active_notional_usdt=active_notional,
+        )
+        if max_for_position <= 0:
+            return self._blocked(candidate, "no risk or liquidity capacity remains")
         entry_price = (
             candidate.feature_snapshot.ask_price
             if candidate.side == StrategySide.LONG
@@ -161,7 +193,7 @@ class V2ExecutionCoordinator:
         )
         try:
             quantity = normalize_order_quantity(
-                target_notional, entry_price, universe_status.instrument,
+                max_for_position, entry_price, universe_status.instrument,
                 max_for_position,
             )
         except ValueError as exc:
@@ -176,6 +208,8 @@ class V2ExecutionCoordinator:
             run_id=self.run_id, candidate_id=candidate.id, symbol=candidate.symbol,
             strategy_name=candidate.strategy_name, notional=notional,
             risk_usdt=risk_usdt,
+            side=candidate.side,
+            btc_beta=candidate.feature_snapshot.btc_beta,
         )
         if reservation is None:
             return self._blocked(candidate, "durable portfolio reservation was rejected")
@@ -216,10 +250,17 @@ class V2ExecutionCoordinator:
                     "execution_task_received_at": candidate.execution_task_received_at,
                 },
                 instrument_rules=universe_status.instrument,
+                pre_submit_market_guard=lambda: self._pre_submit_market_guard(
+                    candidate, entry_price
+                ),
             )
         except DemoSafetyError as exc:
             policy = classify_expected_demo_policy_rejection(exc)
             if policy is None:
+                if self.repository.get_demo_execution(str(candidate.id)) is None:
+                    self.portfolio.release(
+                        reservation.id, activate_cooldown=False
+                    )
                 raise
             rejected_at = datetime.now(timezone.utc)
             self.portfolio.release(
@@ -249,6 +290,16 @@ class V2ExecutionCoordinator:
                 "exchange_order_submitted": False,
                 "exchange_environment": "BYBIT_DEMO",
             }
+        except Exception:
+            # Release only when the exchange state machine never acquired its
+            # own durable reservation. An uncertain/created execution must stay
+            # reserved for reconciliation.
+            durable_execution = self.repository.get_demo_execution(str(candidate.id))
+            if durable_execution is None:
+                self.portfolio.release(reservation.id, activate_cooldown=False)
+            else:
+                self.portfolio.mark_open(reservation.id, durable_execution.id)
+            raise
         if record is None:
             self.last_error = self.demo_execution.last_error or "Demo execution was blocked"
             self.portfolio.release(reservation.id, activate_cooldown=False)
@@ -263,6 +314,36 @@ class V2ExecutionCoordinator:
             "notional": str(notional), "leverage": str(leverage),
             "exchange_environment": "BYBIT_DEMO",
         }
+
+    def _pre_submit_market_guard(
+        self, candidate: V2SignalCandidate, original_entry_price: Decimal
+    ) -> Decimal:
+        current = (
+            self.market_snapshot_provider(candidate.symbol)
+            if self.market_snapshot_provider is not None
+            else candidate.feature_snapshot
+        )
+        if current is None or not current.fresh:
+            raise DemoSafetyError("final pre-submit market data is unavailable or stale")
+        now = datetime.now(timezone.utc)
+        if (now - current.timestamp).total_seconds() > self.settings.v2_max_signal_submit_age_seconds:
+            raise DemoSafetyError("final pre-submit market snapshot is too old")
+        if current.spread_bps > self.settings.v2_max_spread_bps:
+            raise DemoSafetyError("final pre-submit spread is too wide")
+        depth = (
+            current.ask_depth_10bps_usdt or current.ask_depth_usdt
+            if candidate.side == StrategySide.LONG
+            else current.bid_depth_10bps_usdt or current.bid_depth_usdt
+        )
+        if depth < self.settings.v2_min_orderbook_depth_usdt:
+            raise DemoSafetyError("final pre-submit executable depth is insufficient")
+        current_entry = (
+            current.ask_price if candidate.side == StrategySide.LONG else current.bid_price
+        )
+        deviation = abs(current_entry / original_entry_price - Decimal("1")) * Decimal("10000")
+        if deviation > self.settings.v2_max_price_deviation_bps:
+            raise DemoSafetyError("price moved beyond the pre-submit tolerance")
+        return current_entry
 
     def _persist_compatibility_candidate(
         self, candidate: V2SignalCandidate, quantity: Decimal, notional: Decimal,
@@ -383,4 +464,33 @@ def _market_snapshot(candidate: V2SignalCandidate) -> MarketSnapshot:
         trend_score=float(max(Decimal("-1"), min(Decimal("1"), feature.price_momentum.get("1m", Decimal("0")) / Decimal("100")))),
         volatility_pct=float(feature.realized_volatility.get("1m", Decimal("0")) / Decimal("100")),
         liquidity_ok=feature.spread_bps <= Decimal("15"), api_stable=feature.fresh,
+    )
+
+
+def calculate_risk_target_notional(
+    settings: Settings,
+    *,
+    stop_loss_pct: Decimal,
+    category_target_notional: Decimal,
+    executable_depth_usdt: Decimal,
+    active_notional_usdt: Decimal,
+) -> Decimal:
+    if stop_loss_pct <= 0:
+        return Decimal("0")
+    risk_budget = (
+        settings.risk_capital_usdt
+        * settings.v2_per_trade_risk_pct
+        / Decimal("100")
+    )
+    risk_target = risk_budget / (stop_loss_pct / Decimal("100"))
+    liquidity_cap = (
+        executable_depth_usdt * settings.v2_max_book_participation_pct
+        / Decimal("100")
+    )
+    remaining = max(
+        Decimal("0"), settings.max_total_notional_usdt - active_notional_usdt
+    )
+    return max(
+        Decimal("0"),
+        min(category_target_notional, risk_target, liquidity_cap, remaining),
     )
