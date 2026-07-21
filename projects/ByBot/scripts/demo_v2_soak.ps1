@@ -299,6 +299,30 @@ function Assert-SingleUvicornOwner {
     }
 }
 
+function Wait-UvicornReady {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$BaseUrl,
+        [int]$TimeoutSeconds = 240
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Process.HasExited) {
+            $Process.WaitForExit()
+            $Process.Refresh()
+            throw ('FastAPI exited before readiness: ' + $Process.ExitCode)
+        }
+        try {
+            $null = Invoke-RestMethod ($BaseUrl + '/health') -TimeoutSec 2
+            Assert-SingleUvicornOwner -ExpectedPid $Process.Id
+            return
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    throw ('FastAPI did not become ready within ' + $TimeoutSeconds + ' seconds.')
+}
+
 function Invoke-FinalValidation {
     if ($script:finalValidationRan) { return }
     $script:finalValidationRan = $true
@@ -387,25 +411,35 @@ try {
         ) -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
 
         $base = 'http://127.0.0.1:8137'
-        $ready = $false
-        for ($i=0; $i -lt 240; $i++) {
-            if ($script:process.HasExited) { throw "FastAPI exited before readiness: $($script:process.ExitCode)" }
-            try { $null = Invoke-RestMethod "$base/health" -TimeoutSec 2; $ready = $true; break } catch { Start-Sleep -Seconds 1 }
-        }
-        if (-not $ready) { throw 'FastAPI did not become ready.' }
-        Assert-SingleUvicornOwner -ExpectedPid $script:process.Id
+        Wait-UvicornReady -Process $script:process -BaseUrl $base
         $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 5
         if (-not $status.preflight_ok) { throw ('V2 runtime preflight failed: ' + ($status.preflight_blockers -join '; ')) }
         Write-Host ('V2 STARTED: PASS run_id=' + $runId)
 
         while ([DateTime]::UtcNow -lt $deadline) {
             Start-Sleep -Seconds 30
+            $restartReason = $null
             if ($script:process.HasExited) {
-                Write-Warning 'FastAPI stopped; restarting with the same durable run_id.'
+                $restartReason = 'process exited'
+            } else {
+                try {
+                    # HasExited is insufficient on Windows: the process can
+                    # survive an accept-loop socket failure while port 8137 is
+                    # no longer listening.  Port ownership is the authoritative
+                    # readiness invariant for this local runner.
+                    Assert-SingleUvicornOwner -ExpectedPid $script:process.Id
+                } catch {
+                    $restartReason = 'listener ownership lost'
+                }
+            }
+            if ($null -ne $restartReason) {
+                Write-Warning (
+                    'FastAPI unavailable (' + $restartReason +
+                    '); restarting with the same durable run_id.'
+                )
                 Stop-Uvicorn
                 $script:process = Start-Process -FilePath $python -ArgumentList @('-m','uvicorn','app.main:app','--host','127.0.0.1','--port','8137') -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -WindowStyle Hidden
-                Start-Sleep -Seconds 5
-                Assert-SingleUvicornOwner -ExpectedPid $script:process.Id
+                Wait-UvicornReady -Process $script:process -BaseUrl $base
             }
             try {
                 $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 3

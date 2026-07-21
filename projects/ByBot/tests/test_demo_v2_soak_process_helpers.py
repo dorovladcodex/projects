@@ -183,4 +183,20 @@ def test_owner_check_uses_bound_integer_pid_without_nullable_value() -> None:
 
 def test_runner_allows_bounded_four_minute_startup_reconciliation() -> None:
     source = RUNNER.read_text(encoding="utf-8")
-    assert "for ($i=0; $i -lt 240; $i++)" in source
+    assert "function Wait-UvicornReady" in source
+    assert "[int]$TimeoutSeconds = 240" in source
+
+
+def test_alive_uvicorn_without_listener_is_restarted() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    main = source.split(
+        "$deadline = [DateTime]::UtcNow.AddHours($Hours)", 1
+    )[1]
+    loop = main.split(
+        "while ([DateTime]::UtcNow -lt $deadline)", 1
+    )[1].split("$null = Invoke-RestMethod \"$base/v2/stop-new-entries\"", 1)[0]
+
+    assert "Assert-SingleUvicornOwner -ExpectedPid $script:process.Id" in loop
+    assert "$restartReason = 'listener ownership lost'" in loop
+    assert "Wait-UvicornReady -Process $script:process -BaseUrl $base" in loop
+    assert "restarting with the same durable run_id" in loop
