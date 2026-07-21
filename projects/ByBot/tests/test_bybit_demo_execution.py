@@ -15,6 +15,7 @@ from app.bybit.demo import (
     DEMO_PRIVATE_WS_URL,
     DEMO_REST_URL,
     BybitDemoRestClient,
+    DemoExchangeError,
     DemoExecutionService,
     DemoSafetyError,
     InstrumentRules,
@@ -1696,3 +1697,119 @@ def test_direct_cleanup_cancels_only_owned_protection_and_closes_reduce_only() -
     assert len(client.orders) == 1
     assert client.orders[0]["reduceOnly"] == "true"
     assert client.orders[0]["qty"] == "0.001"
+
+
+def test_direct_cleanup_treats_coupled_tp_sl_cancel_as_idempotent() -> None:
+    class CoupledProtectionClient(FakeDemoClient):
+        def cancel_order(self, symbol, order_id):
+            self.cancelled.append((symbol, order_id))
+            if self.open_orders:
+                self.open_orders = []
+                return {"retCode": 0}
+            raise DemoExchangeError("Bybit Demo request failed: order not exists")
+
+    repo, client = MemoryRepository(), CoupledProtectionClient()
+    demo = DemoExecutionService(
+        demo_settings(demo_canary_enabled=True),
+        repo, client, run_id="demo-test-run",
+    )
+    candidate, _, _, _ = candidate_bundle()
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=1, run_id=demo.run_id,
+        order_link_id="entry", order_id="entry-id",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("65000"), take_profit=Decimal("65650"),
+        stop_loss=Decimal("64675"), protection_confirmed=True,
+    )
+    repo.records[str(candidate.id)] = record
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.001", "side": "Buy",
+        "takeProfit": "65650", "stopLoss": "64675", "leverage": "1",
+        "positionIdx": 0,
+    }]
+    client.open_orders = [
+        {
+            "symbol": "BTCUSDT", "orderId": order_id, "orderLinkId": "",
+            "side": "Sell", "qty": "0.001", "reduceOnly": True,
+            "closeOnTrigger": True, "stopOrderType": stop_type,
+            "createType": (
+                "CreateByTakeProfit"
+                if stop_type == "TakeProfit" else "CreateByStopLoss"
+            ),
+            "positionIdx": 0,
+            "triggerDirection": 1 if stop_type == "TakeProfit" else 2,
+            "triggerPrice": trigger,
+        }
+        for order_id, stop_type, trigger in (
+            ("tp", "TakeProfit", "65650"),
+            ("sl", "StopLoss", "64675"),
+        )
+    ]
+
+    demo.direct_cleanup_execution(str(record.id), "restart failed")
+
+    assert client.cancelled == [
+        (Symbol.BTCUSDT, "tp"), (Symbol.BTCUSDT, "sl")
+    ]
+    assert len(client.orders) == 1
+    assert client.orders[0]["reduceOnly"] == "true"
+    assert client.orders[0]["qty"] == "0.001"
+
+
+def test_direct_cleanup_is_available_for_guarded_v2_without_canary_flag() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = DemoExecutionService(
+        demo_settings(v2_enabled=True, demo_canary_enabled=False),
+        repo, client, run_id="demo-v2-run",
+    )
+    candidate, _, _, _ = candidate_bundle()
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=1, run_id=demo.run_id,
+        order_link_id="entry", order_id="entry-id",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("65000"), protection_confirmed=True,
+    )
+    repo.records[str(candidate.id)] = record
+    client.positions = [{
+        "symbol": "BTCUSDT", "size": "0.001", "side": "Buy",
+        "takeProfit": "", "stopLoss": "", "leverage": "1", "positionIdx": 0,
+    }]
+
+    demo.direct_cleanup_execution(str(record.id), "v2 startup failed")
+
+    assert len(client.orders) == 1
+    assert client.orders[0]["reduceOnly"] == "true"
+
+
+def test_demo_status_marks_pre_entry_remote_snapshot_stale() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, _, _, _ = candidate_bundle()
+    confirmed_at = datetime.now(timezone.utc)
+    record = DemoExecutionRecord(
+        candidate_id=candidate.id, risk_decision_id=1, run_id=demo.run_id,
+        order_link_id="entry", order_id="entry-id",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT, side=Side.BUY,
+        requested_quantity=Decimal("0.001"), accepted_quantity=Decimal("0.001"),
+        position_confirmed_at=confirmed_at, protection_confirmed=True,
+    )
+    repo.records[str(candidate.id)] = record
+    demo.last_reconciliation_at = confirmed_at - timedelta(seconds=1)
+
+    stale = demo.as_status()
+    assert stale["remote_state_authoritative"] is False
+    assert stale["remote_state_snapshot_state"] == "STALE"
+
+    demo.reconciliation_in_progress = True
+    assert demo.as_status()["remote_state_snapshot_state"] == "REFRESHING"
+
+    demo.reconciliation_in_progress = False
+    demo.last_reconciliation_at = confirmed_at + timedelta(seconds=1)
+    ready = demo.as_status()
+    assert ready["remote_state_authoritative"] is True
+    assert ready["remote_state_snapshot_state"] == "READY"

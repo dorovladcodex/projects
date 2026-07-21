@@ -2262,7 +2262,11 @@ class DemoExecutionService:
         self, execution_id: str, reason: str
     ) -> DemoExecutionRecord:
         """One-shot exact-execution cleanup for an unavailable FastAPI process."""
-        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+        if (
+            not self.enabled
+            or self.client is None
+            or not (self.settings.demo_canary_enabled or self.settings.v2_enabled)
+        ):
             raise DemoSafetyError("direct Demo cleanup is unavailable")
         require_demo_execution(self.settings)
         validate_demo_domains(self.client.base_url, self.client.private_ws_url)
@@ -2288,8 +2292,31 @@ class DemoExecutionService:
         for order in associated:
             order_id = str(order.get("orderId") or "")
             if order_id:
-                self.client.cancel_order(record.symbol, order_id)
+                try:
+                    self.client.cancel_order(record.symbol, order_id)
+                except Exception:
+                    # Bybit Full TP/SL is a coupled protection set: cancelling
+                    # one generated order can remove its sibling as well.  A
+                    # subsequent cancel then returns an error even though the
+                    # requested safety state has already been reached.  Trust
+                    # only a bounded authoritative re-read, never the error
+                    # text, before treating that response as idempotent.
+                    remaining = self.client.get_open_orders(symbol=record.symbol)
+                    if any(
+                        str(item.get("orderId") or "") == order_id
+                        for item in remaining
+                    ):
+                        raise
         record.failure_reason = reason[:250]
+        # Cancellation and a concurrently triggered protection order can
+        # change the position.  Re-read immediately before the exact reduce-
+        # only close and never use the pre-cancellation quantity blindly.
+        active = [
+            item for item in self.client.get_positions(symbol=record.symbol)
+            if _decimal(item.get("size"), default="0") > 0
+        ]
+        if len(active) > 1:
+            raise DemoSafetyError("multiple remote positions prevent direct cleanup")
         if active:
             remote_size = _decimal(active[0].get("size"), default="0")
             if record.accepted_quantity <= 0 or remote_size != record.accepted_quantity:
@@ -2502,6 +2529,40 @@ class DemoExecutionService:
         counts: dict[str, int] = {}
         for record in records:
             counts[record.state.value] = counts.get(record.state.value, 0) + 1
+        active_records = [
+            record for record in records if record.state not in TERMINAL_DEMO_STATES
+        ]
+        active_remote_watermarks = [
+            value
+            for record in active_records
+            if (
+                value := (
+                    record.position_confirmed_at
+                    or record.first_fill_at
+                    or record.exchange_fill_at
+                    or record.exchange_order_created_at
+                    or record.created_at
+                )
+            ) is not None
+        ]
+        latest_active_remote_watermark = (
+            max(_aware(value) for value in active_remote_watermarks)
+            if active_remote_watermarks else None
+        )
+        remote_state_authoritative = bool(
+            not self.reconciliation_in_progress
+            and self.last_reconciliation_at is not None
+            and (
+                latest_active_remote_watermark is None
+                or _aware(self.last_reconciliation_at)
+                >= latest_active_remote_watermark
+            )
+        )
+        remote_state_snapshot_state = (
+            "REFRESHING"
+            if self.reconciliation_in_progress
+            else "READY" if remote_state_authoritative else "STALE"
+        )
         return {
             "enabled": self.enabled,
             "environment": "demo" if self.enabled else "disabled",
@@ -2532,6 +2593,13 @@ class DemoExecutionService:
             "bot_owned_open_orders": self.bot_owned_open_orders,
             "unrelated_open_orders": self.unrelated_open_orders,
             "bot_owned_open_positions": self.bot_owned_open_positions,
+            "remote_state_authoritative": remote_state_authoritative,
+            "remote_state_snapshot_state": remote_state_snapshot_state,
+            "reconciliation_in_progress": self.reconciliation_in_progress,
+            "active_execution_remote_watermark": (
+                latest_active_remote_watermark.isoformat()
+                if latest_active_remote_watermark else None
+            ),
             "last_error": self.last_error,
             "account_verified": self.account_verified,
             "risk_capital_usdt": str(self.settings.demo_risk_capital_usdt),

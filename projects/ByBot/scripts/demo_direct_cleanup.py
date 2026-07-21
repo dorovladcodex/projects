@@ -25,7 +25,11 @@ def main() -> int:
         return 1
     try:
         settings = get_settings()
-        repository = PersistenceRepository(settings.database_url, create_schema=False)
+        # This command is a Windows host process.  Docker services use `db`,
+        # while host-run recovery must address the published PostgreSQL port.
+        # Keep the substitution in memory and never print the resulting URL.
+        database_url = settings.database_url.replace("@db:", "@127.0.0.1:")
+        repository = PersistenceRepository(database_url, create_schema=False)
         client = BybitDemoRestClient(
             api_key=settings.bybit_api_key, api_secret=settings.bybit_api_secret,
             base_url=settings.bybit_private_demo_base_url,
