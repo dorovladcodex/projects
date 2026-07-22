@@ -154,6 +154,14 @@ class InstrumentRules:
 
 
 @dataclass(frozen=True)
+class ProtectionVerificationOutcome:
+    record: DemoExecutionRecord
+    verified: bool
+    terminalizing: bool
+    attempts: int
+
+
+@dataclass(frozen=True)
 class CanaryMinimumOrderPlan:
     """Exchange-minimum order plan bounded by an explicit canary budget.
 
@@ -2431,6 +2439,70 @@ class DemoExecutionService:
         self._submit_reduce_only_close(record, remote_size, "canary_close")
         return record
 
+    def request_canary_trailing_update(
+        self, execution_id: str
+    ) -> DemoExecutionRecord | None:
+        """Exercise the production protection verifier on one owned canary."""
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            return None
+        require_demo_execution(self.settings)
+        record = next(
+            (
+                item for item in self.repository.load_demo_executions()
+                if str(item.id) == execution_id and item.run_id == self.run_id
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        with self._execution_lock(record.id):
+            record = next(
+                (
+                    item for item in self.repository.load_demo_executions()
+                    if str(item.id) == execution_id and item.run_id == self.run_id
+                ),
+                record,
+            )
+            if record.state != DemoExecutionState.DEMO_POSITION_OPEN:
+                raise DemoSafetyError("trailing canary requires an open owned position")
+            rules = self.client.get_instrument(record.symbol)
+            position = _owned_position(
+                self.client.get_positions(symbol=record.symbol), record
+            )
+            if position is None:
+                raise DemoSafetyError("trailing canary position ownership is unavailable")
+            current_tp = _decimal(position.get("takeProfit"), default="0")
+            current_sl = _decimal(position.get("stopLoss"), default="0")
+            mark_price = _decimal(position.get("markPrice"), default="0")
+            if current_tp <= 0 or current_sl <= 0 or mark_price <= 0:
+                raise DemoSafetyError("trailing canary protection or mark price is unavailable")
+            if record.side == Side.BUY:
+                ceiling = normalize_price(
+                    mark_price - rules.tick_size * Decimal("2"),
+                    rules,
+                    round_up=False,
+                )
+                requested_sl = min(current_sl + rules.tick_size, ceiling)
+                if requested_sl <= current_sl:
+                    raise DemoSafetyError("no safe BUY trailing increment is available")
+            else:
+                floor = normalize_price(
+                    mark_price + rules.tick_size * Decimal("2"),
+                    rules,
+                    round_up=True,
+                )
+                requested_sl = max(current_sl - rules.tick_size, floor)
+                if requested_sl >= current_sl:
+                    raise DemoSafetyError("no safe SELL trailing increment is available")
+            outcome = self._update_and_verify_protection(
+                record,
+                rules=rules,
+                take_profit=current_tp,
+                stop_loss=requested_sl,
+                verified_at=datetime.now(timezone.utc),
+            )
+            return outcome.record
+
     def monitor_strategy_position(
         self,
         execution_id: str,
@@ -2444,12 +2516,45 @@ class DemoExecutionService:
         now: datetime | None = None,
     ) -> DemoExecutionRecord | None:
         """Manage one exact owned V2 position; unrelated positions are untouched."""
-        current = now or datetime.now(timezone.utc)
         record = next(
             (item for item in self.repository.load_demo_executions() if str(item.id) == execution_id),
             None,
         )
-        if record is None or record.state != DemoExecutionState.DEMO_POSITION_OPEN:
+        if record is None:
+            return record
+        with self._execution_lock(record.id):
+            record = next(
+                (
+                    item for item in self.repository.load_demo_executions()
+                    if str(item.id) == execution_id
+                ),
+                record,
+            )
+            return self._monitor_strategy_position_locked(
+                record,
+                last_price,
+                data_fresh=data_fresh,
+                setup_valid=setup_valid,
+                stale_feature=stale_feature,
+                stale_age_seconds=stale_age_seconds,
+                stale_exit_threshold_seconds=stale_exit_threshold_seconds,
+                now=now,
+            )
+
+    def _monitor_strategy_position_locked(
+        self,
+        record: DemoExecutionRecord,
+        last_price: Decimal,
+        *,
+        data_fresh: bool,
+        setup_valid: bool,
+        stale_feature: str | None,
+        stale_age_seconds: float | None,
+        stale_exit_threshold_seconds: float | None,
+        now: datetime | None,
+    ) -> DemoExecutionRecord:
+        current = now or datetime.now(timezone.utc)
+        if record.state != DemoExecutionState.DEMO_POSITION_OPEN:
             return record
         if record.average_fill_price is None or record.accepted_quantity <= 0:
             return record
@@ -2563,38 +2668,200 @@ class DemoExecutionService:
                 )
                 improves = improves and abs(proposed - record.stop_loss) >= minimum_step
                 if improves:
-                    try:
-                        self.client.set_trading_stop(
-                            record.symbol, record.take_profit, proposed
-                        )
-                    except DemoExchangeError as exc:
-                        if "not modified" not in str(exc).lower():
-                            raise
-                    verified_positions = self.client.get_positions(record.symbol)
-                    verified = next(
-                        (
-                            item for item in verified_positions
-                            if _decimal(item.get("size"), default="0")
-                            == record.accepted_quantity
-                            and str(item.get("side") or "").upper()
-                            == record.side.value
-                        ),
-                        None,
+                    # The break-even clamp above can introduce more precision
+                    # than Bybit's tick. Canonicalize *after* every clamp before
+                    # mutation and comparison.
+                    proposed = normalize_price(
+                        proposed,
+                        rules,
+                        round_up=record.side == Side.SELL,
                     )
-                    if verified is None or not _protection_matches(
-                        verified, record.take_profit, proposed
-                    ):
-                        raise DemoSafetyError(
-                            "updated trailing protection could not be verified"
-                        )
-                    record.stop_loss = proposed
-                    record.trailing_stop_updated_at = current
-                    record.trailing_stop_update_count += 1
-                    record.updated_at = current
-                    self.repository.save_demo_execution(record, event_type="V2_TRAILING_STOP_UPDATED")
+                    outcome = self._update_and_verify_protection(
+                        record,
+                        rules=rules,
+                        take_profit=record.take_profit,
+                        stop_loss=proposed,
+                        verified_at=current,
+                    )
+                    record = outcome.record
+                    if outcome.terminalizing:
+                        return record
         record.updated_at = current
         self.repository.save_demo_execution(record, event_type="V2_POSITION_METRICS_UPDATED")
         return record
+
+    def _update_and_verify_protection(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        take_profit: Decimal,
+        stop_loss: Decimal,
+        verified_at: datetime,
+    ) -> ProtectionVerificationOutcome:
+        """Mutate once, then verify from bounded authoritative REST snapshots."""
+        if self.client is None:
+            raise DemoSafetyError("Demo exchange client is unavailable")
+        round_up = record.side == Side.SELL
+        normalized_tp = normalize_price(take_profit, rules, round_up=round_up)
+        normalized_sl = normalize_price(stop_loss, rules, round_up=round_up)
+        requested = {
+            "take_profit": str(take_profit),
+            "stop_loss": str(stop_loss),
+            "active_price": None,
+        }
+        normalized = {
+            "take_profit": str(normalized_tp),
+            "stop_loss": str(normalized_sl),
+            "tick_size": str(rules.tick_size),
+        }
+
+        # An identical update is idempotent and must not cause a second REST
+        # mutation, including when two monitoring tasks race.
+        before = self.client.get_positions(record.symbol)
+        owned_before = _owned_position(before, record)
+        if owned_before is not None and _normalized_protection_matches(
+            owned_before, normalized_tp, normalized_sl, rules, record.side
+        ):
+            self._persist_protection_verification(
+                record,
+                requested=requested,
+                normalized=normalized,
+                position=owned_before,
+                attempt=0,
+                mutation_response=None,
+                result="ALREADY_VERIFIED",
+                blocker=None,
+                observed_at=verified_at,
+            )
+            record.stop_loss = normalized_sl
+            return ProtectionVerificationOutcome(record, True, False, 0)
+
+        mutation_response: dict[str, Any] | None = None
+        try:
+            response = self.client.set_trading_stop(
+                record.symbol, normalized_tp, normalized_sl
+            )
+            mutation_response = _sanitized_mutation_response(response)
+        except DemoExchangeError as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+            mutation_response = {"retCode": "IDEMPOTENT", "retMsg": "not modified"}
+
+        attempts = self.settings.v2_protection_verification_attempts
+        for attempt in range(1, attempts + 1):
+            positions = self.client.get_positions(record.symbol)
+            owned = _owned_position(positions, record)
+            if owned is not None:
+                matches = _normalized_protection_matches(
+                    owned, normalized_tp, normalized_sl, rules, record.side
+                )
+                self._persist_protection_verification(
+                    record,
+                    requested=requested,
+                    normalized=normalized,
+                    position=owned,
+                    attempt=attempt,
+                    mutation_response=mutation_response,
+                    result="VERIFIED" if matches else "REST_PROPAGATION_PENDING",
+                    blocker=None if matches else "authoritative REST protection differs",
+                    observed_at=datetime.now(timezone.utc),
+                )
+                if matches:
+                    record.take_profit = normalized_tp
+                    record.stop_loss = normalized_sl
+                    record.trailing_stop_updated_at = verified_at
+                    record.trailing_stop_update_count += 1
+                    record.updated_at = verified_at
+                    self.repository.save_demo_execution(
+                        record, event_type="V2_TRAILING_STOP_UPDATED"
+                    )
+                    return ProtectionVerificationOutcome(record, True, False, attempt)
+            else:
+                self._persist_protection_verification(
+                    record,
+                    requested=requested,
+                    normalized=normalized,
+                    position=None,
+                    attempt=attempt,
+                    mutation_response=mutation_response,
+                    result="POSITION_FLAT_RECONCILING",
+                    blocker=None,
+                    observed_at=datetime.now(timezone.utc),
+                )
+                reconciled = self._reconcile_execution_rest_locked(record)
+                if reconciled.state in TERMINAL_DEMO_STATES or reconciled.state in {
+                    DemoExecutionState.DEMO_CLOSING,
+                    DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
+                }:
+                    return ProtectionVerificationOutcome(
+                        reconciled, False, True, attempt
+                    )
+                # A zero REST position is never made safer by demanding TP/SL.
+                # Terminalization owns exact close attribution from this point.
+                if not any(
+                    _decimal(item.get("size"), default="0") > 0
+                    for item in positions
+                ):
+                    return ProtectionVerificationOutcome(
+                        reconciled, False, True, attempt
+                    )
+            if attempt < attempts and self.settings.v2_protection_verification_delay_ms:
+                time.sleep(
+                    self.settings.v2_protection_verification_delay_ms / 1000
+                )
+
+        self._persist_protection_verification(
+            record,
+            requested=requested,
+            normalized=normalized,
+            position=owned,
+            attempt=attempts,
+            mutation_response=mutation_response,
+            result="FAILED_OPEN_UNPROTECTED",
+            blocker="open position protection did not match after bounded REST verification",
+            observed_at=datetime.now(timezone.utc),
+        )
+        raise DemoSafetyError("updated trailing protection could not be verified")
+
+    def _persist_protection_verification(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        requested: dict[str, Any],
+        normalized: dict[str, Any],
+        position: dict[str, Any] | None,
+        attempt: int,
+        mutation_response: dict[str, Any] | None,
+        result: str,
+        blocker: str | None,
+        observed_at: datetime,
+    ) -> None:
+        observation = {
+            "requested": requested,
+            "normalized_requested": normalized,
+            "observed": {
+                "take_profit": str(position.get("takeProfit") or "") if position else None,
+                "stop_loss": str(position.get("stopLoss") or "") if position else None,
+                "size": str(position.get("size") or "0") if position else "0",
+                "side": str(position.get("side") or "") if position else None,
+            },
+            "source": "REST",
+            "position_state": "OPEN" if position is not None else "FLAT_OR_CLOSING",
+            "verification_attempt": attempt,
+            "mutation_response": mutation_response,
+            "result": result,
+            "blocker": blocker,
+            "observed_at": observed_at.isoformat(),
+        }
+        record.last_protection_verification = observation
+        record.protection_verification_history = [
+            *record.protection_verification_history[-19:], observation
+        ]
+        record.updated_at = observed_at
+        self.repository.save_demo_execution(
+            record, event_type="V2_PROTECTION_VERIFICATION_ATTEMPT"
+        )
 
     def as_status(self) -> dict[str, Any]:
         records = self.repository.load_demo_executions() if self.repository else []
@@ -3540,6 +3807,49 @@ def _protection_matches(
         _decimal(position.get("takeProfit"), default="0") == take_profit
         and _decimal(position.get("stopLoss"), default="0") == stop_loss
     )
+
+
+def _owned_position(
+    positions: list[dict[str, Any]], record: DemoExecutionRecord
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item for item in positions
+            if str(item.get("symbol") or record.symbol.value) == record.symbol.value
+            and _decimal(item.get("size"), default="0") == record.accepted_quantity
+            and str(item.get("side") or "").upper() == record.side.value
+        ),
+        None,
+    )
+
+
+def _normalized_protection_matches(
+    position: dict[str, Any],
+    take_profit: Decimal,
+    stop_loss: Decimal,
+    rules: InstrumentRules,
+    side: Side,
+) -> bool:
+    round_up = side == Side.SELL
+    observed_tp = normalize_price(
+        _decimal(position.get("takeProfit"), default="0"),
+        rules,
+        round_up=round_up,
+    )
+    observed_sl = normalize_price(
+        _decimal(position.get("stopLoss"), default="0"),
+        rules,
+        round_up=round_up,
+    )
+    return observed_tp == take_profit and observed_sl == stop_loss
+
+
+def _sanitized_mutation_response(response: dict[str, Any] | None) -> dict[str, Any]:
+    response = response or {}
+    return {
+        "retCode": response.get("retCode", 0),
+        "retMsg": str(response.get("retMsg") or "")[:120] or None,
+    }
 
 
 def _is_execution_owned_open_order(

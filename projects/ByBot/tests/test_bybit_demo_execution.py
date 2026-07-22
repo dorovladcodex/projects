@@ -7,6 +7,8 @@ import time
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from pydantic import ValidationError
@@ -1813,3 +1815,254 @@ def test_demo_status_marks_pre_entry_remote_snapshot_stale() -> None:
     ready = demo.as_status()
     assert ready["remote_state_authoritative"] is True
     assert ready["remote_state_snapshot_state"] == "READY"
+
+
+_CYCLE_139 = json.loads(
+    (Path(__file__).parent / "fixtures" / "v2_cycle_139_protection_replay.json")
+    .read_text(encoding="utf-8")
+)
+
+
+def test_cycle_139_fixture_links_both_failures_to_the_single_open_execution() -> None:
+    assert _CYCLE_139["cycles"] == [138, 139]
+    assert _CYCLE_139["execution_id"] == "85f45a15-9f12-44e5-b285-cfe99e112a6b"
+    assert len(_CYCLE_139["failure_times"]) == 2
+
+
+def _wif_rules() -> InstrumentRules:
+    return InstrumentRules(
+        symbol=Symbol.WIFUSDT, status="Trading",
+        qty_step=Decimal("1"), min_order_qty=Decimal("1"),
+        min_notional_value=Decimal("5"), tick_size=Decimal("0.00001"),
+        min_leverage=Decimal("1"), max_leverage=Decimal("25"),
+        leverage_step=Decimal("0.01"),
+    )
+
+
+def _trailing_record() -> DemoExecutionRecord:
+    return DemoExecutionRecord(
+        candidate_id=uuid4(), risk_decision_id=1,
+        run_id=_CYCLE_139["run_id"], order_link_id="cycle-139-entry",
+        order_id="4cafba3b-29cb-47e7-b2ce-729ec043c0e6",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.WIFUSDT, side=Side.BUY,
+        requested_quantity=Decimal("161"), accepted_quantity=Decimal("161"),
+        average_fill_price=Decimal(_CYCLE_139["entry_price"]),
+        take_profit=Decimal(_CYCLE_139["take_profit"]),
+        stop_loss=Decimal(_CYCLE_139["initial_stop_loss"]),
+        stop_loss_pct=Decimal("0.25"), take_profit_pct=Decimal("0.5"),
+        trailing_stop_pct=Decimal("0.5"), break_even_at_r=Decimal("1"),
+        protection_confirmed=True,
+    )
+
+
+class ProtectionReplayClient(FakeDemoClient):
+    def __init__(self, reflected_stops: list[str | None]) -> None:
+        super().__init__()
+        self.reflected_stops = list(reflected_stops)
+        self.mutated = False
+        self.set_stop_calls: list[tuple[Symbol, Decimal, Decimal]] = []
+        self.ws_snapshot = {"stopLoss": "0.15483"}
+        self.cached_snapshot = {"stopLoss": "0.15483"}
+
+    def get_instrument(self, symbol):
+        return _wif_rules()
+
+    def _position(self, stop: str | None) -> list[dict[str, object]]:
+        if stop is None:
+            return []
+        return [{
+            "symbol": "WIFUSDT", "size": "161", "side": "Buy",
+            "takeProfit": "0.15595", "stopLoss": stop, "markPrice": "0.15570",
+            "positionIdx": 0,
+        }]
+
+    def get_positions(self, symbol=None, settle_coin=None):
+        if not self.mutated:
+            return self._position("0.15483")
+        stop = self.reflected_stops.pop(0) if len(self.reflected_stops) > 1 else self.reflected_stops[0]
+        return self._position(stop)
+
+    def set_trading_stop(self, symbol, take_profit, stop_loss):
+        self.set_stop_calls.append((symbol, take_profit, stop_loss))
+        self.mutated = True
+        return {"retCode": 0, "retMsg": "OK"}
+
+
+def _trailing_service(client: ProtectionReplayClient):
+    repo = MemoryRepository()
+    record = _trailing_record()
+    repo.records[str(record.candidate_id)] = record
+    demo = DemoExecutionService(
+        demo_settings(
+            v2_protection_verification_attempts=3,
+            v2_protection_verification_delay_ms=0,
+        ),
+        repo, client, run_id=record.run_id,
+    )
+    return demo, repo, record
+
+
+def _run_trailing_update(demo: DemoExecutionService, record: DemoExecutionRecord):
+    return demo.monitor_strategy_position(
+        str(record.id), Decimal("0.15570"),
+        now=record.created_at + timedelta(seconds=30),
+    )
+
+
+def test_cycle_139_immediate_rest_reflection_and_tick_normalization() -> None:
+    client = ProtectionReplayClient(["0.15553"])
+    demo, repo, record = _trailing_service(client)
+    result = _run_trailing_update(demo, record)
+    assert result.stop_loss == Decimal("0.15553")
+    assert client.set_stop_calls == [
+        (Symbol.WIFUSDT, Decimal("0.15595"), Decimal("0.15553"))
+    ]
+    assert result.last_protection_verification["source"] == "REST"
+    assert result.last_protection_verification["result"] == "VERIFIED"
+    assert repo.records[str(record.candidate_id)].stop_loss == Decimal("0.15553")
+
+
+def test_cycle_139_raw_break_even_is_canonicalized_to_exchange_tick() -> None:
+    raw = Decimal(_CYCLE_139["requested_break_even_stop_raw"])
+    assert normalize_price(raw, _wif_rules(), round_up=False) == Decimal(
+        _CYCLE_139["exchange_stop_trigger"]
+    )
+
+
+def test_cycle_139_delayed_rest_reflection_retries_without_duplicate_mutation() -> None:
+    client = ProtectionReplayClient(["0.15483", "0.15483", "0.15553"])
+    demo, _, record = _trailing_service(client)
+    result = _run_trailing_update(demo, record)
+    assert result.last_protection_verification["verification_attempt"] == 3
+    assert len(client.set_stop_calls) == 1
+    assert [item["result"] for item in result.protection_verification_history[-3:]] == [
+        "REST_PROPAGATION_PENDING", "REST_PROPAGATION_PENDING", "VERIFIED",
+    ]
+
+
+def test_cycle_139_rest_mutation_response_is_sanitized_and_audited() -> None:
+    client = ProtectionReplayClient(["0.15553"])
+    demo, _, record = _trailing_service(client)
+    result = _run_trailing_update(demo, record)
+    assert result.last_protection_verification["mutation_response"] == {
+        "retCode": 0, "retMsg": "OK",
+    }
+    assert "result" not in result.last_protection_verification["mutation_response"]
+
+
+def test_cycle_139_stale_ws_and_cache_are_not_authoritative() -> None:
+    client = ProtectionReplayClient(["0.15553"])
+    demo, _, record = _trailing_service(client)
+    result = _run_trailing_update(demo, record)
+    assert client.ws_snapshot["stopLoss"] != result.last_protection_verification["observed"]["stop_loss"]
+    assert client.cached_snapshot["stopLoss"] != result.last_protection_verification["observed"]["stop_loss"]
+    assert result.last_protection_verification["source"] == "REST"
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [DemoExecutionState.DEMO_CLOSING, DemoExecutionState.DEMO_CLOSED],
+)
+def test_cycle_139_flat_or_stop_fill_hands_off_to_terminalization(terminal_state) -> None:
+    client = ProtectionReplayClient([None])
+    demo, _, record = _trailing_service(client)
+    demo._reconcile_execution_rest_locked = lambda current: current.model_copy(
+        update={"state": terminal_state}
+    )
+    result = _run_trailing_update(demo, record)
+    assert result.state == terminal_state
+    assert len(client.set_stop_calls) == 1
+
+
+def test_cycle_139_identical_update_is_idempotent_and_does_not_mutate() -> None:
+    client = ProtectionReplayClient(["0.15553"])
+    client.mutated = True
+    demo, _, record = _trailing_service(client)
+    result = _run_trailing_update(demo, record)
+    assert result.stop_loss == Decimal("0.15553")
+    assert client.set_stop_calls == []
+    assert result.last_protection_verification["result"] == "ALREADY_VERIFIED"
+
+
+def test_cycle_139_two_monitoring_tasks_share_execution_lock() -> None:
+    client = ProtectionReplayClient(["0.15553"])
+    demo, repo, record = _trailing_service(client)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _run_trailing_update(demo, record), range(2)))
+    assert len(client.set_stop_calls) == 1
+    assert all(item is not None for item in results)
+    assert repo.records[str(record.candidate_id)].trailing_stop_update_count == 1
+
+
+def test_cycle_139_genuinely_open_unprotected_still_fails_closed() -> None:
+    client = ProtectionReplayClient(["0.15483"])
+    demo, repo, record = _trailing_service(client)
+    with pytest.raises(DemoSafetyError, match="could not be verified"):
+        _run_trailing_update(demo, record)
+    saved = repo.records[str(record.candidate_id)]
+    assert saved.last_protection_verification["result"] == "FAILED_OPEN_UNPROTECTED"
+    assert len(client.set_stop_calls) == 1
+
+
+def test_cycle_139_failure_persists_every_bounded_rest_observation() -> None:
+    client = ProtectionReplayClient(["0.15483"])
+    demo, repo, record = _trailing_service(client)
+    with pytest.raises(DemoSafetyError):
+        _run_trailing_update(demo, record)
+    history = repo.records[str(record.candidate_id)].protection_verification_history
+    pending = [item for item in history if item["result"] == "REST_PROPAGATION_PENDING"]
+    assert [item["verification_attempt"] for item in pending] == [1, 2, 3]
+    assert history[-1]["blocker"] == (
+        "open position protection did not match after bounded REST verification"
+    )
+
+
+def test_cycle_139_terminal_handoff_is_not_applied_twice() -> None:
+    client = ProtectionReplayClient([None])
+    demo, repo, record = _trailing_service(client)
+
+    def terminalize(current):
+        current.state = DemoExecutionState.DEMO_CLOSED
+        repo.save_demo_execution(current, event_type="DEMO_CLOSE_TERMINALIZED")
+        return current
+
+    demo._reconcile_execution_rest_locked = terminalize
+    first = _run_trailing_update(demo, record)
+    second = _run_trailing_update(demo, record)
+    assert first.state == second.state == DemoExecutionState.DEMO_CLOSED
+    assert repo.saved_events.count(
+        ("DEMO_CLOSE_TERMINALIZED", DemoExecutionState.DEMO_CLOSED.value)
+    ) == 1
+    assert len(client.set_stop_calls) == 1
+
+
+def test_cycle_139_replay_retains_exact_stop_loss_trade_attribution_and_pnl() -> None:
+    assert _CYCLE_139["exchange_stop_trigger"] == _CYCLE_139["requested_stop_normalized"]
+    assert _CYCLE_139["close_type"] == "StopLoss"
+    assert Decimal(_CYCLE_139["net_realized_pnl"]) == Decimal("0.02239485")
+    # The preceding WIF SELL remains independently authoritative as well.
+    assert Decimal("-0.08906696") + Decimal("0.02239485") == Decimal("-0.06667211")
+    assert _CYCLE_139["unprotected_interval_observed"] is False
+
+
+def test_targeted_canary_uses_the_canonical_production_verifier() -> None:
+    client = ProtectionReplayClient(["0.15484"])
+    repo = MemoryRepository()
+    record = _trailing_record()
+    repo.records[str(record.candidate_id)] = record
+    demo = DemoExecutionService(
+        demo_settings(
+            demo_canary_enabled=True,
+            v2_protection_verification_attempts=2,
+            v2_protection_verification_delay_ms=0,
+        ),
+        repo, client, run_id=record.run_id,
+    )
+    result = demo.request_canary_trailing_update(str(record.id))
+    assert result is not None
+    assert result.stop_loss == Decimal("0.15484")
+    assert result.last_protection_verification["result"] == "VERIFIED"
+    assert client.set_stop_calls == [
+        (Symbol.WIFUSDT, Decimal("0.15595"), Decimal("0.15484"))
+    ]

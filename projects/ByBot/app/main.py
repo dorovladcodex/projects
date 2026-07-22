@@ -1013,6 +1013,23 @@ def demo_canary_close(execution_id: str) -> dict[str, object]:
     }
 
 
+@app.post("/demo/canary/{execution_id}/trailing-update")
+def demo_canary_trailing_update(execution_id: str) -> dict[str, object]:
+    _require_demo_canary()
+    try:
+        record = demo_execution_service.request_canary_trailing_update(execution_id)
+    except DemoSafetyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Demo canary execution not found")
+    return {
+        "execution": record.model_dump(mode="json"),
+        "verification": record.last_protection_verification,
+        "production_verifier_used": True,
+        "live_execution_blocked": True,
+    }
+
+
 @app.post("/demo/canary/{execution_id}/failure-cleanup")
 def demo_canary_failure_cleanup(
     execution_id: str, request: DemoCanaryFailureCleanupRequest

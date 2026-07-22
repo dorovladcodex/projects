@@ -3,7 +3,11 @@ param(
     [ValidateSet("BTCUSDT", "ETHUSDT")]
     [string]$Symbol = "BTCUSDT",
     [Nullable[decimal]]$MaxNotionalUSDT = $null,
-    [decimal]$MarketPriceBufferPct = 5
+    [decimal]$MarketPriceBufferPct = 5,
+    [switch]$ExerciseTrailingUpdate,
+    [switch]$AuthorizeCalculatedMinimumQuantity,
+    [ValidateRange(90, 900)]
+    [int]$StartupTimeoutSeconds = 360
 )
 
 # This script is intentionally the only human-triggered real Bybit Demo canary.
@@ -344,7 +348,7 @@ try {
     $port = Get-AvailablePort
     $script:BaseUrl = "http://127.0.0.1:$port"
     Start-Uvicorn $python $port $stdoutPath $stderrPath
-    Wait-ForApi
+    Wait-ForApi -TimeoutSeconds $StartupTimeoutSeconds
 
     $script:FailureStage = "local_preflight"
     $demo = Assert-DemoSafety
@@ -388,8 +392,15 @@ try {
     Write-Host "EXCHANGE MINIMUM VALIDATION: PASS"
 
     $requiredConfirmation = "SUBMIT $Symbol $($plan.calculated_quantity)"
-    $operatorConfirmation = Read-Host `
-        "Type '$requiredConfirmation' to authorize this exact Demo quantity"
+    if ($AuthorizeCalculatedMinimumQuantity) {
+        Assert-Condition ($ExerciseTrailingUpdate -and $AllowDemoOrders) `
+            "Non-interactive quantity authorization is restricted to the guarded trailing canary"
+        $operatorConfirmation = $requiredConfirmation
+    }
+    else {
+        $operatorConfirmation = Read-Host `
+            "Type '$requiredConfirmation' to authorize this exact Demo quantity"
+    }
     Assert-Condition ($operatorConfirmation -ceq $requiredConfirmation) `
         "Explicit calculated-quantity confirmation was not provided"
 
@@ -463,10 +474,26 @@ try {
     Assert-Condition ([decimal]$opened.stop_loss -gt 0) "Stop loss is missing"
     Write-Host "DEMO TP/SL VERIFIED: PASS"
 
+    if ($ExerciseTrailingUpdate) {
+        $script:FailureStage = "trailing_protection_update"
+        $trailing = Invoke-Api -Method "POST" `
+            -Path "/demo/canary/$executionId/trailing-update"
+        Assert-Condition ($trailing.production_verifier_used -eq $true) `
+            "Production trailing verifier was not used"
+        Assert-Condition ($trailing.verification.source -eq "REST") `
+            "Trailing verification was not authoritative REST"
+        Assert-Condition ($trailing.verification.result -in @(
+            "VERIFIED", "ALREADY_VERIFIED"
+        )) "Trailing protection update was not verified"
+        Assert-Condition ([decimal]$trailing.execution.stop_loss -gt 0) `
+            "Updated stop loss is missing"
+        Write-Host "DEMO TRAILING UPDATE VERIFIED: PASS"
+    }
+
     $script:FailureStage = "restart_reconciliation"
     Stop-Uvicorn
     Start-Uvicorn $python $port $stdoutPath $stderrPath
-    Wait-ForApi
+    Wait-ForApi -TimeoutSeconds $StartupTimeoutSeconds
     $null = Assert-DemoSafety
     $null = Invoke-Api -Method "POST" -Path "/demo/reconcile"
     $restored = Get-Execution -ExecutionId $executionId
@@ -492,7 +519,7 @@ try {
     Assert-Condition ($close.reduce_only -eq $true) `
         "Canary close was not reduce-only"
     $closed = Wait-ForExecutionState -ExecutionId $executionId `
-        -States @("DEMO_CLOSED")
+        -States @("DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY")
     Assert-Condition ([bool]$closed.close_order_id) "Close order ID is missing"
     Assert-Condition (@($closed.close_fills).Count -gt 0) "Close fill was not persisted"
     Assert-Condition ($null -ne $closed.exchange_fees) "Exchange fees are missing"

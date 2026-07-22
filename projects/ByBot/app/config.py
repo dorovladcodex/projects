@@ -195,6 +195,8 @@ class Settings(BaseSettings):
     v2_setup_invalidation_bps: Decimal = Field(default=Decimal("20"), ge=0, le=1000)
     v2_trailing_update_min_bps: Decimal = Field(default=Decimal("5"), gt=0, le=1000)
     v2_trailing_update_interval_seconds: int = Field(default=15, ge=1, le=3600)
+    v2_protection_verification_attempts: int = Field(default=3, ge=1, le=10)
+    v2_protection_verification_delay_ms: int = Field(default=200, ge=0, le=5000)
     v2_break_even_cost_buffer_bps: Decimal = Field(default=Decimal("3"), ge=0, le=1000)
     v2_strategy_default_threshold: float = Field(default=0.62, ge=0, le=1)
     v2_meme_strategy_threshold: float = Field(default=0.70, ge=0, le=1)

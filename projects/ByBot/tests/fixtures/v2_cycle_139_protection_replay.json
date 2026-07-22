@@ -1,0 +1,26 @@
+{
+  "run_id": "demo-v2-20260722T192352421Z",
+  "execution_id": "85f45a15-9f12-44e5-b285-cfe99e112a6b",
+  "cycles": [138, 139],
+  "failure_times": [
+    "2026-07-22T20:24:49.353587Z",
+    "2026-07-22T20:25:09.457930Z"
+  ],
+  "symbol": "WIFUSDT",
+  "side": "BUY",
+  "quantity": "161",
+  "entry_price": "0.15521",
+  "take_profit": "0.15595",
+  "initial_stop_loss": "0.15483",
+  "tick_size": "0.00001",
+  "round_trip_cost_and_buffer": "0.0021",
+  "requested_break_even_stop_raw": "0.155535941",
+  "requested_stop_normalized": "0.15553",
+  "exchange_stop_trigger": "0.15553",
+  "close_order_id": "9fe16e26-a621-4e2d-b40a-630a8b99a961",
+  "close_execution_id": "7654b516-b684-4a48-850d-c5d3cb1d2a8f",
+  "close_type": "StopLoss",
+  "exit_price": "0.15552",
+  "net_realized_pnl": "0.02239485",
+  "unprotected_interval_observed": false
+}

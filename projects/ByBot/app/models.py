@@ -210,6 +210,8 @@ class DemoExecutionRecord(BaseModel):
     maximum_adverse_excursion: Decimal = Decimal("0")
     trailing_stop_updated_at: datetime | None = None
     trailing_stop_update_count: int = Field(default=0, ge=0)
+    last_protection_verification: dict[str, Any] = Field(default_factory=dict)
+    protection_verification_history: list[dict[str, Any]] = Field(default_factory=list)
     entry_slippage: Decimal | None = None
     exit_slippage: Decimal | None = None
     paper_shadow_pnl: Decimal | None = None
