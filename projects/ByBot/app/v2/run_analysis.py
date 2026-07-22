@@ -111,13 +111,67 @@ def analyze_demo_v2_run(
         if record.state.value in _COMPLETED_TRADE_STATES
         and record.accepted_quantity > 0
     ]
+    authoritative_trades: list[dict[str, Any]] = []
+    completed_analysis_errors: list[dict[str, str]] = []
+    for record in completed:
+        try:
+            diagnosis = diagnose_demo_execution(
+                config, str(record.id), repository=repo, client=read_client
+            )
+            blockers = exact_close_reconciliation_blockers(diagnosis)
+            if blockers or diagnosis.close_source is None:
+                completed_analysis_errors.append({
+                    "execution_id": str(record.id),
+                    "error": "; ".join(blockers or [
+                        "exact close attribution is unavailable"
+                    ]),
+                })
+                continue
+            authoritative_trades.append({
+                "execution_id": str(record.id),
+                "candidate_id": str(record.candidate_id),
+                "run_id": record.run_id,
+                "symbol": record.symbol.value,
+                "side": record.side.value,
+                "strategy": record.strategy_name,
+                "entry_order_id": record.order_id,
+                "close_order_id": (
+                    str(diagnosis.close_order_history[0].get("orderId") or "")
+                    if diagnosis.close_order_history else record.close_order_id
+                ),
+                "entry_execution_ids": [
+                    str(item.get("execId") or "")
+                    for item in diagnosis.entry_executions
+                ],
+                "close_execution_ids": [
+                    str(item.get("execId") or "")
+                    for item in diagnosis.close_executions
+                ],
+                "entry_price": str(_weighted_execution_price(
+                    diagnosis.entry_executions
+                )),
+                "exit_price": str(_weighted_execution_price(
+                    diagnosis.close_executions
+                )),
+                "exit_attribution": diagnosis.close_source,
+                "gross_realized_pnl": str(diagnosis.gross_realized_pnl),
+                "entry_fees": str(diagnosis.entry_fees),
+                "close_fees": str(diagnosis.close_fees),
+                "net_realized_pnl": str(diagnosis.net_realized_pnl),
+                "source": "authoritative_exchange_order_and_execution_ids",
+            })
+        except Exception as exc:
+            completed_analysis_errors.append({
+                "execution_id": str(record.id),
+                "error": type(exc).__name__,
+            })
     net_pnl = sum(
-        (
-            record.realized_exchange_pnl
-            for record in completed
-            if record.realized_exchange_pnl is not None
-        ),
+        (Decimal(item["net_realized_pnl"]) for item in authoritative_trades),
         Decimal("0"),
+    )
+    unattributed_exit_count = sum(
+        item["exit_attribution"] == "unattributed_external_close"
+        for item in authoritative_trades
     )
     remote_positions = {
         symbol: value for symbol, value in diagnostics.positions.items()
@@ -129,6 +183,9 @@ def analyze_demo_v2_run(
         "durable_execution_count": len(records),
         "completed_trades": len(completed),
         "net_realized_pnl": str(net_pnl),
+        "authoritative_trades": authoritative_trades,
+        "unattributed_exit_count": unattributed_exit_count,
+        "completed_trade_analysis_errors": completed_analysis_errors,
         "unresolved_execution_ids": [str(item.id) for item in unresolved],
         "remote_open_positions": remote_positions,
         "remote_bot_owned_open_orders": len(diagnostics.bot_owned_open_orders),
@@ -160,6 +217,9 @@ def analyze_demo_v2_run(
             and not remote_positions
             and not diagnostics.bot_owned_open_orders
             and diagnostics.passed
+            and len(authoritative_trades) == len(completed)
+            and not completed_analysis_errors
+            and unattributed_exit_count == 0
             else "FAIL"
         ),
         "unresolved": recovery_rows,
@@ -201,6 +261,23 @@ def _read_json(path: Path) -> Any:
         return {"artifact_read_error": type(exc).__name__}
 
 
+def _weighted_execution_price(rows: list[dict[str, Any]]) -> Decimal:
+    quantity = sum(
+        (Decimal(str(item.get("execQty") or "0")) for item in rows), Decimal("0")
+    )
+    if quantity <= 0:
+        return Decimal("0")
+    value = sum(
+        (
+            Decimal(str(item.get("execQty") or "0"))
+            * Decimal(str(item.get("execPrice") or "0"))
+            for item in rows
+        ),
+        Decimal("0"),
+    )
+    return value / quantity
+
+
 def _markdown(summary: dict[str, Any]) -> str:
     unresolved = summary["unresolved"]
     lines = [
@@ -208,6 +285,7 @@ def _markdown(summary: dict[str, Any]) -> str:
         f"- Result: **{summary['analysis_result']}**",
         f"- Completed trades: {summary['completed_trades']}",
         f"- Net realized PnL: {summary['net_realized_pnl']}",
+        f"- Unattributed exits: {summary['unattributed_exit_count']}",
         f"- Unresolved executions: {len(unresolved)}",
         f"- Remote open positions: {len(summary['remote_open_positions'])}",
         f"- Remote bot-owned orders: {summary['remote_bot_owned_open_orders']}",
@@ -227,4 +305,19 @@ def _markdown(summary: dict[str, Any]) -> str:
             f"- Read-only repair eligible: {str(row['read_only_repair_eligible']).lower()}",
             f"- Blockers: {'; '.join(blockers)}", "",
         ])
+    lines.extend(["", "## Authoritative completed trades", ""])
+    if not summary["authoritative_trades"]:
+        lines.append("None.")
+    for row in summary["authoritative_trades"]:
+        lines.extend([
+            f"### {row['execution_id']}", "",
+            f"- Symbol: {row['symbol']}",
+            f"- Exit attribution: {row['exit_attribution']}",
+            f"- Entry / exit: {row['entry_price']} / {row['exit_price']}",
+            f"- Net realized PnL: {row['net_realized_pnl']}", "",
+        ])
+    if summary["completed_trade_analysis_errors"]:
+        lines.extend(["## Completed-trade analysis errors", ""])
+        for row in summary["completed_trade_analysis_errors"]:
+            lines.append(f"- {row['execution_id']}: {row['error']}")
     return "\n".join(lines).rstrip() + "\n"

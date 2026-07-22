@@ -70,46 +70,61 @@ class DemoReplayResult:
     cooldown_update_count: int
     unresolved_execution_ids: list[str]
     terminal_event_count: int
+    risk_ledger_application_count: int
     exchange_mutation_attempts: int
 
 
 class ReplayRepository:
     """Thread-safe deterministic store implementing the real service contract."""
 
-    def __init__(self, record: DemoExecutionRecord) -> None:
-        self.record = record.model_copy(deep=True)
+    def __init__(
+        self, record: DemoExecutionRecord,
+        historical_records: list[DemoExecutionRecord] | None = None,
+    ) -> None:
+        self.primary_id = str(record.id)
+        self.records = {
+            str(item.id): item.model_copy(deep=True)
+            for item in [*(historical_records or []), record]
+        }
         self.events: list[dict[str, Any]] = []
         self.private_event_keys: set[str] = set()
         self.released_reservation_ids: set[str] = set()
         self.cooldown_symbols: set[str] = set()
         self._lock = RLock()
 
+    @property
+    def record(self) -> DemoExecutionRecord:
+        return self.records[self.primary_id]
+
+    @record.setter
+    def record(self, value: DemoExecutionRecord) -> None:
+        self.records[str(value.id)] = value.model_copy(deep=True)
+
     def load_demo_kill_switch(self):
         return None
 
     def get_demo_execution(self, candidate_id: str):
         with self._lock:
-            if str(self.record.candidate_id) != candidate_id:
-                return None
-            return self.record.model_copy(deep=True)
+            return next((
+                item.model_copy(deep=True) for item in self.records.values()
+                if str(item.candidate_id) == candidate_id
+            ), None)
 
     def load_demo_executions(self):
         with self._lock:
-            return [self.record.model_copy(deep=True)]
+            return [item.model_copy(deep=True) for item in self.records.values()]
 
     def find_demo_execution(self, order_link_id: str, order_id: str):
         with self._lock:
-            if (
-                order_link_id
-                and order_link_id in {
-                    self.record.order_link_id, self.record.close_order_link_id,
-                }
-            ) or (
-                order_id
-                and order_id in {self.record.order_id, self.record.close_order_id}
-            ):
-                return self.record.model_copy(deep=True)
-            return None
+            return next((
+                item.model_copy(deep=True) for item in self.records.values()
+                if (
+                    order_link_id
+                    and order_link_id in {item.order_link_id, item.close_order_link_id}
+                ) or (
+                    order_id and order_id in {item.order_id, item.close_order_id}
+                )
+            ), None)
 
     def record_demo_event(self, key: str, event_type: str, payload: dict[str, Any]):
         with self._lock:
@@ -120,15 +135,17 @@ class ReplayRepository:
 
     def save_demo_execution(self, record: DemoExecutionRecord, *, event_type: str):
         with self._lock:
-            if self.record.state in TERMINAL_DEMO_STATES:
+            existing = self.records.get(str(record.id))
+            if existing is not None and existing.state in TERMINAL_DEMO_STATES:
                 return True
-            record.order_id = record.order_id or self.record.order_id
-            record.order_link_id = record.order_link_id or self.record.order_link_id
-            record.close_order_id = record.close_order_id or self.record.close_order_id
-            record.close_order_link_id = (
-                record.close_order_link_id or self.record.close_order_link_id
-            )
-            self.record = record.model_copy(deep=True)
+            if existing is not None:
+                record.order_id = record.order_id or existing.order_id
+                record.order_link_id = record.order_link_id or existing.order_link_id
+                record.close_order_id = record.close_order_id or existing.close_order_id
+                record.close_order_link_id = (
+                    record.close_order_link_id or existing.close_order_link_id
+                )
+            self.records[str(record.id)] = record.model_copy(deep=True)
             self.events.append({
                 "event_type": event_type,
                 "state": record.state.value,
@@ -140,9 +157,10 @@ class ReplayRepository:
         self, record: DemoExecutionRecord, *, event_type: str,
     ) -> str:
         with self._lock:
-            if self.record.state in TERMINAL_DEMO_STATES:
+            existing = self.records.get(str(record.id))
+            if existing is not None and existing.state in TERMINAL_DEMO_STATES:
                 return "ALREADY_TERMINAL"
-            self.record = record.model_copy(deep=True)
+            self.records[str(record.id)] = record.model_copy(deep=True)
             self.events.append({
                 "event_type": event_type,
                 "state": record.state.value,
@@ -166,7 +184,10 @@ class ReplayRepository:
 class ReplayBybitClient:
     """Read-only exchange snapshot; every mutation method is a hard failure."""
 
-    def __init__(self, fixture: DemoReplayFixture, *, opened_at: datetime) -> None:
+    def __init__(
+        self, fixture: DemoReplayFixture, *, opened_at: datetime,
+        closed_pnl_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.fixture = fixture
         self.mutation_attempts = 0
         close_side = "Sell" if fixture.side == Side.BUY else "Buy"
@@ -227,6 +248,7 @@ class ReplayBybitClient:
             "updatedTime": str(close_ms + 1_000),
         }]
         self.open_orders: list[dict[str, Any]] = []
+        self.closed_pnl_rows = list(closed_pnl_rows or [])
 
     def get_open_orders(self, symbol=None, settle_coin=None):
         return list(self.open_orders)
@@ -241,7 +263,7 @@ class ReplayBybitClient:
         return list(self.positions)
 
     def get_closed_pnl(self, symbol=None, settle_coin=None):
-        return []
+        return list(self.closed_pnl_rows)
 
     def _mutation(self, *_args, **_kwargs):
         self.mutation_attempts += 1
@@ -254,8 +276,18 @@ class ReplayBybitClient:
 
 
 class DemoV2ReplayHarness:
-    def __init__(self, fixture: DemoReplayFixture) -> None:
+    def __init__(
+        self, fixture: DemoReplayFixture, *,
+        historical_records: list[DemoExecutionRecord] | None = None,
+        stale_closed_pnl: list[dict[str, Any]] | None = None,
+        duplicate_close_event: bool = False,
+        restart_during_closing: bool = False,
+    ) -> None:
         self.fixture = fixture
+        self.historical_records = list(historical_records or [])
+        self.stale_closed_pnl = list(stale_closed_pnl or [])
+        self.duplicate_close_event = duplicate_close_event
+        self.restart_during_closing = restart_during_closing
 
     def run(self) -> DemoReplayResult:
         opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -272,8 +304,11 @@ class DemoV2ReplayHarness:
             created_at=opened_at - timedelta(seconds=1),
             updated_at=opened_at - timedelta(seconds=1),
         )
-        repository = ReplayRepository(record)
-        client = ReplayBybitClient(self.fixture, opened_at=opened_at)
+        repository = ReplayRepository(record, self.historical_records)
+        client = ReplayBybitClient(
+            self.fixture, opened_at=opened_at,
+            closed_pnl_rows=self.stale_closed_pnl,
+        )
         settings = Settings(
             _env_file=None, app_env="demo", test_mode=False,
             bot_mode="BYBIT_DEMO", execution_mode="BYBIT_DEMO",
@@ -319,6 +354,19 @@ class DemoV2ReplayHarness:
             "topic": "order", "data": [client.history[1]],
         })
         lifecycle.append("CLOSE_Filled")
+        if self.duplicate_close_event:
+            service.handle_private_event({
+                "topic": "execution", "data": [client.executions[1]],
+            })
+            service.handle_private_event({
+                "topic": "order", "data": [client.history[1]],
+            })
+            lifecycle.append("duplicate close replayed")
+        if self.restart_during_closing:
+            service = DemoExecutionService(
+                settings, repository, client, run_id=self.fixture.run_id
+            )
+            lifecycle.append("service restarted during closing")
         client.positions = [{
             "symbol": self.fixture.symbol.value, "size": "0", "side": "",
             "positionIdx": 0, "takeProfit": "", "stopLoss": "",
@@ -328,9 +376,10 @@ class DemoV2ReplayHarness:
             "topic": "position", "data": [client.positions[0]],
         })
         lifecycle += ["POSITION_FLAT_PENDING_PNL", "remote flat", "no remaining orders"]
-        final = service._reconcile_execution_rest(
-            repository.get_demo_execution(str(candidate_id))
-        )
+        service.reconcile()
+        final = repository.get_demo_execution(str(candidate_id))
+        if final is None:
+            raise AssertionError("replay execution disappeared")
         runtime_view = SimpleNamespace(repository=repository, portfolio=portfolio)
         V2Runtime._sync_reservations(runtime_view)
         V2Runtime._sync_reservations(runtime_view)
@@ -347,5 +396,6 @@ class DemoV2ReplayHarness:
             cooldown_update_count=len(repository.cooldown_symbols),
             unresolved_execution_ids=[] if terminal else [str(final.id)],
             terminal_event_count=terminal_count,
+            risk_ledger_application_count=len(portfolio.realized_events),
             exchange_mutation_attempts=client.mutation_attempts,
         )

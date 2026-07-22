@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from statistics import pstdev
-from typing import Any, Awaitable, Callable
+from threading import RLock
+from typing import Any, Awaitable, Callable, Sequence
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -45,11 +46,34 @@ class OrderFlowPoint:
     normalized_imbalance: Decimal
 
 
+@dataclass(frozen=True)
+class _FeatureStateSnapshot:
+    """Immutable, internally consistent view captured under the engine lock."""
+
+    ticker: dict[str, Any]
+    book: tuple[Decimal, Decimal, Decimal, Decimal, datetime]
+    book_levels: tuple[dict[Decimal, Decimal], dict[Decimal, Decimal]]
+    executable_depth: tuple[Decimal, Decimal]
+    trades: tuple[TradePoint, ...]
+    btc_trades: tuple[TradePoint, ...]
+    liquidations: tuple[LiquidationPoint, ...]
+    order_flow: tuple[OrderFlowPoint, ...]
+    funding: tuple[Decimal, datetime] | None
+    open_interest: tuple[tuple[datetime, Decimal], ...]
+    source_states: dict[str, SourceState]
+    liquidation_invalid: bool
+    liquidation_subscribed: bool
+    liquidation_unsupported: bool
+
+
 class RollingFeatureEngine:
     """Deterministic per-symbol numeric windows fed by WS or tests."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # Writers and the immutable reader capture use this one lock.  The
+        # expensive feature calculations intentionally run after it is released.
+        self._state_lock = RLock()
         limit = settings.v2_feature_history_limit
         self.trades: dict[Symbol, deque[TradePoint]] = defaultdict(
             lambda: deque(maxlen=limit)
@@ -88,22 +112,35 @@ class RollingFeatureEngine:
     def ingest_ticker(self, symbol: Symbol, data: dict[str, Any], timestamp: datetime) -> None:
         # Bybit ticker messages after the initial snapshot are sparse deltas.
         # Merge them so a funding-only delta cannot erase lastPrice.
-        ticker = self.tickers.setdefault(symbol, {})
-        ticker.update(data)
-        ticker["timestamp"] = timestamp
-        self._healthy("ticker", timestamp)
+        with self._state_lock:
+            ticker = self.tickers.setdefault(symbol, {})
+            ticker.update(data)
+            ticker["timestamp"] = timestamp
+            self._healthy("ticker", timestamp)
 
     def ingest_trade(
         self, symbol: Symbol, price: Decimal, quantity: Decimal,
         side: str, timestamp: datetime,
     ) -> None:
-        self.trades[symbol].append(TradePoint(timestamp, price, quantity, side.upper()))
-        self._healthy("trades", timestamp)
+        with self._state_lock:
+            self.trades[symbol].append(TradePoint(timestamp, price, quantity, side.upper()))
+            self._healthy("trades", timestamp)
 
     def ingest_orderbook(
         self, symbol: Symbol, bids: list[list[object]], asks: list[list[object]],
         timestamp: datetime, *, snapshot: bool = True,
         update_id: int | None = None, sequence: int | None = None,
+    ) -> None:
+        with self._state_lock:
+            self._ingest_orderbook_locked(
+                symbol, bids, asks, timestamp, snapshot=snapshot,
+                update_id=update_id, sequence=sequence,
+            )
+
+    def _ingest_orderbook_locked(
+        self, symbol: Symbol, bids: list[list[object]], asks: list[list[object]],
+        timestamp: datetime, *, snapshot: bool,
+        update_id: int | None, sequence: int | None,
     ) -> None:
         if update_id == 1:
             snapshot = True
@@ -181,84 +218,138 @@ class RollingFeatureEngine:
         self, symbol: Symbol, side: str, price: Decimal,
         quantity: Decimal, timestamp: datetime,
     ) -> None:
-        if side.upper() not in {"BUY", "SELL"} or price <= 0 or quantity <= 0:
-            self.invalid_liquidation_symbols.add(symbol)
+        with self._state_lock:
+            if side.upper() not in {"BUY", "SELL"} or price <= 0 or quantity <= 0:
+                self.invalid_liquidation_symbols.add(symbol)
+                state = self.source_states["liquidations"]
+                state.health = SourceHealth.DEGRADED
+                state.last_error = "invalid liquidation payload"
+                return
+            self.invalid_liquidation_symbols.discard(symbol)
+            self.liquidations[symbol].append(
+                LiquidationPoint(timestamp, price * quantity, side.upper())
+            )
             state = self.source_states["liquidations"]
-            state.health = SourceHealth.DEGRADED
-            state.last_error = "invalid liquidation payload"
-            return
-        self.invalid_liquidation_symbols.discard(symbol)
-        self.liquidations[symbol].append(
-            LiquidationPoint(timestamp, price * quantity, side.upper())
-        )
-        state = self.source_states["liquidations"]
-        state.last_event_at = timestamp
-        self._healthy("liquidations", timestamp)
+            state.last_event_at = timestamp
+            self._healthy("liquidations", timestamp)
 
     def mark_transport_connected(self, connected: bool, *, at: datetime | None = None) -> None:
         current = at or datetime.now(timezone.utc)
-        for state in self.source_states.values():
-            state.connected = connected
-            state.last_heartbeat_at = current
-            if not connected:
-                state.health = SourceHealth.DEGRADED
+        with self._state_lock:
+            for state in self.source_states.values():
+                state.connected = connected
+                state.last_heartbeat_at = current
+                if not connected:
+                    state.health = SourceHealth.DEGRADED
 
     def mark_liquidation_subscribed(
         self, symbols: tuple[Symbol, ...], *, at: datetime | None = None,
         unsupported: tuple[Symbol, ...] = (),
     ) -> None:
         current = at or datetime.now(timezone.utc)
-        state = self.source_states["liquidations"]
-        state.connected = True
-        state.subscribed = True
-        state.subscription_confirmed_at = current
-        state.last_heartbeat_at = current
-        state.health = SourceHealth.OK
-        state.last_error = None
-        self.unsupported_liquidation_symbols.update(unsupported)
-        for symbol in symbols:
-            if symbol not in self.unsupported_liquidation_symbols:
-                self.liquidation_subscriptions[symbol] = current
+        with self._state_lock:
+            state = self.source_states["liquidations"]
+            state.connected = True
+            state.subscribed = True
+            state.subscription_confirmed_at = current
+            state.last_heartbeat_at = current
+            state.health = SourceHealth.OK
+            state.last_error = None
+            self.unsupported_liquidation_symbols.update(unsupported)
+            for symbol in symbols:
+                if symbol not in self.unsupported_liquidation_symbols:
+                    self.liquidation_subscriptions[symbol] = current
 
     def ingest_rest_metrics(
         self, symbol: Symbol, *, funding_rate: Decimal | None,
         open_interest: Decimal | None, volume_24h: Decimal | None,
         timestamp: datetime,
     ) -> None:
-        if funding_rate is not None:
-            self.funding[symbol] = (funding_rate, timestamp)
-        if open_interest is not None:
-            self.open_interest[symbol].append((timestamp, open_interest))
-        ticker = self.tickers.setdefault(symbol, {})
-        if volume_24h is not None:
-            ticker["volume24h"] = volume_24h
-        self._healthy("rest", timestamp)
+        with self._state_lock:
+            if funding_rate is not None:
+                self.funding[symbol] = (funding_rate, timestamp)
+            if open_interest is not None:
+                self.open_interest[symbol].append((timestamp, open_interest))
+            ticker = self.tickers.setdefault(symbol, {})
+            if volume_24h is not None:
+                ticker["volume24h"] = volume_24h
+            self._healthy("rest", timestamp)
+
+    def has_ticker(self, symbol: Symbol) -> bool:
+        with self._state_lock:
+            return symbol in self.tickers
+
+    def mark_source_degraded(
+        self, source: str, error: str, *, increment_reconnect: bool = False,
+        subscribed: bool | None = None,
+    ) -> None:
+        with self._state_lock:
+            state = self.source_states[source]
+            state.health = SourceHealth.DEGRADED
+            state.last_error = error
+            if subscribed is not None:
+                state.subscribed = subscribed
+            if increment_reconnect:
+                state.reconnects += 1
+
+    def _capture_state(self, symbol: Symbol) -> _FeatureStateSnapshot | None:
+        with self._state_lock:
+            ticker = self.tickers.get(symbol)
+            book = self.books.get(symbol)
+            levels = self._book_levels.get(symbol)
+            if not ticker or not book or levels is None:
+                return None
+            bid_levels, ask_levels = levels
+            return _FeatureStateSnapshot(
+                ticker=dict(ticker), book=book,
+                book_levels=(dict(bid_levels), dict(ask_levels)),
+                executable_depth=self.executable_depth.get(
+                    symbol, (book[2], book[3])
+                ),
+                trades=tuple(self.trades.get(symbol, ())),
+                btc_trades=tuple(self.trades.get(Symbol.BTCUSDT, ())),
+                liquidations=tuple(self.liquidations.get(symbol, ())),
+                order_flow=tuple(self.order_flow.get(symbol, ())),
+                funding=self.funding.get(symbol),
+                open_interest=tuple(self.open_interest.get(symbol, ())),
+                source_states={
+                    key: value.model_copy(deep=True)
+                    for key, value in self.source_states.items()
+                },
+                liquidation_invalid=symbol in self.invalid_liquidation_symbols,
+                liquidation_subscribed=symbol in self.liquidation_subscriptions,
+                liquidation_unsupported=symbol in self.unsupported_liquidation_symbols,
+            )
 
     def snapshot(
         self, symbol: Symbol, *, now: datetime | None = None,
         btc_snapshot: MarketFeatureSnapshot | None = None,
     ) -> MarketFeatureSnapshot | None:
         current = now or datetime.now(timezone.utc)
-        ticker = self.tickers.get(symbol)
-        book = self.books.get(symbol)
-        if not ticker or not book:
+        state_snapshot = self._capture_state(symbol)
+        if state_snapshot is None:
             return None
+        ticker = state_snapshot.ticker
+        book = state_snapshot.book
+        trades = state_snapshot.trades
+        liquidations = state_snapshot.liquidations
+        order_flow_points = state_snapshot.order_flow
+        open_interest = state_snapshot.open_interest
         last = _dec(ticker.get("lastPrice") or ticker.get("price"))
         bid, ask, bid_depth, ask_depth, book_time = book
         ticker_time = ticker.get("timestamp")
-        trade_time = self.trades[symbol][-1].timestamp if self.trades[symbol] else None
+        trade_time = trades[-1].timestamp if trades else None
         liquidation_time = (
-            self.liquidations[symbol][-1].timestamp
-            if self.liquidations[symbol] else None
+            liquidations[-1].timestamp if liquidations else None
         )
         source_timestamps = {
             "ticker": ticker_time if isinstance(ticker_time, datetime) else None,
             "orderbook": book_time,
             "trades": trade_time,
             "liquidations": liquidation_time,
-            "funding": self.funding.get(symbol, (None, None))[1],
+            "funding": state_snapshot.funding[1] if state_snapshot.funding else None,
             "open_interest": (
-                self.open_interest[symbol][-1][0] if self.open_interest[symbol] else None
+                open_interest[-1][0] if open_interest else None
             ),
         }
         source_ages = {
@@ -268,7 +359,8 @@ class RollingFeatureEngine:
         }
         for source, age in source_ages.items():
             if age is not None:
-                self._source_age_samples[source].append(age)
+                with self._state_lock:
+                    self._source_age_samples[source].append(age)
         mandatory_times = [item for item in (ticker_time, book_time) if isinstance(item, datetime)]
         stale_reasons: list[str] = []
         stale_evidence: list[dict[str, Any]] = []
@@ -279,9 +371,9 @@ class RollingFeatureEngine:
             for item in mandatory_times
         ):
             stale_reasons.append("ticker or orderbook is stale")
-        if not self.trades[symbol]:
+        if not trades:
             stale_reasons.append("public trades are unavailable")
-        elif (current - self.trades[symbol][-1].timestamp).total_seconds() > (
+        elif (current - trades[-1].timestamp).total_seconds() > (
             self.settings.v2_market_stale_seconds
         ):
             stale_reasons.append("public trades are stale")
@@ -300,7 +392,8 @@ class RollingFeatureEngine:
                 })
         fresh = not stale_reasons
         if not fresh:
-            self.stale_feature_observations += 1
+            with self._state_lock:
+                self.stale_feature_observations += 1
         momentum: dict[str, Decimal] = {}
         breakout: dict[str, Decimal] = {}
         acceleration: dict[str, Decimal] = {}
@@ -310,7 +403,7 @@ class RollingFeatureEngine:
         observation_count: dict[str, int] = {}
         window_coverage: dict[str, Decimal] = {}
         for label, seconds in WINDOWS.items():
-            window = [p for p in self.trades[symbol] if current - p.timestamp <= timedelta(seconds=seconds)]
+            window = [p for p in trades if current - p.timestamp <= timedelta(seconds=seconds)]
             momentum[label] = _momentum(window, last)
             breakout[label] = _breakout_distance(window, last)
             acceleration[label] = min(
@@ -320,7 +413,7 @@ class RollingFeatureEngine:
             imbalance[label] = _trade_imbalance(window)
             volatility[label] = _volatility(window)
             ofi_rows = [
-                item.normalized_imbalance for item in self.order_flow[symbol]
+                item.normalized_imbalance for item in order_flow_points
                 if current - item.timestamp <= timedelta(seconds=seconds)
             ]
             order_flow[label] = (
@@ -337,43 +430,40 @@ class RollingFeatureEngine:
             (bid_depth - ask_depth) / book_total if book_total > 0 else Decimal("0")
         )
         spread_bps = (ask - bid) / ((ask + bid) / 2) * Decimal("10000")
-        top_bid_qty = self._book_levels[symbol][0].get(bid, Decimal("0"))
-        top_ask_qty = self._book_levels[symbol][1].get(ask, Decimal("0"))
+        top_bid_qty = state_snapshot.book_levels[0].get(bid, Decimal("0"))
+        top_ask_qty = state_snapshot.book_levels[1].get(ask, Decimal("0"))
         top_total = top_bid_qty + top_ask_qty
         microprice = (
             (ask * top_bid_qty + bid * top_ask_qty) / top_total
             if top_total > 0 else (bid + ask) / Decimal("2")
         )
-        prices = [point.price for point in self.trades[symbol] if current - point.timestamp <= timedelta(minutes=15)]
+        prices = [point.price for point in trades if current - point.timestamp <= timedelta(minutes=15)]
         local_high = max(prices, default=last); local_low = min(prices, default=last)
-        liqs = [point for point in self.liquidations[symbol] if current - point.timestamp <= timedelta(minutes=5)]
+        liqs = [point for point in liquidations if current - point.timestamp <= timedelta(minutes=5)]
         # Bybit `S` is the liquidated position side: Buy means a LONG was
         # liquidated; Sell means a SHORT was liquidated.
         long_liq = sum((p.notional for p in liqs if p.side == "BUY"), Decimal("0"))
         short_liq = sum((p.notional for p in liqs if p.side == "SELL"), Decimal("0"))
         liq_total = short_liq + long_liq
-        liquidation_state = self.source_states["liquidations"]
-        subscribed = symbol in self.liquidation_subscriptions
+        liquidation_state = state_snapshot.source_states["liquidations"]
+        subscribed = state_snapshot.liquidation_subscribed
         transport_available = (
             liquidation_state.connected
             and liquidation_state.health not in {
                 SourceHealth.UNAVAILABLE, SourceHealth.DEGRADED, SourceHealth.STALE,
             }
-            and symbol not in self.unsupported_liquidation_symbols
+            and not state_snapshot.liquidation_unsupported
         )
-        oi_change = _series_change(self.open_interest[symbol], current, timedelta(minutes=5))
-        funding_rate = self.funding.get(symbol, (None, current))[0]
+        oi_change = _series_change(open_interest, current, timedelta(minutes=5))
+        funding_rate = state_snapshot.funding[0] if state_snapshot.funding else None
         funding_deviation = funding_rate * Decimal("10000") if funding_rate is not None else None
         relative = Decimal("0")
         if btc_snapshot and symbol != Symbol.BTCUSDT:
             relative = momentum["5m"] - btc_snapshot.price_momentum.get("5m", Decimal("0"))
         market_regime = _regime(momentum["15m"], volatility["15m"])
-        bid_depth_10bps, ask_depth_10bps = self.executable_depth.get(
-            symbol, (bid_depth, ask_depth)
-        )
+        bid_depth_10bps, ask_depth_10bps = state_snapshot.executable_depth
         correlation, beta = _btc_relationship(
-            list(self.trades[symbol]),
-            list(self.trades[Symbol.BTCUSDT]),
+            list(trades), list(state_snapshot.btc_trades),
             current,
         ) if symbol != Symbol.BTCUSDT else (Decimal("1"), Decimal("1"))
         return MarketFeatureSnapshot(
@@ -392,7 +482,7 @@ class RollingFeatureEngine:
             observation_count=observation_count,
             window_coverage_seconds=window_coverage,
             atr_bps=_atr_bps([
-                point for point in self.trades[symbol]
+                point for point in trades
                 if current - point.timestamp <= timedelta(minutes=15)
             ], last),
             distance_from_high_bps=(last - local_high) / last * Decimal("10000"),
@@ -402,12 +492,12 @@ class RollingFeatureEngine:
             btc_beta=beta,
             funding_rate=funding_rate,
             funding_deviation_bps=funding_deviation,
-            open_interest=self.open_interest[symbol][-1][1] if self.open_interest[symbol] else None,
+            open_interest=open_interest[-1][1] if open_interest else None,
             open_interest_change_pct=oi_change,
             liquidation_long_usdt=long_liq, liquidation_short_usdt=short_liq,
             liquidation_imbalance=(short_liq - long_liq) / liq_total if liq_total else Decimal("0"),
             volume_24h=_dec(ticker.get("volume24h"), "0"), market_regime=market_regime,
-            source_health={key: value.health for key, value in self.source_states.items()},
+            source_health={key: value.health for key, value in state_snapshot.source_states.items()},
             source_timestamps=source_timestamps,
             source_age_seconds=source_ages,
             stale_evidence=stale_evidence,
@@ -419,7 +509,7 @@ class RollingFeatureEngine:
                 max(0.0, (current - liquidation_time).total_seconds())
                 if liquidation_time else None
             ),
-            liquidation_data_valid=symbol not in self.invalid_liquidation_symbols,
+            liquidation_data_valid=not state_snapshot.liquidation_invalid,
             # Subscription initialization is intentionally independent from
             # event recency: a healthy stream can legitimately emit zero
             # liquidation events for a symbol.
@@ -427,7 +517,7 @@ class RollingFeatureEngine:
             liquidation_feed_available=transport_available,
             liquidation_connection_state=("CONNECTED" if liquidation_state.connected else "DISCONNECTED"),
             liquidation_subscription_state=(
-                "UNSUPPORTED" if symbol in self.unsupported_liquidation_symbols
+                "UNSUPPORTED" if state_snapshot.liquidation_unsupported
                 else "SUBSCRIBED" if subscribed else "NOT_SUBSCRIBED"
             ),
             liquidation_event_count_5m=len(liqs),
@@ -435,13 +525,23 @@ class RollingFeatureEngine:
         )
 
     def record_critical_stale_incident(self) -> None:
-        self.stale_incidents += 1
+        with self._state_lock:
+            self.stale_incidents += 1
 
     def data_age_metrics(self) -> dict[str, dict[str, float | str | bool | None]]:
+        with self._state_lock:
+            samples_by_source = {
+                source: tuple(self._source_age_samples.get(source, ()))
+                for source in ("ticker", "trades", "orderbook", "liquidations", "rest")
+            }
+            states = {
+                source: self.source_states[source].model_copy(deep=True)
+                for source in samples_by_source
+            }
         result: dict[str, dict[str, float | str | bool | None]] = {}
         for source in ("ticker", "trades", "orderbook", "liquidations", "rest"):
-            samples = sorted(self._source_age_samples.get(source, ()))
-            state = self.source_states[source]
+            samples = sorted(samples_by_source[source])
+            state = states[source]
             latest_age = (
                 max(0.0, (datetime.now(timezone.utc) - state.last_message_at).total_seconds())
                 if state.last_message_at else None
@@ -506,10 +606,10 @@ class BybitPublicWebSocketEngine:
             except Exception as exc:
                 self.reconnects += 1
                 self.features.mark_transport_connected(False)
-                for state in self.features.source_states.values():
-                    state.health = SourceHealth.DEGRADED
-                    state.last_error = type(exc).__name__
-                    state.reconnects += 1
+                for source in ("ticker", "trades", "orderbook", "liquidations", "rest"):
+                    self.features.mark_source_degraded(
+                        source, type(exc).__name__, increment_reconnect=True
+                    )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.settings.v2_ws_reconnect_max_seconds)
 
@@ -541,10 +641,10 @@ class BybitPublicWebSocketEngine:
                     unsupported=tuple(unsupported),
                 )
             else:
-                state = self.features.source_states["liquidations"]
-                state.health = SourceHealth.DEGRADED
-                state.subscribed = False
-                state.last_error = "liquidation subscription rejected"
+                self.features.mark_source_degraded(
+                    "liquidations", "liquidation subscription rejected",
+                    subscribed=False,
+                )
             return
         topic = str(message.get("topic") or "")
         data = message.get("data")
@@ -610,14 +710,12 @@ class BybitRestMetricsPoller:
                     volume_24h=_dec(ticker.get("volume24h"), "0"), timestamp=now,
                 )
                 # REST ticker is also a bounded WS fallback.
-                if symbol not in self.features.tickers:
+                if not self.features.has_ticker(symbol):
                     self.features.ingest_ticker(symbol, ticker, now)
                 self.failures.pop(symbol, None)
             except Exception as exc:
                 self.failures[symbol] = type(exc).__name__
-                state = self.features.source_states["rest"]
-                state.health = SourceHealth.DEGRADED
-                state.last_error = type(exc).__name__
+                self.features.mark_source_degraded("rest", type(exc).__name__)
         self.last_polled_at = now
 
     def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
@@ -751,7 +849,7 @@ def _btc_relationship(
 
 
 def _series_change(
-    points: deque[tuple[datetime, Decimal]], now: datetime, window: timedelta,
+    points: Sequence[tuple[datetime, Decimal]], now: datetime, window: timedelta,
 ) -> Decimal | None:
     rows = [item for item in points if now - item[0] <= window]
     if len(rows) < 2 or rows[0][1] == 0:

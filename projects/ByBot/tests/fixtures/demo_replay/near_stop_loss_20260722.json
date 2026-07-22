@@ -1,0 +1,17 @@
+{
+  "execution_id": "212e9388-8269-49e6-9159-3ac779d264d1",
+  "run_id": "demo-v2-20260722T082205376Z",
+  "symbol": "NEARUSDT",
+  "side": "SELL",
+  "entry_order_id": "740828ce-0aab-4ce4-ad2c-d48ee2e91642",
+  "order_link_id": "bybot-1b8ea3-e-db68601ac29ac08ba827",
+  "close_order_id": "d8a7d67a-1299-4c7e-855a-1b2e562c1f4c",
+  "entry_execution_id": "ae522766-6868-4e97-afd9-1f5dd5c7b9bf",
+  "close_execution_id": "e2ec9857-6f54-44cc-9114-9324770ea25c",
+  "quantity": "26.7",
+  "entry_price": "1.8678",
+  "close_price": "1.8725",
+  "entry_fee": "0.02742865",
+  "close_fee": "0.02749767",
+  "close_source": "stop_loss"
+}

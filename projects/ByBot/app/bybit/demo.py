@@ -1689,6 +1689,116 @@ class DemoExecutionService:
             )
         return True
 
+    def _finalize_durable_exact_flat_close(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        realtime: list[dict[str, Any]],
+        positions: list[dict[str, Any]],
+    ) -> bool:
+        """Finalize complete durable fills without consulting symbol-level PnL."""
+        if (
+            record.state not in {
+                DemoExecutionState.DEMO_POSITION_OPEN,
+                DemoExecutionState.DEMO_CLOSING,
+                DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
+            }
+            or not record.order_id
+            or not record.close_order_id
+            or not record.fills
+            or not record.close_fills
+            or any(
+                str(item.get("symbol") or "") == record.symbol.value
+                and _decimal(item.get("size"), default="0") > 0
+                for item in positions
+            )
+            or any(_is_execution_owned_open_order(item, record) for item in realtime)
+        ):
+            return False
+        attribution = canonical_exit_attribution(
+            record.exit_attribution or record.close_reason
+        )
+        if (
+            attribution == "unattributed_external_close"
+            and record.failure_reason
+            and record.close_order_link_id
+        ):
+            # A durable bot-generated close link plus complete exact fills is
+            # sufficient ownership evidence for the existing cleanup path.
+            attribution = "forced_cleanup"
+        if attribution == "unattributed_external_close":
+            return False
+        entry_time_ms = _record_entry_time_ms(record)
+        if (
+            any(fill.order_id != record.order_id for fill in record.fills)
+            or any(fill.order_id != record.close_order_id for fill in record.close_fills)
+            or any(
+                int(fill.executed_at.timestamp() * 1000) < entry_time_ms
+                for fill in record.close_fills
+            )
+        ):
+            return False
+        all_records = self.repository.load_demo_executions()
+        if any(
+            _exchange_identity_used_by_other(
+                all_records, record, fill.order_id, fill.execution_id
+            )
+            for fill in [*record.fills, *record.close_fills]
+        ):
+            return False
+        entry_qty = sum((fill.quantity for fill in record.fills), Decimal("0"))
+        close_qty = sum((fill.quantity for fill in record.close_fills), Decimal("0"))
+        if (
+            entry_qty != record.accepted_quantity
+            or close_qty != record.accepted_quantity
+            or record.accepted_quantity <= 0
+        ):
+            return False
+        entry_average = sum(
+            (fill.quantity * fill.price for fill in record.fills), Decimal("0")
+        ) / entry_qty
+        close_average = sum(
+            (fill.quantity * fill.price for fill in record.close_fills), Decimal("0")
+        ) / close_qty
+        fees = sum(
+            (fill.fee for fill in [*record.fills, *record.close_fills]),
+            Decimal("0"),
+        )
+        direction = Decimal("1") if record.side == Side.BUY else Decimal("-1")
+        record.average_fill_price = entry_average
+        record.average_close_price = close_average
+        record.exchange_fees = fees
+        record.gross_realized_pnl = (
+            (close_average - entry_average) * close_qty * direction
+        )
+        record.paper_shadow_pnl = record.gross_realized_pnl - fees
+        record.realized_exchange_pnl = record.paper_shadow_pnl
+        record.exit_attribution = attribution
+        record.close_reason = attribution
+        record.closed_at = max(fill.executed_at for fill in record.close_fills)
+        record.state = (
+            DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+            if attribution == "manual_external_close"
+            else DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
+            if record.failure_reason
+            else DemoExecutionState.DEMO_CLOSED
+        )
+        record.cleanup_result = "remote position flat and bot-owned orders zero"
+        record.last_error = None
+        record.updated_at = datetime.now(timezone.utc)
+        terminalizer = getattr(self.repository, "terminalize_demo_execution", None)
+        if callable(terminalizer):
+            result = terminalizer(
+                record, event_type="DEMO_CLOSE_TERMINALIZED"
+            )
+            if result == "FAILED":
+                raise RuntimeError("durable Demo terminalization failed")
+        else:
+            self.repository.save_demo_execution(
+                record, event_type="DEMO_CLOSE_TERMINALIZED"
+            )
+        return True
+
     def _execution_lock(self, execution_id: UUID) -> RLock:
         with self._execution_locks_guard:
             return self._execution_locks.setdefault(execution_id, RLock())
@@ -1987,65 +2097,27 @@ class DemoExecutionService:
                     DemoExecutionState.DEMO_CLOSING,
                 }
             ):
-                pnl_item = next(
-                    (
-                        item for item in closed_pnl
-                        if str(item.get("symbol") or "") == record.symbol.value
-                        and (
-                            not record.close_order_id
-                            or str(item.get("orderId") or "") == record.close_order_id
-                        )
-                    ),
-                    None,
+                # Never select PnL or a close by symbol.  The local list was
+                # loaded before account-wide REST processing and can lag a WS
+                # close fill.  Re-run the canonical exact order/exec ownership
+                # path against this reconciliation's authoritative snapshots.
+                if self._finalize_attributed_flat_close(
+                    record,
+                    realtime=remote_orders,
+                    history=history,
+                    executions=executions,
+                    positions=positions,
+                ):
+                    continue
+                if self._finalize_durable_exact_flat_close(
+                    record, realtime=remote_orders, positions=positions
+                ):
+                    continue
+                record.state = DemoExecutionState.DEMO_RECONCILIATION_REQUIRED
+                record.last_error = (
+                    "remote position is flat without exact execution-scoped "
+                    "close order and fill evidence"
                 )
-                if pnl_item is None:
-                    if record.close_fills and record.paper_shadow_pnl is not None:
-                        record.realized_exchange_pnl = record.paper_shadow_pnl
-                        record.state = (
-                            DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
-                            if record.failure_reason
-                            else DemoExecutionState.DEMO_CLOSED
-                        )
-                    else:
-                        record.state = DemoExecutionState.DEMO_RECONCILIATION_REQUIRED
-                        record.last_error = "locally open position is flat remotely without closed PnL"
-                else:
-                    record.realized_exchange_pnl = _decimal(
-                        pnl_item.get("closedPnl"), default="0"
-                    )
-                    record.state = (
-                        DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE
-                        if record.failure_reason
-                        else DemoExecutionState.DEMO_CLOSED
-                    )
-                    if not record.exit_attribution:
-                        record.exit_attribution = "unattributed_external_close"
-                        record.close_reason = record.exit_attribution
-                        record.attribution_failure_reason = (
-                            "remote flat reconciliation completed without attributable close metadata"
-                        )
-                        record.exit_attribution_evidence = {
-                            "source": "rest_position_reconciliation",
-                            "entry_order_id": record.order_id,
-                            "close_order_id": record.close_order_id,
-                            "entry_execution_ids": [item.execution_id for item in record.fills],
-                            "exit_execution_ids": [item.execution_id for item in record.close_fills],
-                        }
-                if record.state in {
-                    DemoExecutionState.DEMO_CLOSED,
-                    DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
-                }:
-                    if not record.exit_attribution:
-                        record.exit_attribution = "unattributed_external_close"
-                        record.close_reason = record.exit_attribution
-                        record.attribution_failure_reason = (
-                            "terminal close has no attributable exchange or bot close evidence"
-                        )
-                    record.cleanup_result = (
-                        "remote position flat and bot-owned orders zero"
-                        if self.bot_owned_open_orders == 0
-                        else "remote position flat; bot-owned orders remain"
-                    )
                 record.updated_at = datetime.now(timezone.utc)
                 self.repository.save_demo_execution(record, event_type="REST_POSITION_RECONCILED")
         result = {
