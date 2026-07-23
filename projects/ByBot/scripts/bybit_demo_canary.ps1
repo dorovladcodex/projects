@@ -5,6 +5,7 @@ param(
     [Nullable[decimal]]$MaxNotionalUSDT = $null,
     [decimal]$MarketPriceBufferPct = 5,
     [switch]$ExerciseTrailingUpdate,
+    [switch]$ExerciseFlatDuringProtectionRace,
     [switch]$AuthorizeCalculatedMinimumQuantity,
     [ValidateRange(90, 900)]
     [int]$StartupTimeoutSeconds = 360
@@ -393,8 +394,10 @@ try {
 
     $requiredConfirmation = "SUBMIT $Symbol $($plan.calculated_quantity)"
     if ($AuthorizeCalculatedMinimumQuantity) {
-        Assert-Condition ($ExerciseTrailingUpdate -and $AllowDemoOrders) `
-            "Non-interactive quantity authorization is restricted to the guarded trailing canary"
+        Assert-Condition (
+            ($ExerciseTrailingUpdate -or $ExerciseFlatDuringProtectionRace) -and
+            $AllowDemoOrders
+        ) "Non-interactive quantity authorization is restricted to a guarded protection canary"
         $operatorConfirmation = $requiredConfirmation
     }
     else {
@@ -489,6 +492,26 @@ try {
             "Updated stop loss is missing"
         Write-Host "DEMO TRAILING UPDATE VERIFIED: PASS"
     }
+    elseif ($ExerciseFlatDuringProtectionRace) {
+        $script:FailureStage = "flat_during_protection_race"
+        $race = Invoke-Api -Method "POST" `
+            -Path "/demo/canary/$executionId/flat-during-protection-race" `
+            -TimeoutSec 90
+        Assert-Condition ($race.production_verifier_used -eq $true) `
+            "Production protection verifier was not used"
+        Assert-Condition ($race.cycle_failure_emitted -eq $false) `
+            "Benign flat-position race emitted a cycle failure"
+        Assert-Condition ($race.classification -eq "TERMINALIZATION_HANDOFF") `
+            "Flat-position race did not use TERMINALIZATION_HANDOFF"
+        Assert-Condition ($race.execution.state -in @(
+            "DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY"
+        )) "Flat-position race did not reach a terminal state"
+        Assert-Condition ([bool]$race.execution.close_order_id) `
+            "Exact race close order ID is missing"
+        Assert-Condition (@($race.execution.close_fills).Count -gt 0) `
+            "Exact race close fill is missing"
+        Write-Host "DEMO FLAT-DURING-PROTECTION HANDOFF: PASS"
+    }
 
     $script:FailureStage = "restart_reconciliation"
     Stop-Uvicorn
@@ -498,10 +521,19 @@ try {
     $null = Invoke-Api -Method "POST" -Path "/demo/reconcile"
     $restored = Get-Execution -ExecutionId $executionId
     Assert-Condition ($null -ne $restored) "Execution was not restored after restart"
-    Assert-Condition ($restored.state -eq "DEMO_POSITION_OPEN") `
-        "Exchange position was not reconciled after restart"
-    Assert-Condition ($restored.protection_confirmed -eq $true) `
-        "TP/SL was not restored after restart"
+    if ($ExerciseFlatDuringProtectionRace) {
+        Assert-Condition ($restored.state -in @(
+            "DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY"
+        )) "Terminal race execution was not restored after restart"
+        Assert-Condition (@($restored.close_fills).Count -gt 0) `
+            "Terminal race close fill was not restored"
+    }
+    else {
+        Assert-Condition ($restored.state -eq "DEMO_POSITION_OPEN") `
+            "Exchange position was not reconciled after restart"
+        Assert-Condition ($restored.protection_confirmed -eq $true) `
+            "TP/SL was not restored after restart"
+    }
     Assert-Condition ([decimal]$restored.accepted_quantity -eq [decimal]$opened.accepted_quantity) `
         "Local and remote quantities differ after restart"
     Write-Host "RESTART RECONCILIATION: PASS"
@@ -513,17 +545,19 @@ try {
     }
     Write-Host "IDEMPOTENCY: PASS"
 
-    $script:FailureStage = "planned_close"
-    $close = Invoke-Api -Method "POST" `
-        -Path "/demo/canary/$executionId/close"
-    Assert-Condition ($close.reduce_only -eq $true) `
-        "Canary close was not reduce-only"
-    $closed = Wait-ForExecutionState -ExecutionId $executionId `
-        -States @("DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY")
-    Assert-Condition ([bool]$closed.close_order_id) "Close order ID is missing"
-    Assert-Condition (@($closed.close_fills).Count -gt 0) "Close fill was not persisted"
-    Assert-Condition ($null -ne $closed.exchange_fees) "Exchange fees are missing"
-    Write-Host "DEMO REDUCE-ONLY CLOSE: PASS"
+    if (-not $ExerciseFlatDuringProtectionRace) {
+        $script:FailureStage = "planned_close"
+        $close = Invoke-Api -Method "POST" `
+            -Path "/demo/canary/$executionId/close"
+        Assert-Condition ($close.reduce_only -eq $true) `
+            "Canary close was not reduce-only"
+        $closed = Wait-ForExecutionState -ExecutionId $executionId `
+            -States @("DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY")
+        Assert-Condition ([bool]$closed.close_order_id) "Close order ID is missing"
+        Assert-Condition (@($closed.close_fills).Count -gt 0) "Close fill was not persisted"
+        Assert-Condition ($null -ne $closed.exchange_fees) "Exchange fees are missing"
+        Write-Host "DEMO REDUCE-ONLY CLOSE: PASS"
+    }
 
     $finalReconcile = Invoke-Api -Method "POST" -Path "/demo/reconcile"
     $finalDemo = Invoke-Api -Path "/demo/status"

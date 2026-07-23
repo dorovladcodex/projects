@@ -1,0 +1,32 @@
+{
+  "run_id": "demo-v2-20260723T142152202Z",
+  "cycle": 99,
+  "event_at": "2026-07-23T15:11:58.648882Z",
+  "failure_fingerprint": "844aba674e416108f0030612",
+  "error_type": "DemoExchangeError",
+  "ret_code": null,
+  "ret_code_note": "Historical client discarded retCode before persistence.",
+  "ret_msg": "can not set tp/sl/ts for zero position",
+  "stage": "position_monitoring",
+  "event_order": [
+    "authoritative position pre-check observed the owned position open",
+    "exchange protection closed the position",
+    "set_trading_stop returned a structured zero-position rejection",
+    "the exception escaped position monitoring",
+    "V2_CYCLE_FAILURE was emitted"
+  ],
+  "completed_trades": [
+    {"symbol": "SOLUSDT", "exit": "take_profit", "net_pnl": "0.1585521"},
+    {"symbol": "NEARUSDT", "exit": "stop_loss", "net_pnl": "-0.17509394"},
+    {"symbol": "XRPUSDT", "exit": "take_profit", "net_pnl": "0.18808348"},
+    {"symbol": "SUIUSDT", "exit": "take_profit", "net_pnl": "0.1185792"},
+    {"symbol": "WIFUSDT", "exit": "stop_loss", "net_pnl": "-0.09001067"},
+    {"symbol": "ETHUSDT", "exit": "take_profit", "net_pnl": "0.18735672"},
+    {"symbol": "LINKUSDT", "exit": "stop_loss", "net_pnl": "-0.17867236"},
+    {"symbol": "SUIUSDT", "exit": "take_profit", "net_pnl": "0.1010247"}
+  ],
+  "net_pnl": "0.30981923",
+  "unresolved_executions": 0,
+  "unattributed_exits": 0,
+  "unprotected_intervals": 0
+}

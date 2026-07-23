@@ -2066,3 +2066,389 @@ def test_targeted_canary_uses_the_canonical_production_verifier() -> None:
     assert client.set_stop_calls == [
         (Symbol.WIFUSDT, Decimal("0.15595"), Decimal("0.15484"))
     ]
+
+
+_CYCLE_99 = json.loads(
+    (
+        Path(__file__).parent
+        / "fixtures"
+        / "v2_cycle_99_flat_protection_race.json"
+    ).read_text(encoding="utf-8")
+)
+
+
+def _cycle_99_record() -> DemoExecutionRecord:
+    entry_at = datetime(2026, 7, 23, 15, 10, tzinfo=timezone.utc)
+    return DemoExecutionRecord(
+        candidate_id=uuid4(),
+        risk_decision_id=1,
+        run_id=_CYCLE_99["run_id"],
+        order_link_id="cycle-99-entry-link",
+        order_id="cycle-99-entry-order",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.BTCUSDT,
+        side=Side.BUY,
+        requested_quantity=Decimal("0.001"),
+        accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("65000"),
+        take_profit=Decimal("65100"),
+        stop_loss=Decimal("64900"),
+        stop_loss_pct=Decimal("0.2"),
+        take_profit_pct=Decimal("0.4"),
+        trailing_stop_pct=Decimal("0.2"),
+        break_even_at_r=Decimal("1"),
+        protection_confirmed=True,
+        fills=[
+            DemoFill(
+                execution_id="cycle-99-entry-exec",
+                order_id="cycle-99-entry-order",
+                quantity=Decimal("0.001"),
+                price=Decimal("65000"),
+                fee=Decimal("0.01"),
+                executed_at=entry_at,
+            )
+        ],
+    )
+
+
+class Cycle99FlatProtectionClient(FakeDemoClient):
+    """Synthetic replay: exact close lands between pre-check and mutation."""
+
+    def __init__(
+        self,
+        *,
+        close_type: str = "TakeProfit",
+        close_quantity: str = "0.001",
+        exact_evidence: bool = True,
+        remain_open: bool = False,
+        reflect_requested_protection: bool = False,
+    ) -> None:
+        super().__init__()
+        self.close_type = close_type
+        self.close_quantity = close_quantity
+        self.exact_evidence = exact_evidence
+        self.remain_open = remain_open
+        self.reflect_requested_protection = reflect_requested_protection
+        self.closed = False
+        self.set_stop_calls = 0
+        self.requested_stop: str | None = None
+        self.positions = []
+
+    def get_instrument(self, symbol):
+        return instrument()
+
+    def get_positions(self, symbol=None, settle_coin=None):
+        if self.closed and not self.remain_open:
+            return []
+        stop = (
+            self.requested_stop
+            if self.reflect_requested_protection and self.requested_stop
+            else "64900"
+        )
+        return [{
+            "symbol": "BTCUSDT",
+            "size": "0.001",
+            "side": "Buy",
+            "takeProfit": "65100",
+            "stopLoss": stop,
+            "markPrice": "65000",
+            "positionIdx": 0,
+        }]
+
+    def get_open_orders(self, symbol=None, settle_coin=None):
+        return []
+
+    def set_trading_stop(self, symbol, take_profit, stop_loss):
+        self.set_stop_calls += 1
+        self.requested_stop = str(stop_loss)
+        self.closed = True
+        if self.exact_evidence:
+            close_at = 1784819460000
+            create_type = (
+                "CreateByTakeProfit"
+                if self.close_type == "TakeProfit"
+                else "CreateByStopLoss"
+            )
+            self.history = [{
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "orderId": "cycle-99-close-order",
+                "orderStatus": "Filled",
+                "qty": self.close_quantity,
+                "cumExecQty": self.close_quantity,
+                "avgPrice": "65100",
+                "reduceOnly": True,
+                "closeOnTrigger": True,
+                "stopOrderType": self.close_type,
+                "createType": create_type,
+                "updatedTime": str(close_at),
+            }]
+            self.executions = [{
+                "symbol": "BTCUSDT",
+                "side": "Sell",
+                "orderId": "cycle-99-close-order",
+                "execId": "cycle-99-close-exec",
+                "execQty": self.close_quantity,
+                "execPrice": "65100",
+                "execFee": "0.01",
+                "feeCurrency": "USDT",
+                "execTime": str(close_at),
+                "reduceOnly": True,
+                "stopOrderType": self.close_type,
+                "createType": create_type,
+            }]
+        raise DemoExchangeError(
+            "Bybit Demo request failed: can not set tp/sl/ts for zero position",
+            ret_code=999999,
+            ret_msg="can not set tp/sl/ts for zero position",
+        )
+
+
+def _cycle_99_service(
+    client: Cycle99FlatProtectionClient,
+) -> tuple[DemoExecutionService, MemoryRepository, DemoExecutionRecord]:
+    repo = MemoryRepository()
+    record = _cycle_99_record()
+    repo.records[str(record.candidate_id)] = record
+    demo = DemoExecutionService(
+        demo_settings(
+            demo_canary_enabled=True,
+            v2_protection_verification_attempts=2,
+            v2_protection_verification_delay_ms=0,
+        ),
+        repo,
+        client,
+        run_id=record.run_id,
+    )
+    return demo, repo, record
+
+
+@pytest.mark.parametrize(
+    ("close_type", "attribution"),
+    [("TakeProfit", "take_profit"), ("StopLoss", "stop_loss")],
+)
+def test_cycle_99_exact_exchange_close_hands_off_without_cycle_failure(
+    close_type: str, attribution: str
+) -> None:
+    client = Cycle99FlatProtectionClient(close_type=close_type)
+    demo, repo, record = _cycle_99_service(client)
+    result = demo.request_canary_trailing_update(str(record.id))
+    assert result is not None
+    assert result.state == DemoExecutionState.DEMO_CLOSED
+    assert result.exit_attribution == attribution
+    assert result.last_protection_verification["classification"] == (
+        "TERMINALIZATION_HANDOFF"
+    )
+    assert result.last_protection_verification["cycle_failure_emitted"] is False
+    assert result.last_protection_verification["mutation_response"] == {
+        "retCode": 999999,
+        "retMsg": "can not set tp/sl/ts for zero position",
+    }
+    assert client.set_stop_calls == 1
+    assert repo.saved_events.count(
+        ("DEMO_CLOSE_TERMINALIZED", DemoExecutionState.DEMO_CLOSED.value)
+    ) == 1
+
+
+def test_cycle_99_partial_close_fails_closed() -> None:
+    client = Cycle99FlatProtectionClient(close_quantity="0.0005")
+    demo, repo, record = _cycle_99_service(client)
+    with pytest.raises(DemoSafetyError, match="failed exact reconciliation"):
+        demo.request_canary_trailing_update(str(record.id))
+    saved = repo.records[str(record.candidate_id)]
+    assert saved.last_protection_verification["classification"] == (
+        "REAL_PROTECTION_FAILURE"
+    )
+    assert "not terminal" in saved.last_protection_verification["blocker"]
+
+
+def test_cycle_99_flat_without_exact_close_evidence_fails_closed() -> None:
+    client = Cycle99FlatProtectionClient(exact_evidence=False)
+    demo, repo, record = _cycle_99_service(client)
+    with pytest.raises(DemoSafetyError, match="failed exact reconciliation"):
+        demo.request_canary_trailing_update(str(record.id))
+    saved = repo.records[str(record.candidate_id)]
+    assert "close order/fill evidence is incomplete" in (
+        saved.last_protection_verification["blocker"]
+    )
+
+
+def test_cycle_99_conflicting_exchange_identity_fails_closed() -> None:
+    client = Cycle99FlatProtectionClient()
+    demo, repo, record = _cycle_99_service(client)
+    other = _cycle_99_record().model_copy(
+        update={
+            "id": uuid4(),
+            "candidate_id": uuid4(),
+            "state": DemoExecutionState.DEMO_CLOSED,
+            "close_order_id": "cycle-99-close-order",
+            "close_fills": [
+                DemoFill(
+                    execution_id="cycle-99-close-exec",
+                    order_id="cycle-99-close-order",
+                    quantity=Decimal("0.001"),
+                    price=Decimal("65100"),
+                    executed_at=datetime(
+                        2026, 7, 23, 15, 11, tzinfo=timezone.utc
+                    ),
+                )
+            ],
+        }
+    )
+    repo.records[str(other.candidate_id)] = other
+    with pytest.raises(DemoSafetyError, match="failed exact reconciliation"):
+        demo.request_canary_trailing_update(str(record.id))
+
+
+def test_cycle_99_remote_open_and_protected_is_verified_without_retry() -> None:
+    client = Cycle99FlatProtectionClient(
+        remain_open=True, reflect_requested_protection=True
+    )
+    demo, _, record = _cycle_99_service(client)
+    result = demo.request_canary_trailing_update(str(record.id))
+    assert result is not None
+    assert result.state == DemoExecutionState.DEMO_POSITION_OPEN
+    assert result.last_protection_verification["classification"] == (
+        "PROTECTION_VERIFIED_REMOTE_OPEN"
+    )
+    assert client.set_stop_calls == 1
+
+
+def test_cycle_99_remote_open_and_unprotected_fails_closed() -> None:
+    client = Cycle99FlatProtectionClient(remain_open=True)
+    demo, _, record = _cycle_99_service(client)
+    with pytest.raises(DemoSafetyError, match="failed exact reconciliation"):
+        demo.request_canary_trailing_update(str(record.id))
+    assert client.set_stop_calls == 1
+
+
+def test_cycle_99_terminalization_and_pnl_are_applied_exactly_once() -> None:
+    client = Cycle99FlatProtectionClient()
+    demo, repo, record = _cycle_99_service(client)
+    first = demo.request_canary_trailing_update(str(record.id))
+    assert first is not None
+    second = demo._reconcile_execution_rest(first)
+    assert second.realized_exchange_pnl == Decimal("0.08")
+    assert len(second.close_fills) == 1
+    assert repo.saved_events.count(
+        ("DEMO_CLOSE_TERMINALIZED", DemoExecutionState.DEMO_CLOSED.value)
+    ) == 1
+
+
+def test_cycle_99_concurrent_monitoring_does_not_duplicate_terminalization() -> None:
+    client = Cycle99FlatProtectionClient()
+    demo, repo, record = _cycle_99_service(client)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _: demo.request_canary_trailing_update(str(record.id)),
+                range(2),
+            )
+        )
+    assert sum(item is not None for item in results) >= 1
+    assert client.set_stop_calls == 1
+    assert repo.saved_events.count(
+        ("DEMO_CLOSE_TERMINALIZED", DemoExecutionState.DEMO_CLOSED.value)
+    ) == 1
+
+
+def test_cycle_99_fixture_has_eight_exact_trades_and_authoritative_total() -> None:
+    trades = _CYCLE_99["completed_trades"]
+    assert len(trades) == 8
+    assert sum(Decimal(item["net_pnl"]) for item in trades) == Decimal(
+        _CYCLE_99["net_pnl"]
+    )
+    assert _CYCLE_99["unresolved_executions"] == 0
+    assert _CYCLE_99["unattributed_exits"] == 0
+    assert _CYCLE_99["unprotected_intervals"] == 0
+
+
+def test_demo_exchange_error_preserves_structured_ret_code_and_message() -> None:
+    exc = DemoExchangeError(
+        "sanitized",
+        ret_code=999999,
+        ret_msg="can not set tp/sl/ts for zero position",
+    )
+    assert exc.ret_code == 999999
+    assert exc.ret_msg == "can not set tp/sl/ts for zero position"
+
+
+def test_demo_rest_client_preserves_exchange_ret_code() -> None:
+    client = BybitDemoRestClient(
+        api_key="fake",
+        api_secret="fake",
+        http_request=lambda *args: {
+            "retCode": 999999,
+            "retMsg": "can not set tp/sl/ts for zero position",
+        },
+    )
+    with pytest.raises(DemoExchangeError) as captured:
+        client.set_trading_stop(
+            Symbol.BTCUSDT, Decimal("65100"), Decimal("64900")
+        )
+    assert captured.value.ret_code == 999999
+    assert captured.value.ret_msg == (
+        "can not set tp/sl/ts for zero position"
+    )
+
+
+def test_cycle_99_unstructured_exchange_error_is_not_reclassified() -> None:
+    class UnstructuredClient(Cycle99FlatProtectionClient):
+        def set_trading_stop(self, symbol, take_profit, stop_loss):
+            self.set_stop_calls += 1
+            raise DemoExchangeError(
+                "Bybit Demo request failed: transient",
+                ret_code=999999,
+                ret_msg="transient",
+            )
+
+    client = UnstructuredClient()
+    demo, _, record = _cycle_99_service(client)
+    with pytest.raises(DemoExchangeError, match="transient"):
+        demo.request_canary_trailing_update(str(record.id))
+    assert client.set_stop_calls == 1
+
+
+def test_cycle_99_any_remote_open_order_blocks_terminalization_handoff() -> None:
+    class OpenOrderClient(Cycle99FlatProtectionClient):
+        def get_open_orders(self, symbol=None, settle_coin=None):
+            if not self.closed:
+                return []
+            return [{
+                "symbol": "BTCUSDT",
+                "orderId": "manual-unrelated",
+                "orderLinkId": "",
+                "side": "Sell",
+                "reduceOnly": False,
+            }]
+
+    client = OpenOrderClient()
+    demo, repo, record = _cycle_99_service(client)
+    with pytest.raises(DemoSafetyError, match="open orders remain"):
+        demo.request_canary_trailing_update(str(record.id))
+    assert not any(
+        event == "DEMO_CLOSE_TERMINALIZED"
+        for event, _ in repo.saved_events
+    )
+
+
+def test_cycle_99_handoff_does_not_activate_kill_switch_or_emergency_close() -> None:
+    client = Cycle99FlatProtectionClient()
+    demo, repo, record = _cycle_99_service(client)
+    result = demo.request_canary_trailing_update(str(record.id))
+    assert result is not None
+    assert result.state == DemoExecutionState.DEMO_CLOSED
+    assert repo.kill is None
+    assert client.orders == []
+
+
+def test_cycle_99_replayed_terminal_close_order_adds_no_duplicate_event() -> None:
+    client = Cycle99FlatProtectionClient()
+    demo, repo, record = _cycle_99_service(client)
+    result = demo.request_canary_trailing_update(str(record.id))
+    assert result is not None
+    before = list(repo.saved_events)
+    close_order = client.history[0]
+    demo._apply_order_update(result, close_order, force_close=True)
+    demo._apply_order_update(result, close_order, force_close=True)
+    assert repo.saved_events == before

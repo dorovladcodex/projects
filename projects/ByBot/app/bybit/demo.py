@@ -137,7 +137,16 @@ class DemoSafetyError(RuntimeError):
 
 
 class DemoExchangeError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        ret_code: int | None = None,
+        ret_msg: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.ret_code = ret_code
+        self.ret_msg = ret_msg
 
 
 @dataclass(frozen=True)
@@ -703,8 +712,11 @@ class BybitDemoRestClient:
         data = self._http_request(method, url, headers, body, self.timeout_seconds)
         ret_code = int(data.get("retCode") or 0)
         if ret_code != 0 and ret_code not in (allowed_ret_codes or set()):
+            ret_msg = str(data.get("retMsg") or "unknown error")
             raise DemoExchangeError(
-                f"Bybit Demo request failed: {data.get('retMsg', 'unknown error')}"
+                f"Bybit Demo request failed: {ret_msg}",
+                ret_code=ret_code,
+                ret_msg=ret_msg,
             )
         return data
 
@@ -2440,7 +2452,10 @@ class DemoExecutionService:
         return record
 
     def request_canary_trailing_update(
-        self, execution_id: str
+        self,
+        execution_id: str,
+        *,
+        close_before_mutation: bool = False,
     ) -> DemoExecutionRecord | None:
         """Exercise the production protection verifier on one owned canary."""
         if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
@@ -2463,6 +2478,8 @@ class DemoExecutionService:
                 ),
                 record,
             )
+            if record.state in TERMINAL_DEMO_STATES:
+                return record
             if record.state != DemoExecutionState.DEMO_POSITION_OPEN:
                 raise DemoSafetyError("trailing canary requires an open owned position")
             rules = self.client.get_instrument(record.symbol)
@@ -2494,14 +2511,56 @@ class DemoExecutionService:
                 requested_sl = max(current_sl - rules.tick_size, floor)
                 if requested_sl >= current_sl:
                     raise DemoSafetyError("no safe SELL trailing increment is available")
+
+            before_mutation_hook = None
+            if close_before_mutation:
+                def close_exact_owned_position(
+                    current: DemoExecutionRecord,
+                ) -> None:
+                    self._submit_reduce_only_close(
+                        current,
+                        current.accepted_quantity,
+                        "canary_close",
+                    )
+                    deadline = time.monotonic() + 20
+                    while time.monotonic() < deadline:
+                        reconciled = self._reconcile_execution_rest_locked(current)
+                        positions = self.client.get_positions(
+                            symbol=current.symbol
+                        )
+                        if (
+                            reconciled.state in TERMINAL_DEMO_STATES
+                            and not any(
+                                _decimal(item.get("size"), default="0") > 0
+                                for item in positions
+                            )
+                        ):
+                            return
+                        time.sleep(0.25)
+                    raise DemoSafetyError(
+                        "canary exact close did not become terminal before "
+                        "the protection mutation"
+                    )
+
+                before_mutation_hook = close_exact_owned_position
             outcome = self._update_and_verify_protection(
                 record,
                 rules=rules,
                 take_profit=current_tp,
                 stop_loss=requested_sl,
                 verified_at=datetime.now(timezone.utc),
+                before_mutation_hook=before_mutation_hook,
             )
             return outcome.record
+
+    def request_canary_flat_during_protection_race(
+        self, execution_id: str
+    ) -> DemoExecutionRecord | None:
+        """Force one exact owned close between protection pre-check and mutation."""
+
+        return self.request_canary_trailing_update(
+            execution_id, close_before_mutation=True
+        )
 
     def monitor_strategy_position(
         self,
@@ -2698,6 +2757,7 @@ class DemoExecutionService:
         take_profit: Decimal,
         stop_loss: Decimal,
         verified_at: datetime,
+        before_mutation_hook: Callable[[DemoExecutionRecord], None] | None = None,
     ) -> ProtectionVerificationOutcome:
         """Mutate once, then verify from bounded authoritative REST snapshots."""
         if self.client is None:
@@ -2739,14 +2799,31 @@ class DemoExecutionService:
 
         mutation_response: dict[str, Any] | None = None
         try:
+            if before_mutation_hook is not None:
+                before_mutation_hook(record)
             response = self.client.set_trading_stop(
                 record.symbol, normalized_tp, normalized_sl
             )
             mutation_response = _sanitized_mutation_response(response)
         except DemoExchangeError as exc:
-            if "not modified" not in str(exc).lower():
+            if "not modified" in str(exc).lower():
+                mutation_response = {
+                    "retCode": exc.ret_code or "IDEMPOTENT",
+                    "retMsg": exc.ret_msg or "not modified",
+                }
+            elif _is_structured_flat_position_error(exc):
+                return self._handle_possible_flat_protection_failure(
+                    record,
+                    rules=rules,
+                    requested=requested,
+                    normalized=normalized,
+                    take_profit=normalized_tp,
+                    stop_loss=normalized_sl,
+                    mutation_error=exc,
+                    verified_at=verified_at,
+                )
+            else:
                 raise
-            mutation_response = {"retCode": "IDEMPOTENT", "retMsg": "not modified"}
 
         attempts = self.settings.v2_protection_verification_attempts
         for attempt in range(1, attempts + 1):
@@ -2824,6 +2901,147 @@ class DemoExecutionService:
         )
         raise DemoSafetyError("updated trailing protection could not be verified")
 
+    def _handle_possible_flat_protection_failure(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        requested: dict[str, Any],
+        normalized: dict[str, Any],
+        take_profit: Decimal,
+        stop_loss: Decimal,
+        mutation_error: DemoExchangeError,
+        verified_at: datetime,
+    ) -> ProtectionVerificationOutcome:
+        """Classify a structured zero-position rejection from exact REST state.
+
+        The caller already owns the per-execution lock.  The exchange may close
+        the position between the pre-check and mutation response, so this path
+        never retries the mutation.  It either verifies an open protected
+        position, hands exact full-close evidence to the existing terminalizer,
+        or fails closed with durable attribution blockers.
+        """
+
+        mutation_response = {
+            "retCode": mutation_error.ret_code,
+            "retMsg": mutation_error.ret_msg,
+        }
+        attempts = self.settings.v2_protection_verification_attempts
+        last_blockers: list[str] = []
+        for attempt in range(1, attempts + 1):
+            positions = self.client.get_positions(symbol=record.symbol)
+            symbol_positions = [
+                item for item in positions
+                if str(item.get("symbol") or "") == record.symbol.value
+                and _decimal(item.get("size"), default="0") > 0
+            ]
+            owned = _owned_position(symbol_positions, record)
+            if owned is not None:
+                if _normalized_protection_matches(
+                    owned, take_profit, stop_loss, rules, record.side
+                ):
+                    self._persist_protection_verification(
+                        record,
+                        requested=requested,
+                        normalized=normalized,
+                        position=owned,
+                        attempt=attempt,
+                        mutation_response=mutation_response,
+                        result="VERIFIED",
+                        blocker=None,
+                        observed_at=datetime.now(timezone.utc),
+                        classification="PROTECTION_VERIFIED_REMOTE_OPEN",
+                        cycle_failure_emitted=False,
+                        terminalization_result=None,
+                    )
+                    record.take_profit = take_profit
+                    record.stop_loss = stop_loss
+                    return ProtectionVerificationOutcome(
+                        record, True, False, attempt
+                    )
+                last_blockers = [
+                    "authoritative remote position remains open",
+                    "authoritative REST protection differs",
+                ]
+            elif symbol_positions:
+                last_blockers = [
+                    "remote position does not match owned side or quantity"
+                ]
+            else:
+                open_orders = self.client.get_open_orders(symbol=record.symbol)
+                if open_orders:
+                    last_blockers = [
+                        "authoritative remote open orders remain"
+                    ]
+                    if (
+                        attempt < attempts
+                        and self.settings.v2_protection_verification_delay_ms
+                    ):
+                        time.sleep(
+                            self.settings.v2_protection_verification_delay_ms
+                            / 1000
+                        )
+                    continue
+                reconciled = self._reconcile_execution_rest_locked(record)
+                last_blockers = _terminalization_handoff_blockers(
+                    reconciled,
+                    positions=self.client.get_positions(symbol=record.symbol),
+                    open_orders=open_orders,
+                    all_records=self.repository.load_demo_executions(),
+                )
+                if not last_blockers:
+                    self._persist_protection_verification(
+                        reconciled,
+                        requested=requested,
+                        normalized=normalized,
+                        position=None,
+                        attempt=attempt,
+                        mutation_response=mutation_response,
+                        result="TERMINALIZATION_HANDOFF",
+                        blocker=None,
+                        observed_at=datetime.now(timezone.utc),
+                        classification="TERMINALIZATION_HANDOFF",
+                        cycle_failure_emitted=False,
+                        terminalization_result=reconciled.state.value,
+                    )
+                    return ProtectionVerificationOutcome(
+                        reconciled, False, True, attempt
+                    )
+            if (
+                attempt < attempts
+                and self.settings.v2_protection_verification_delay_ms
+            ):
+                time.sleep(
+                    self.settings.v2_protection_verification_delay_ms / 1000
+                )
+
+        blocker = "; ".join(last_blockers) or (
+            "zero-position protection rejection could not be reconciled"
+        )
+        if not any(
+            _decimal(item.get("size"), default="0") > 0
+            for item in self.client.get_positions(symbol=record.symbol)
+        ):
+            record.attribution_failure_reason = blocker
+        self._persist_protection_verification(
+            record,
+            requested=requested,
+            normalized=normalized,
+            position=None,
+            attempt=attempts,
+            mutation_response=mutation_response,
+            result="REAL_PROTECTION_FAILURE",
+            blocker=blocker,
+            observed_at=datetime.now(timezone.utc),
+            classification="REAL_PROTECTION_FAILURE",
+            cycle_failure_emitted=True,
+            terminalization_result=None,
+        )
+        raise DemoSafetyError(
+            "structured zero-position protection rejection failed exact "
+            f"reconciliation: {blocker}"
+        )
+
     def _persist_protection_verification(
         self,
         record: DemoExecutionRecord,
@@ -2836,7 +3054,13 @@ class DemoExecutionService:
         result: str,
         blocker: str | None,
         observed_at: datetime,
+        classification: str | None = None,
+        cycle_failure_emitted: bool | None = None,
+        terminalization_result: str | None = None,
     ) -> None:
+        close_quantity = sum(
+            (fill.quantity for fill in record.close_fills), Decimal("0")
+        )
         observation = {
             "requested": requested,
             "normalized_requested": normalized,
@@ -2851,7 +3075,16 @@ class DemoExecutionService:
             "verification_attempt": attempt,
             "mutation_response": mutation_response,
             "result": result,
+            "classification": classification,
             "blocker": blocker,
+            "cycle_failure_emitted": cycle_failure_emitted,
+            "terminalization_result": terminalization_result,
+            "execution_id": str(record.id),
+            "close_order_id": record.close_order_id,
+            "close_execution_ids": [
+                fill.execution_id for fill in record.close_fills
+            ],
+            "close_quantity": str(close_quantity),
             "observed_at": observed_at.isoformat(),
         }
         record.last_protection_verification = observation
@@ -2973,6 +3206,18 @@ class DemoExecutionService:
         )
         if is_close:
             if _exchange_event_time_ms(item) < _record_entry_time_ms(record):
+                return
+            if (
+                status == "Filled"
+                and record.state in TERMINAL_DEMO_STATES
+                and (
+                    (record.close_order_id and order_id == record.close_order_id)
+                    or (
+                        record.close_order_link_id
+                        and order_link == record.close_order_link_id
+                    )
+                )
+            ):
                 return
             if order_id and not record.close_order_id:
                 record.close_order_id = order_id
@@ -3850,6 +4095,84 @@ def _sanitized_mutation_response(response: dict[str, Any] | None) -> dict[str, A
         "retCode": response.get("retCode", 0),
         "retMsg": str(response.get("retMsg") or "")[:120] or None,
     }
+
+
+def _is_structured_flat_position_error(exc: DemoExchangeError) -> bool:
+    """Recognize only Bybit's structured zero-position protection rejection."""
+
+    return bool(
+        exc.ret_code is not None
+        and exc.ret_code != 0
+        and "can not set tp/sl/ts for zero position"
+        in str(exc.ret_msg or "").casefold()
+    )
+
+
+def _terminalization_handoff_blockers(
+    record: DemoExecutionRecord,
+    *,
+    positions: list[dict[str, Any]],
+    open_orders: list[dict[str, Any]],
+    all_records: list[DemoExecutionRecord],
+) -> list[str]:
+    """Prove that exact, full-close terminalization already completed."""
+
+    blockers: list[str] = []
+    if record.state not in TERMINAL_DEMO_STATES:
+        blockers.append(f"durable execution is not terminal: {record.state.value}")
+    if any(
+        str(item.get("symbol") or "") == record.symbol.value
+        and _decimal(item.get("size"), default="0") > 0
+        for item in positions
+    ):
+        blockers.append("authoritative remote position is not flat")
+    if open_orders:
+        blockers.append("authoritative remote open orders remain")
+    if not record.order_id or not record.fills:
+        blockers.append("exact entry order/fill evidence is incomplete")
+    if not record.close_order_id or not record.close_fills:
+        blockers.append("exact close order/fill evidence is incomplete")
+
+    entry_quantity = sum(
+        (fill.quantity for fill in record.fills), Decimal("0")
+    )
+    close_quantity = sum(
+        (fill.quantity for fill in record.close_fills), Decimal("0")
+    )
+    if (
+        record.accepted_quantity <= 0
+        or entry_quantity != record.accepted_quantity
+        or close_quantity != record.accepted_quantity
+    ):
+        blockers.append("entry/full-close quantity evidence is not exact")
+    if record.fills and record.close_fills:
+        entry_time = min(fill.executed_at for fill in record.fills)
+        close_time = min(fill.executed_at for fill in record.close_fills)
+        if _aware(close_time) < _aware(entry_time):
+            blockers.append("close evidence predates entry")
+    if any(
+        fill.order_id != record.order_id
+        or _exchange_identity_used_by_other(
+            all_records, record, fill.order_id, fill.execution_id
+        )
+        for fill in record.fills
+    ):
+        blockers.append("entry order/execution ownership is conflicting")
+    if any(
+        fill.order_id != record.close_order_id
+        or _exchange_identity_used_by_other(
+            all_records, record, fill.order_id, fill.execution_id
+        )
+        for fill in record.close_fills
+    ):
+        blockers.append("close order/execution ownership is conflicting")
+    if canonical_exit_attribution(
+        record.exit_attribution or record.close_reason
+    ) == "unattributed_external_close":
+        blockers.append("close attribution is not authoritative")
+    if record.realized_exchange_pnl is None:
+        blockers.append("authoritative exchange PnL is unavailable")
+    return blockers
 
 
 def _is_execution_owned_open_order(
