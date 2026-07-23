@@ -59,6 +59,12 @@ from app.v2.news import (
 )
 from app.v2.portfolio import PortfolioRiskService
 from app.v2.runtime import V2Runtime, v2_cycle_loop
+from app.v2.models import (
+    ScoreComponents,
+    StrategyName,
+    StrategySide,
+    V2SignalCandidate,
+)
 from app.v2.universe import BybitPublicUniverseClient, SymbolUniverseService
 
 settings = get_settings()
@@ -307,6 +313,106 @@ def v2_stop_new_entries() -> dict[str, object]:
     if settings.app_env.lower() != "demo" or not settings.v2_enabled:
         raise HTTPException(status_code=404, detail="V2 Demo runtime is disabled")
     return v2_runtime.begin_draining()
+
+
+@app.post("/v2/canary/sizing/{symbol}/{notional_tier}")
+def v2_sizing_canary(
+    symbol: Symbol, notional_tier: int
+) -> dict[str, object]:
+    """Guarded deterministic candidate exercising production V2 sizing."""
+
+    _require_demo_canary()
+    if not settings.v2_enabled or notional_tier not in {100, 200}:
+        raise HTTPException(status_code=404, detail="V2 sizing canary unavailable")
+    feature = v2_feature_engine.snapshot(symbol)
+    if feature is None or not feature.fresh:
+        raise HTTPException(
+            status_code=503, detail="fresh V2 feature snapshot is unavailable"
+        )
+    score = Decimal("0.64") if notional_tier == 100 else Decimal("0.72")
+    desired_net_edge = Decimal("10") if notional_tier == 100 else Decimal("18")
+    depth = (
+        feature.ask_depth_10bps_usdt
+        or feature.ask_depth_usdt
+    )
+    impact = (
+        min(
+            Decimal("25"),
+            Decimal(notional_tier) / depth * Decimal("10000"),
+        )
+        if depth > 0 else Decimal("25")
+    )
+    slippage = max(
+        settings.v2_slippage_bps * Decimal("2"),
+        feature.spread_bps + impact,
+    )
+    now = datetime.now(timezone.utc)
+    components = ScoreComponents(
+        strategy_score=score,
+        liquidity_score=score,
+        market_confirmation_score=score,
+        relative_strength_score=score,
+        estimated_fee_penalty=Decimal("0"),
+        estimated_slippage_penalty=Decimal("0"),
+        correlation_penalty=Decimal("0"),
+        portfolio_exposure_penalty=Decimal("0"),
+        final_score=score,
+    )
+    candidate = V2SignalCandidate(
+        run_id=v2_run_id,
+        strategy_name=StrategyName.VOLUME_BREAKOUT,
+        strategy_version="sizing-canary-v1",
+        symbol=symbol,
+        side=StrategySide.LONG,
+        created_at=now,
+        expires_at=now + timedelta(minutes=2),
+        market_regime=feature.market_regime,
+        feature_snapshot=feature,
+        raw_strategy_score=score,
+        confidence=score,
+        estimated_edge_bps=(
+            settings.v2_taker_fee_bps * Decimal("2")
+            + slippage
+            + desired_net_edge
+        ),
+        expected_fees_bps=settings.v2_taker_fee_bps * Decimal("2"),
+        expected_slippage_bps=slippage,
+        expected_funding_bps=Decimal("0"),
+        entry_reason=f"guarded V2 {notional_tier} USDT sizing canary",
+        threshold=Decimal("0.62"),
+        distance_to_threshold=score - Decimal("0.62"),
+        score_components=components,
+        admitted=True,
+        state="READY",
+        stop_loss_pct=Decimal("0.5"),
+        take_profit_pct=Decimal("1"),
+        maximum_holding_seconds=1800,
+    )
+    result = v2_execution_coordinator.execute(
+        candidate, manual_canary=True
+    )
+    if not result.get("execution_attempted"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": result.get("reason"),
+                "rejection_code": result.get("rejection_code"),
+                "sizing": (
+                    candidate.sizing.model_dump(mode="json")
+                    if candidate.sizing else None
+                ),
+            },
+        )
+    return {
+        **result,
+        "target_tier_usdt": notional_tier,
+        "sizing": (
+            candidate.sizing.model_dump(mode="json")
+            if candidate.sizing else None
+        ),
+        "production_v2_sizing_used": True,
+        "live_execution_blocked": True,
+    }
 
 
 @app.get("/status")

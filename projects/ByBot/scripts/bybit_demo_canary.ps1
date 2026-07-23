@@ -1,11 +1,14 @@
 param(
     [switch]$AllowDemoOrders,
-    [ValidateSet("BTCUSDT", "ETHUSDT")]
+    [ValidateSet("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")]
     [string]$Symbol = "BTCUSDT",
     [Nullable[decimal]]$MaxNotionalUSDT = $null,
     [decimal]$MarketPriceBufferPct = 5,
     [switch]$ExerciseTrailingUpdate,
     [switch]$ExerciseFlatDuringProtectionRace,
+    [ValidateSet(0, 100, 200)]
+    [int]$V2SizingTier = 0,
+    [switch]$SkipControlledRestart,
     [switch]$AuthorizeCalculatedMinimumQuantity,
     [ValidateRange(90, 900)]
     [int]$StartupTimeoutSeconds = 360
@@ -163,9 +166,50 @@ function Invoke-Api {
     try { return Invoke-RestMethod @parameters }
     catch {
         $status = $null
-        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-        throw "API $Method $Path failed (HTTP $status): $($_.Exception.Message)"
+        $responseBody = $null
+        if ($_.Exception.Response) {
+            $status = [int]$_.Exception.Response.StatusCode
+            try {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object IO.StreamReader($stream)
+                    try { $responseBody = $reader.ReadToEnd() }
+                    finally { $reader.Dispose() }
+                }
+            }
+            catch { }
+        }
+        $detail = if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            Protect-Text $_.ErrorDetails.Message
+        }
+        elseif ($responseBody) {
+            Protect-Text $responseBody
+        }
+        else {
+            $_.Exception.Message
+        }
+        throw "API $Method $Path failed (HTTP $status): $detail"
     }
+}
+
+function Invoke-DemoReconcile {
+    param([int]$Attempts = 3)
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            return Invoke-Api -Method "POST" -Path "/demo/reconcile" -TimeoutSec 90
+        }
+        catch {
+            $lastFailure = $_
+            if ($script:Child -and $script:Child.HasExited) {
+                throw
+            }
+            if ($attempt -lt $Attempts) {
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+    }
+    throw $lastFailure
 }
 
 function Wait-ForApi {
@@ -184,6 +228,33 @@ function Wait-ForApi {
         Start-Sleep -Seconds 1
     }
     throw "FastAPI did not become ready"
+}
+
+function Start-UvicornReady {
+    param(
+        [string]$Python,
+        [int]$Port,
+        [string]$Stdout,
+        [string]$Stderr,
+        [int]$TimeoutSeconds,
+        [int]$Attempts = 3
+    )
+    $lastFailure = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Start-Uvicorn $Python $Port $Stdout $Stderr
+        try {
+            Wait-ForApi -TimeoutSeconds $TimeoutSeconds
+            return
+        }
+        catch {
+            $lastFailure = $_
+            Stop-Uvicorn
+            if ($attempt -lt $Attempts) {
+                Start-Sleep -Seconds (2 * $attempt)
+            }
+        }
+    }
+    throw $lastFailure
 }
 
 function Get-RunExecutions {
@@ -317,6 +388,8 @@ try {
     Set-IsolatedEnvironment "BYBIT_ENABLE_TRADING" "false"
     Set-IsolatedEnvironment "AUTO_PAPER_EXECUTION" "false"
     Set-IsolatedEnvironment "DEMO_CANARY_ENABLED" "true"
+    Set-IsolatedEnvironment "V2_ENABLED" $(if ($V2SizingTier) { "true" } else { "false" })
+    Set-IsolatedEnvironment "V2_AUTO_DEMO_EXECUTION" "false"
     Set-IsolatedEnvironment "BYBIT_PRIVATE_DEMO_BASE_URL" "https://api-demo.bybit.com"
     Set-IsolatedEnvironment "BYBIT_PRIVATE_DEMO_WS_URL" "wss://stream-demo.bybit.com"
     Set-IsolatedEnvironment "DEMO_LEVERAGE" "1"
@@ -348,54 +421,70 @@ try {
 
     $port = Get-AvailablePort
     $script:BaseUrl = "http://127.0.0.1:$port"
-    Start-Uvicorn $python $port $stdoutPath $stderrPath
-    Wait-ForApi -TimeoutSeconds $StartupTimeoutSeconds
+    Start-UvicornReady $python $port $stdoutPath $stderrPath `
+        $StartupTimeoutSeconds
 
     $script:FailureStage = "local_preflight"
     $demo = Assert-DemoSafety
-    $reconcile = Invoke-Api -Method "POST" -Path "/demo/reconcile"
+    $reconcile = Invoke-DemoReconcile
     Assert-Condition ($reconcile.status -eq "OK") "Demo reconciliation failed"
     Assert-Condition ([int]$reconcile.open_orders_by_symbol.$Symbol -eq 0) `
         "$Symbol has an active order"
     Assert-Condition ([int]$reconcile.remote_positions -eq 0) `
         "Demo account must be flat before the controlled canary"
+    if ($V2SizingTier) {
+        $v2Preflight = Invoke-Api -Path "/v2/preflight"
+        Assert-Condition ($v2Preflight.ok -eq $true) (
+            "V2 execution preflight failed: " +
+            (@($v2Preflight.blockers) -join "; ")
+        )
+        Write-Host "V2 EXECUTION PREFLIGHT: PASS"
+    }
     $initialUnrelatedOrders = [int]$demo.unrelated_open_orders
     Write-Host "DEMO ACCOUNT VERIFIED: PASS"
 
     # Preview reads current instrument rules and price without creating a
     # candidate, risk decision, execution reservation, or exchange order.
-    $script:FailureStage = "exchange_minimum_preview"
-    $preview = Invoke-Api -Method "POST" -Path "/demo/canary/preview" -Body @{
-        symbol = $Symbol
-        max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+    $plan = $null
+    if (-not $V2SizingTier) {
+        $script:FailureStage = "exchange_minimum_preview"
+        $preview = Invoke-Api -Method "POST" -Path "/demo/canary/preview" -Body @{
+            symbol = $Symbol
+            max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+        }
+        $plan = $preview.plan
+        Assert-Condition ($null -ne $plan) "Exchange minimum plan is missing"
+        Assert-Condition ($plan.symbol -eq $Symbol) "Preview returned the wrong symbol"
+        Assert-Condition ($plan.instrument_status -eq "Trading") `
+            "$Symbol is not Trading"
+        Assert-Condition ($null -ne $plan.calculated_quantity) `
+            "Calculated minimum order quantity is missing"
+        Assert-Condition ([decimal]$plan.calculated_quantity -gt [decimal]0) `
+            "Calculated minimum order quantity is invalid"
+        Assert-Condition ([decimal]$plan.buffered_required_notional -le $MaxNotionalUSDT) `
+            "Buffered required budget exceeds explicit MaxNotionalUSDT"
+
+        Write-Host "DEMO SYMBOL: $($plan.symbol)"
+        Write-Host "MIN ORDER QTY: $($plan.min_order_qty)"
+        Write-Host "QTY STEP: $($plan.qty_step)"
+        Write-Host "MIN NOTIONAL: $($plan.min_notional_value)"
+        Write-Host "REFERENCE PRICE: $($plan.reference_price)"
+        Write-Host "CALCULATED ORDER QTY: $($plan.calculated_quantity)"
+        Write-Host "ESTIMATED NOTIONAL: $($plan.estimated_notional)"
+        Write-Host "BUFFERED REQUIRED BUDGET: $($plan.buffered_required_notional)"
+        Write-Host "MAX CANARY BUDGET: $($MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture))"
+        Write-Host "EXCHANGE MINIMUM VALIDATION: PASS"
     }
-    $plan = $preview.plan
-    Assert-Condition ($null -ne $plan) "Exchange minimum plan is missing"
-    Assert-Condition ($plan.symbol -eq $Symbol) "Preview returned the wrong symbol"
-    Assert-Condition ($plan.instrument_status -eq "Trading") `
-        "$Symbol is not Trading"
-    Assert-Condition ($null -ne $plan.calculated_quantity) `
-        "Calculated minimum order quantity is missing"
-    Assert-Condition ([decimal]$plan.calculated_quantity -gt [decimal]0) `
-        "Calculated minimum order quantity is invalid"
-    Assert-Condition ([decimal]$plan.buffered_required_notional -le $MaxNotionalUSDT) `
-        "Buffered required budget exceeds explicit MaxNotionalUSDT"
 
-    Write-Host "DEMO SYMBOL: $($plan.symbol)"
-    Write-Host "MIN ORDER QTY: $($plan.min_order_qty)"
-    Write-Host "QTY STEP: $($plan.qty_step)"
-    Write-Host "MIN NOTIONAL: $($plan.min_notional_value)"
-    Write-Host "REFERENCE PRICE: $($plan.reference_price)"
-    Write-Host "CALCULATED ORDER QTY: $($plan.calculated_quantity)"
-    Write-Host "ESTIMATED NOTIONAL: $($plan.estimated_notional)"
-    Write-Host "BUFFERED REQUIRED BUDGET: $($plan.buffered_required_notional)"
-    Write-Host "MAX CANARY BUDGET: $($MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture))"
-    Write-Host "EXCHANGE MINIMUM VALIDATION: PASS"
-
-    $requiredConfirmation = "SUBMIT $Symbol $($plan.calculated_quantity)"
+    $requiredConfirmation = if ($V2SizingTier) {
+        "SUBMIT $Symbol V2 $V2SizingTier"
+    } else {
+        "SUBMIT $Symbol $($plan.calculated_quantity)"
+    }
     if ($AuthorizeCalculatedMinimumQuantity) {
         Assert-Condition (
-            ($ExerciseTrailingUpdate -or $ExerciseFlatDuringProtectionRace) -and
+            ($ExerciseTrailingUpdate -or $ExerciseFlatDuringProtectionRace -or
+             $V2SizingTier) -and
             $AllowDemoOrders
         ) "Non-interactive quantity authorization is restricted to a guarded protection canary"
         $operatorConfirmation = $requiredConfirmation
@@ -417,22 +506,36 @@ try {
     $script:NoCandidateCreated = "unknown"
     $script:NoReservationCreated = "unknown"
     $script:NoOrderSubmitted = "unknown"
-    $entry = Invoke-Api -Method "POST" -Path "/demo/canary/execute" -Body @{
-        symbol = $Symbol
-        max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
-        expected_rules_fingerprint = [string]$plan.rules_fingerprint
+    if ($V2SizingTier) {
+        $v2Result = Invoke-Api -Method "POST" `
+            -Path "/v2/canary/sizing/$Symbol/$V2SizingTier" -TimeoutSec 90
+        Assert-Condition ($v2Result.production_v2_sizing_used -eq $true) `
+            "Production V2 sizing was not used"
+        Assert-Condition ($null -ne $v2Result.sizing) "V2 sizing audit is missing"
+        $entry = @{
+            execution = (Get-Execution -ExecutionId $v2Result.execution_id)
+            sizing = $v2Result.sizing
+        }
+        Assert-Condition ($null -ne $entry.execution) "V2 canary execution is missing"
     }
-    Assert-Condition ([bool]$entry.job_id) "Canary did not return a durable job ID"
-    $jobDeadline = [DateTime]::UtcNow.AddMinutes(3)
-    do {
-        $job = Invoke-Api -Path "/demo/canary/jobs/$($entry.job_id)"
-        if ($job.status -in @("SUCCEEDED", "FAILED")) { break }
-        Start-Sleep -Seconds 2
-    } while ([DateTime]::UtcNow -lt $jobDeadline)
-    Assert-Condition ($job.status -eq "SUCCEEDED") `
-        "Durable canary job did not succeed (status=$($job.status), error=$($job.error_code))"
-    $entry = $job.result
-    Assert-Condition ($null -ne $entry.execution) "Canary job has no execution result"
+    else {
+        $entry = Invoke-Api -Method "POST" -Path "/demo/canary/execute" -Body @{
+            symbol = $Symbol
+            max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+            expected_rules_fingerprint = [string]$plan.rules_fingerprint
+        }
+        Assert-Condition ([bool]$entry.job_id) "Canary did not return a durable job ID"
+        $jobDeadline = [DateTime]::UtcNow.AddMinutes(3)
+        do {
+            $job = Invoke-Api -Path "/demo/canary/jobs/$($entry.job_id)"
+            if ($job.status -in @("SUCCEEDED", "FAILED")) { break }
+            Start-Sleep -Seconds 2
+        } while ([DateTime]::UtcNow -lt $jobDeadline)
+        Assert-Condition ($job.status -eq "SUCCEEDED") `
+            "Durable canary job did not succeed (status=$($job.status), error=$($job.error_code))"
+        $entry = $job.result
+        Assert-Condition ($null -ne $entry.execution) "Canary job has no execution result"
+    }
     $script:ExecutionId = [string]$entry.execution.id
     $script:NoCandidateCreated = $false
     $script:NoReservationCreated = $false
@@ -441,10 +544,23 @@ try {
     Assert-Condition ([bool]$script:ExecutionId) "Canary execution ID is missing"
     Assert-Condition ([bool]$entry.execution.order_link_id) "orderLinkId is missing"
     Assert-Condition ([bool]$entry.execution.order_id) "Bybit did not accept an entry order ID"
-    Assert-Condition ($null -ne $entry.plan) "Final exchange minimum plan is missing"
-    Assert-Condition ([decimal]$entry.execution.requested_quantity -eq `
-        [decimal]$entry.plan.calculated_quantity) `
-        "Submitted quantity differs from the calculated exchange minimum"
+    if ($V2SizingTier) {
+        Assert-Condition (
+            [decimal]$entry.sizing.normalized_accepted_notional_usdt -le
+            ([decimal]$V2SizingTier * [decimal]"1.05")
+        ) "Normalized V2 notional exceeds the guarded exchange-lot tolerance"
+        Assert-Condition (
+            [decimal]$entry.sizing.normalized_accepted_notional_usdt -ge
+            [decimal]100
+        ) "Normalized V2 notional is below the configured minimum"
+        Write-Host "V2 SIZING TIER $V2SizingTier`: $($entry.sizing.normalized_accepted_notional_usdt) USDT PASS"
+    }
+    else {
+        Assert-Condition ($null -ne $entry.plan) "Final exchange minimum plan is missing"
+        Assert-Condition ([decimal]$entry.execution.requested_quantity -eq `
+            [decimal]$entry.plan.calculated_quantity) `
+            "Submitted quantity differs from the calculated exchange minimum"
+    }
     Assert-Condition ($entry.execution.state -in @(
         "DEMO_ORDER_ACKNOWLEDGED", "DEMO_ACCEPTED", "DEMO_PARTIALLY_FILLED",
         "DEMO_FILLED", "DEMO_FULLY_FILLED",
@@ -469,6 +585,17 @@ try {
         "Exchange fill quantity is missing"
     Assert-Condition ([decimal]$opened.average_fill_price -gt 0) `
         "Average fill price is missing"
+    if ($V2SizingTier) {
+        $actualAcceptedNotional = [decimal]$opened.accepted_quantity * `
+            [decimal]$opened.average_fill_price
+        $minimumCanaryNotional = [decimal]$V2SizingTier * [decimal]"0.95"
+        $maximumCanaryNotional = [decimal]$V2SizingTier * [decimal]"1.05"
+        Assert-Condition (
+            $actualAcceptedNotional -ge $minimumCanaryNotional -and
+            $actualAcceptedNotional -le $maximumCanaryNotional
+        ) "Actual accepted V2 notional is outside the guarded 5% canary tolerance"
+        Write-Host "V2 ACTUAL ACCEPTED NOTIONAL: $actualAcceptedNotional USDT"
+    }
     Write-Host "DEMO ENTRY FILL CONFIRMED: PASS"
     Write-Host "DEMO POSITION OPEN CONFIRMED: PASS"
     Assert-Condition ($opened.protection_confirmed -eq $true) `
@@ -514,19 +641,41 @@ try {
     }
 
     $script:FailureStage = "restart_reconciliation"
-    Stop-Uvicorn
-    Start-Uvicorn $python $port $stdoutPath $stderrPath
-    Wait-ForApi -TimeoutSeconds $StartupTimeoutSeconds
-    $null = Assert-DemoSafety
-    $null = Invoke-Api -Method "POST" -Path "/demo/reconcile"
-    $restored = Get-Execution -ExecutionId $executionId
+    if ($SkipControlledRestart) {
+        Assert-Condition ($V2SizingTier -in @(100, 200)) `
+            "Controlled restart may be skipped only by the guarded V2 sizing canary"
+        $restored = Get-Execution -ExecutionId $executionId
+        Write-Host "SIZING-ONLY CONTROLLED RESTART: NOT REQUIRED"
+    }
+    else {
+        Stop-Uvicorn
+        Start-UvicornReady $python $port $stdoutPath $stderrPath `
+            $StartupTimeoutSeconds
+        $null = Assert-DemoSafety
+        $null = Invoke-DemoReconcile
+        $restored = Get-Execution -ExecutionId $executionId
+    }
     Assert-Condition ($null -ne $restored) "Execution was not restored after restart"
+    $closedDuringRestart = $false
     if ($ExerciseFlatDuringProtectionRace) {
         Assert-Condition ($restored.state -in @(
             "DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY"
         )) "Terminal race execution was not restored after restart"
         Assert-Condition (@($restored.close_fills).Count -gt 0) `
             "Terminal race close fill was not restored"
+    }
+    elseif ($restored.state -in @("DEMO_CLOSED", "DEMO_CLOSED_EXTERNALLY")) {
+        Assert-Condition (@($restored.close_fills).Count -gt 0) `
+            "Terminal restart close has no exact attributed fill"
+        Assert-Condition (
+            $restored.close_reason -in @("take_profit", "stop_loss")
+        ) "Restart terminal state was not produced by verified TP/SL"
+        Assert-Condition (
+            $restored.cleanup_result -eq
+            "remote position flat and bot-owned orders zero"
+        ) "Restart terminal state is not authoritatively flat"
+        $closedDuringRestart = $true
+        Write-Host "NATURAL CLOSE DURING RESTART: PASS"
     }
     else {
         Assert-Condition ($restored.state -eq "DEMO_POSITION_OPEN") `
@@ -536,16 +685,18 @@ try {
     }
     Assert-Condition ([decimal]$restored.accepted_quantity -eq [decimal]$opened.accepted_quantity) `
         "Local and remote quantities differ after restart"
-    Write-Host "RESTART RECONCILIATION: PASS"
+    if (-not $SkipControlledRestart) {
+        Write-Host "RESTART RECONCILIATION: PASS"
+    }
 
     for ($i = 0; $i -lt 3; $i++) {
-        $null = Invoke-Api -Method "POST" -Path "/demo/reconcile"
+        $null = Invoke-DemoReconcile
         Assert-Condition (@(Get-RunExecutions).Count -eq 1) `
             "Canary execution was duplicated"
     }
     Write-Host "IDEMPOTENCY: PASS"
 
-    if (-not $ExerciseFlatDuringProtectionRace) {
+    if (-not $ExerciseFlatDuringProtectionRace -and -not $closedDuringRestart) {
         $script:FailureStage = "planned_close"
         $close = Invoke-Api -Method "POST" `
             -Path "/demo/canary/$executionId/close"
@@ -559,7 +710,7 @@ try {
         Write-Host "DEMO REDUCE-ONLY CLOSE: PASS"
     }
 
-    $finalReconcile = Invoke-Api -Method "POST" -Path "/demo/reconcile"
+    $finalReconcile = Invoke-DemoReconcile
     $finalDemo = Invoke-Api -Path "/demo/status"
     Assert-Condition ([int]$finalDemo.bot_owned_open_positions -eq 0) `
         "Final Demo position is not flat"

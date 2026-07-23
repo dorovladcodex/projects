@@ -1073,7 +1073,10 @@ class DemoExecutionService:
         maximum_holding_seconds: int | None = None,
         latency_timeline: dict[str, datetime | None] | None = None,
         instrument_rules: InstrumentRules | None = None,
-        pre_submit_market_guard: Callable[[], Decimal] | None = None,
+        pre_submit_market_guard: Callable[
+            [], Decimal | tuple[Decimal, Decimal]
+        ] | None = None,
+        sizing_details: dict[str, Any] | None = None,
     ) -> DemoExecutionRecord | None:
         if not self.enabled or self.client is None:
             return None
@@ -1244,6 +1247,7 @@ class DemoExecutionService:
             leverage=leverage,
             strategy_name=strategy_name,
             strategy_version=strategy_version,
+            sizing_details=dict(sizing_details or {}),
             stop_loss_pct=Decimal(str(candidate.proposed_stop_loss_pct)),
             take_profit_pct=Decimal(str(candidate.proposed_take_profit_pct)),
             trailing_stop_pct=trailing_stop_pct,
@@ -1278,7 +1282,21 @@ class DemoExecutionService:
             execution_stage_durations_ms=durations,
         )
         if pre_submit_market_guard is not None:
-            entry_reference = Decimal(str(pre_submit_market_guard()))
+            guard_result = pre_submit_market_guard()
+            if isinstance(guard_result, tuple):
+                entry_reference, quantity = guard_result
+                entry_reference = Decimal(str(entry_reference))
+                quantity = Decimal(str(quantity))
+                record.requested_quantity = quantity
+                if record.sizing_details:
+                    record.sizing_details[
+                        "normalized_accepted_quantity"
+                    ] = str(quantity)
+                    record.sizing_details[
+                        "normalized_accepted_notional_usdt"
+                    ] = str(quantity * entry_reference)
+            else:
+                entry_reference = Decimal(str(guard_result))
             validate_order_notional(quantity, entry_reference, rules)
             record.reference_entry_price = entry_reference
         database_started = start("database_execution_state")

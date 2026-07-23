@@ -605,7 +605,10 @@ class V2Runtime:
                 ),
             )
         self._record_signal_metric("raw_candidates", candidate)
-        notional = self.settings.v2_target_notional_for_symbol(candidate.symbol.value)
+        # Admission asks whether at least the minimum safe position can fit.
+        # Exact confidence/edge/risk sizing is performed after account fees are
+        # refreshed immediately before the durable reservation.
+        notional = self.settings.v2_min_position_notional_usdt
         risk_usdt = notional * candidate.stop_loss_pct / Decimal("100")
         try:
             portfolio_reasons = self.portfolio.block_reasons(

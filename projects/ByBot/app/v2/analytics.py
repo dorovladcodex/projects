@@ -359,7 +359,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def _signal_row(item: dict[str, Any]) -> dict[str, Any]:
     scores = item.get("score_components") or {}
-    return {
+    row = {
         "run_id": item.get("run_id"), "candidate_id": item.get("id"),
         "created_at": item.get("created_at"), "strategy": item.get("strategy_name"),
         "strategy_version": item.get("strategy_version"), "symbol": item.get("symbol"),
@@ -369,11 +369,13 @@ def _signal_row(item: dict[str, Any]) -> dict[str, Any]:
         "estimated_edge_bps": item.get("estimated_edge_bps"),
         "entry_reason": item.get("entry_reason"), "state": item.get("state"),
     }
+    row.update(_sizing_row(item.get("sizing") or {}))
+    return row
 
 
 def _rejection_row(item: dict[str, Any]) -> dict[str, Any]:
     scores = item.get("score_components") or {}
-    return {
+    row = {
         "run_id": item.get("run_id"), "candidate_id": item.get("id") or item.get("candidate_id"),
         "created_at": item.get("created_at"), "strategy": item.get("strategy_name"),
         "symbol": item.get("symbol"), "side": item.get("side"),
@@ -384,6 +386,8 @@ def _rejection_row(item: dict[str, Any]) -> dict[str, Any]:
         "state": item.get("state"),
         "rejection_reason": item.get("rejection_reason") or item.get("reason"),
     }
+    row.update(_sizing_row(item.get("sizing") or {}))
+    return row
 
 
 def _news_item_row(item: dict[str, Any]) -> dict[str, Any]:
@@ -550,6 +554,12 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
             item.get("execution_stage_durations_ms") or {}, sort_keys=True
         ),
     }
+    sizing = item.get("sizing_details") or {}
+    row.update(_sizing_row(sizing))
+    row["actual_accepted_notional_usdt"] = str(
+        _d(item.get("accepted_quantity"))
+        * _d(item.get("average_fill_price"))
+    )
     for stage in (
         "ownership_check", "reconciliation_check", "account_verification",
         "position_query", "open_orders_query", "instrument_metadata",
@@ -568,6 +578,35 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
                 diagnostics.append(f"wall_clock_fallback:{stage}")
     row["latency_diagnostic_codes"] = list(dict.fromkeys(diagnostics))
     return row
+
+
+def _sizing_row(sizing: dict[str, Any]) -> dict[str, Any]:
+    fields = (
+        "final_score",
+        "confidence_tier",
+        "expected_gross_edge_bps",
+        "expected_fees_bps",
+        "expected_spread_bps",
+        "expected_slippage_bps",
+        "expected_funding_bps",
+        "safety_margin_bps",
+        "expected_net_edge_bps",
+        "stop_distance_pct",
+        "risk_budget_usdt",
+        "confidence_cap_usdt",
+        "edge_cap_usdt",
+        "risk_cap_usdt",
+        "liquidity_cap_usdt",
+        "symbol_cap_usdt",
+        "portfolio_remaining_capacity_usdt",
+        "requested_notional_usdt",
+        "requested_quantity",
+        "normalized_accepted_quantity",
+        "normalized_accepted_notional_usdt",
+        "final_sizing_reason",
+        "rejection_code",
+    )
+    return {f"sizing_{field}": sizing.get(field) for field in fields}
 
 
 def _d(value: object) -> Decimal:

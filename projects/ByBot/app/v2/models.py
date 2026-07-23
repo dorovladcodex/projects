@@ -173,6 +173,34 @@ class ScoreComponents(BaseModel):
     final_score: Decimal
 
 
+class V2SizingDecision(BaseModel):
+    """Auditable economic caps used before a Demo reservation is created."""
+
+    final_score: Decimal
+    confidence_tier: str
+    expected_gross_edge_bps: Decimal
+    expected_fees_bps: Decimal
+    expected_spread_bps: Decimal
+    expected_slippage_bps: Decimal
+    expected_funding_bps: Decimal
+    safety_margin_bps: Decimal
+    expected_net_edge_bps: Decimal
+    stop_distance_pct: Decimal
+    risk_budget_usdt: Decimal
+    confidence_cap_usdt: Decimal
+    edge_cap_usdt: Decimal
+    risk_cap_usdt: Decimal
+    liquidity_cap_usdt: Decimal
+    symbol_cap_usdt: Decimal
+    portfolio_remaining_capacity_usdt: Decimal
+    requested_notional_usdt: Decimal
+    requested_quantity: Decimal | None = None
+    normalized_accepted_quantity: Decimal | None = None
+    normalized_accepted_notional_usdt: Decimal | None = None
+    final_sizing_reason: str
+    rejection_code: str | None = None
+
+
 class V2SignalCandidate(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     run_id: str
@@ -221,6 +249,7 @@ class V2SignalCandidate(BaseModel):
     execution_task_received_at: datetime | None = None
     execution_dispatched_at: datetime | None = None
     execution_rejected_at: datetime | None = None
+    sizing: V2SizingDecision | None = None
 
 
 class PortfolioReservation(BaseModel):

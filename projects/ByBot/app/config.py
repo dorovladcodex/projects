@@ -206,10 +206,10 @@ class Settings(BaseSettings):
     )
     v2_min_expected_edge_bps: Decimal = Field(default=Decimal("8"), ge=0)
 
-    max_concurrent_positions: int = Field(default=8, ge=1, le=50)
+    max_concurrent_positions: int = Field(default=4, ge=1, le=50)
     max_positions_per_symbol: int = Field(default=1, ge=1, le=5)
     max_meme_positions: int = Field(default=2, ge=0, le=20)
-    max_positions_per_correlation_group: int = Field(default=3, ge=1, le=20)
+    max_positions_per_correlation_group: int = Field(default=2, ge=1, le=20)
     max_new_entries_per_5_minutes: int = Field(default=5, ge=1, le=100)
     max_trades_per_day: int = Field(default=100, ge=1, le=10000)
     v2_symbol_cooldown_seconds: int = Field(default=300, ge=0, le=86400)
@@ -217,16 +217,20 @@ class Settings(BaseSettings):
     v2_terminalization_warning_seconds: int = Field(default=30, ge=1, le=3600)
     v2_terminalization_hard_failure_seconds: int = Field(default=120, ge=2, le=7200)
 
-    risk_capital_usdt: Decimal = Field(default=Decimal("2000"), gt=0)
-    max_total_notional_usdt: Decimal = Field(default=Decimal("500"), gt=0)
-    max_portfolio_risk_pct: Decimal = Field(default=Decimal("1.5"), gt=0, le=100)
-    v2_per_trade_risk_pct: Decimal = Field(default=Decimal("0.25"), gt=0, le=5)
+    risk_capital_usdt: Decimal = Field(default=Decimal("1000"), gt=0)
+    max_total_notional_usdt: Decimal = Field(default=Decimal("750"), gt=0)
+    max_portfolio_risk_pct: Decimal = Field(default=Decimal("2"), gt=0, le=100)
+    v2_per_trade_risk_pct: Decimal = Field(default=Decimal("0.5"), gt=0, le=5)
     v2_max_daily_loss_pct: Decimal = Field(default=Decimal("2"), gt=0, le=100)
     v2_max_weekly_loss_pct: Decimal = Field(default=Decimal("5"), gt=0, le=100)
     v2_max_drawdown_pct: Decimal = Field(default=Decimal("10"), gt=0, le=100)
-    core_position_notional_usdt: Decimal = Field(default=Decimal("75"), gt=0)
-    alt_position_notional_usdt: Decimal = Field(default=Decimal("50"), gt=0)
-    meme_position_notional_usdt: Decimal = Field(default=Decimal("25"), gt=0)
+    v2_min_position_notional_usdt: Decimal = Field(default=Decimal("100"), gt=0)
+    v2_core_max_position_notional_usdt: Decimal = Field(default=Decimal("300"), gt=0)
+    v2_alt_max_position_notional_usdt: Decimal = Field(default=Decimal("250"), gt=0)
+    v2_meme_max_position_notional_usdt: Decimal = Field(default=Decimal("150"), gt=0)
+    core_position_notional_usdt: Decimal = Field(default=Decimal("150"), gt=0)
+    alt_position_notional_usdt: Decimal = Field(default=Decimal("150"), gt=0)
+    meme_position_notional_usdt: Decimal = Field(default=Decimal("100"), gt=0)
     core_leverage: Decimal = Field(default=Decimal("3"), ge=1)
     alt_leverage: Decimal = Field(default=Decimal("2"), ge=1)
     meme_leverage: Decimal = Field(default=Decimal("2"), ge=1)
@@ -451,11 +455,25 @@ class Settings(BaseSettings):
         return self.alt_leverage
 
     def v2_target_notional_for_symbol(self, symbol: str) -> Decimal:
-        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}:
+        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
             return self.core_position_notional_usdt
         if symbol in {"DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT"}:
             return self.meme_position_notional_usdt
         return self.alt_position_notional_usdt
+
+    def v2_symbol_notional_cap(self, symbol: str) -> Decimal:
+        if symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}:
+            return self.v2_core_max_position_notional_usdt
+        if symbol in {
+            "DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT",
+            "BONKUSDT", "FLOKIUSDT",
+        }:
+            return self.v2_meme_max_position_notional_usdt
+        return self.v2_alt_max_position_notional_usdt
+
+    @staticmethod
+    def v2_is_core_symbol(symbol: str) -> bool:
+        return symbol in {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
     def v2_strategy_applies_to_symbol(self, strategy: str, symbol: str) -> bool:
         if strategy == "NewsMomentumStrategyV2":

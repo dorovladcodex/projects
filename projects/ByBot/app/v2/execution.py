@@ -15,9 +15,14 @@ from app.models import (
     NewsSignalAction, NewsSignalCandidate, RiskDecision, SignalDryRunResult,
     SignalRiskPreview, SimpleTrend,
 )
-from app.v2.models import ReservationState, StrategySide, V2SignalCandidate
+from app.v2.models import (
+    ReservationState,
+    StrategySide,
+    V2SignalCandidate,
+    V2SizingDecision,
+)
 from app.v2.portfolio import (
-    PortfolioRiskService, normalize_leverage, normalize_order_quantity,
+    PortfolioRiskService, normalize_leverage, normalize_sized_order_quantity,
 )
 from app.v2.universe import SymbolUniverseService
 
@@ -128,18 +133,24 @@ class V2ExecutionCoordinator:
             reasons.append("Demo account is not verified")
         return list(dict.fromkeys(reasons))
 
-    def execute(self, candidate: V2SignalCandidate) -> dict[str, Any]:
+    def execute(
+        self, candidate: V2SignalCandidate, *, manual_canary: bool = False
+    ) -> dict[str, Any]:
         candidate.execution_task_received_at = datetime.now(timezone.utc)
         symbol_lock = self._locks.setdefault(candidate.symbol, RLock())
         with symbol_lock, self.portfolio.symbol_lock(candidate.symbol):
-            return self._execute_locked(candidate)
+            return self._execute_locked(candidate, manual_canary=manual_canary)
 
-    def _execute_locked(self, candidate: V2SignalCandidate) -> dict[str, Any]:
+    def _execute_locked(
+        self, candidate: V2SignalCandidate, *, manual_canary: bool = False
+    ) -> dict[str, Any]:
         if not candidate.admitted or candidate.state != "READY":
             return self._blocked(candidate, "candidate is not admitted and READY")
         if datetime.now(timezone.utc) >= candidate.expires_at:
             return self._blocked(candidate, "candidate expired")
-        preflight = self.safety_preflight()
+        preflight = self.safety_preflight(
+            require_auto_execution=not manual_canary
+        )
         if preflight:
             return self._blocked(candidate, "; ".join(preflight))
         universe_status = self.universe.get(candidate.symbol)
@@ -154,18 +165,6 @@ class V2ExecutionCoordinator:
             candidate.expected_fees_bps = Decimal(
                 str(fee_loader(candidate.symbol))
             )
-        total_cost = (
-            candidate.expected_fees_bps
-            + candidate.expected_slippage_bps
-            + candidate.expected_funding_bps
-        )
-        if candidate.estimated_edge_bps <= (
-            total_cost + self.settings.v2_min_expected_edge_bps
-        ):
-            return self._blocked(
-                candidate, "latest account costs invalidate expected net edge"
-            )
-        target_notional = self.settings.v2_target_notional_for_symbol(candidate.symbol.value)
         active_notional = sum(
             row.notional_usdt for row in self.portfolio.reservations
             if row.state in self.portfolio.ACTIVE
@@ -177,31 +176,76 @@ class V2ExecutionCoordinator:
             else candidate.feature_snapshot.bid_depth_10bps_usdt
             or candidate.feature_snapshot.bid_depth_usdt
         )
-        max_for_position = calculate_risk_target_notional(
+        sizing = calculate_v2_position_sizing(
             self.settings,
+            candidate=candidate,
+            account_round_trip_fee_bps=candidate.expected_fees_bps,
             stop_loss_pct=candidate.stop_loss_pct,
-            category_target_notional=target_notional,
             executable_depth_usdt=directional_depth,
             active_notional_usdt=active_notional,
         )
-        if max_for_position <= 0:
-            return self._blocked(candidate, "no risk or liquidity capacity remains")
+        candidate.sizing = sizing
+        self.repository.save_v2_signal_candidate(candidate)
+        if sizing.rejection_code:
+            return self._blocked(
+                candidate,
+                sizing.final_sizing_reason,
+                rejection_code=sizing.rejection_code,
+            )
+        max_for_position = sizing.requested_notional_usdt
         entry_price = (
             candidate.feature_snapshot.ask_price
             if candidate.side == StrategySide.LONG
             else candidate.feature_snapshot.bid_price
         )
+        hard_max_notional = min(
+            sizing.risk_cap_usdt,
+            sizing.liquidity_cap_usdt,
+            sizing.symbol_cap_usdt,
+            sizing.portfolio_remaining_capacity_usdt,
+        )
         try:
-            quantity = normalize_order_quantity(
-                max_for_position, entry_price, universe_status.instrument,
+            quantity = normalize_sized_order_quantity(
                 max_for_position,
+                self.settings.v2_min_position_notional_usdt,
+                entry_price,
+                universe_status.instrument,
+                hard_max_notional,
             )
         except ValueError as exc:
-            return self._blocked(candidate, str(exc))
+            candidate.sizing.rejection_code = "QUANTITY_NORMALIZATION_FAILED"
+            candidate.sizing.final_sizing_reason = str(exc)
+            return self._blocked(
+                candidate,
+                str(exc),
+                rejection_code=candidate.sizing.rejection_code,
+            )
         notional = quantity * entry_price
+        candidate.sizing.requested_quantity = max_for_position / entry_price
+        candidate.sizing.normalized_accepted_quantity = quantity
+        candidate.sizing.normalized_accepted_notional_usdt = notional
+        if notional < self.settings.v2_min_position_notional_usdt:
+            candidate.sizing.rejection_code = "NORMALIZED_NOTIONAL_BELOW_MINIMUM"
+            candidate.sizing.final_sizing_reason = (
+                "normalized accepted notional is below the 100 USDT minimum"
+            )
+            return self._blocked(
+                candidate,
+                candidate.sizing.final_sizing_reason,
+                rejection_code=candidate.sizing.rejection_code,
+            )
         risk_usdt = notional * candidate.stop_loss_pct / Decimal("100")
-        if risk_usdt > self.settings.risk_capital_usdt * self.settings.max_portfolio_risk_pct / Decimal("100"):
-            return self._blocked(candidate, "position risk exceeds portfolio risk capital")
+        if risk_usdt > sizing.risk_budget_usdt:
+            candidate.sizing.rejection_code = "PER_TRADE_RISK_EXCEEDED"
+            candidate.sizing.final_sizing_reason = (
+                "normalized position risk exceeds the per-trade risk budget"
+            )
+            return self._blocked(
+                candidate,
+                candidate.sizing.final_sizing_reason,
+                rejection_code=candidate.sizing.rejection_code,
+            )
+        self.repository.save_v2_signal_candidate(candidate)
         candidate.reservation_requested_at = datetime.now(timezone.utc)
         self.repository.save_v2_signal_candidate(candidate)
         reservation = self.portfolio.reserve(
@@ -251,8 +295,11 @@ class V2ExecutionCoordinator:
                 },
                 instrument_rules=universe_status.instrument,
                 pre_submit_market_guard=lambda: self._pre_submit_market_guard(
-                    candidate, entry_price
+                    candidate,
+                    entry_price,
+                    universe_status.instrument,
                 ),
+                sizing_details=candidate.sizing.model_dump(mode="json"),
             )
         except DemoSafetyError as exc:
             policy = classify_expected_demo_policy_rejection(exc)
@@ -316,8 +363,11 @@ class V2ExecutionCoordinator:
         }
 
     def _pre_submit_market_guard(
-        self, candidate: V2SignalCandidate, original_entry_price: Decimal
-    ) -> Decimal:
+        self,
+        candidate: V2SignalCandidate,
+        original_entry_price: Decimal,
+        instrument: Any | None = None,
+    ) -> Decimal | tuple[Decimal, Decimal]:
         current = (
             self.market_snapshot_provider(candidate.symbol)
             if self.market_snapshot_provider is not None
@@ -343,7 +393,39 @@ class V2ExecutionCoordinator:
         deviation = abs(current_entry / original_entry_price - Decimal("1")) * Decimal("10000")
         if deviation > self.settings.v2_max_price_deviation_bps:
             raise DemoSafetyError("price moved beyond the pre-submit tolerance")
-        return current_entry
+        if candidate.sizing is None or instrument is None:
+            return current_entry
+        try:
+            hard_max_notional = min(
+                candidate.sizing.risk_cap_usdt,
+                candidate.sizing.liquidity_cap_usdt,
+                candidate.sizing.symbol_cap_usdt,
+                candidate.sizing.portfolio_remaining_capacity_usdt,
+            )
+            quantity = normalize_sized_order_quantity(
+                candidate.sizing.requested_notional_usdt,
+                self.settings.v2_min_position_notional_usdt,
+                current_entry,
+                instrument,
+                hard_max_notional,
+            )
+        except ValueError as exc:
+            raise DemoSafetyError(str(exc)) from exc
+        accepted_notional = quantity * current_entry
+        if accepted_notional < self.settings.v2_min_position_notional_usdt:
+            raise DemoSafetyError(
+                "final normalized notional is below the 100 USDT minimum"
+            )
+        final_risk = accepted_notional * candidate.stop_loss_pct / Decimal("100")
+        if final_risk > candidate.sizing.risk_budget_usdt:
+            raise DemoSafetyError("final normalized risk exceeds per-trade budget")
+        candidate.sizing.requested_quantity = (
+            candidate.sizing.requested_notional_usdt / current_entry
+        )
+        candidate.sizing.normalized_accepted_quantity = quantity
+        candidate.sizing.normalized_accepted_notional_usdt = accepted_notional
+        self.repository.save_v2_signal_candidate(candidate)
+        return current_entry, quantity
 
     def _persist_compatibility_candidate(
         self, candidate: V2SignalCandidate, quantity: Decimal, notional: Decimal,
@@ -437,7 +519,13 @@ class V2ExecutionCoordinator:
             "exchange_order_submitted": False,
         }
 
-    def _blocked(self, candidate: V2SignalCandidate, reason: str) -> dict[str, Any]:
+    def _blocked(
+        self,
+        candidate: V2SignalCandidate,
+        reason: str,
+        *,
+        rejection_code: str | None = None,
+    ) -> dict[str, Any]:
         candidate.state = "EXECUTION_BLOCKED"
         candidate.rejection_reason = reason
         self.repository.save_v2_signal_candidate(candidate)
@@ -445,6 +533,7 @@ class V2ExecutionCoordinator:
         return {
             "execution_attempted": False, "candidate_id": str(candidate.id),
             "state": candidate.state, "reason": reason,
+            "rejection_code": rejection_code,
             "exchange_environment": "BYBIT_DEMO", "exchange_order_submitted": False,
         }
 
@@ -494,3 +583,150 @@ def calculate_risk_target_notional(
         Decimal("0"),
         min(category_target_notional, risk_target, liquidity_cap, remaining),
     )
+
+
+def calculate_v2_position_sizing(
+    settings: Settings,
+    *,
+    candidate: V2SignalCandidate,
+    account_round_trip_fee_bps: Decimal,
+    stop_loss_pct: Decimal,
+    executable_depth_usdt: Decimal,
+    active_notional_usdt: Decimal,
+) -> V2SizingDecision:
+    """Return the minimum of independent economic and portfolio caps."""
+
+    final_score = (
+        candidate.score_components.final_score
+        if candidate.score_components is not None
+        else Decimal("0")
+    )
+    confidence_tier, confidence_cap = _confidence_notional_cap(final_score)
+    symbol_cap = settings.v2_symbol_notional_cap(candidate.symbol.value)
+    spread_bps = candidate.feature_snapshot.spread_bps
+    # Strategy slippage already contains spread plus impact. Split it for
+    # observability without charging the spread twice.
+    existing_impact_bps = max(
+        Decimal("0"), candidate.expected_slippage_bps - spread_bps
+    )
+    # The strategy admission pipeline has already estimated executable-depth
+    # impact for this exact snapshot. Reuse it here so sizing does not apply a
+    # second, differently-scaled market-impact penalty after admission.
+    slippage_bps = existing_impact_bps
+    funding_bps = max(Decimal("0"), candidate.expected_funding_bps)
+    gross_edge_bps = candidate.estimated_edge_bps
+    net_edge_bps = gross_edge_bps - (
+        account_round_trip_fee_bps
+        + spread_bps
+        + slippage_bps
+        + funding_bps
+    )
+    risk_budget = (
+        settings.risk_capital_usdt
+        * settings.v2_per_trade_risk_pct
+        / Decimal("100")
+    )
+    risk_cap = (
+        risk_budget / (stop_loss_pct / Decimal("100"))
+        if stop_loss_pct > 0 else Decimal("0")
+    )
+    liquidity_cap = max(
+        Decimal("0"),
+        executable_depth_usdt
+        * settings.v2_max_book_participation_pct
+        / Decimal("100"),
+    )
+    portfolio_remaining = max(
+        Decimal("0"),
+        settings.max_total_notional_usdt - active_notional_usdt,
+    )
+    edge_cap = _edge_notional_cap(
+        net_edge_bps,
+        core_symbol=settings.v2_is_core_symbol(candidate.symbol.value),
+        liquidity_cap=liquidity_cap,
+    )
+    caps = {
+        "confidence": confidence_cap,
+        "net_edge": edge_cap,
+        "risk": risk_cap,
+        "liquidity": liquidity_cap,
+        "symbol": symbol_cap,
+        "portfolio": portfolio_remaining,
+    }
+    requested = max(Decimal("0"), min(caps.values()))
+    rejection_code: str | None = None
+    if confidence_cap <= 0:
+        rejection_code = "FINAL_SCORE_BELOW_SIZING_MINIMUM"
+        reason = "final post-gate score is below the sizing minimum"
+    elif net_edge_bps <= settings.v2_min_expected_edge_bps:
+        rejection_code = "NET_EDGE_BELOW_SAFETY_MARGIN"
+        reason = "expected net edge is below the required safety margin"
+    elif requested < settings.v2_min_position_notional_usdt:
+        rejection_code = "SAFE_NOTIONAL_BELOW_MINIMUM"
+        limiting = ",".join(
+            name for name, value in caps.items() if value == requested
+        )
+        reason = (
+            "safe notional is below the 100 USDT minimum "
+            f"(limiting_cap={limiting})"
+        )
+    else:
+        limiting = ",".join(
+            name for name, value in caps.items() if value == requested
+        )
+        reason = f"approved; bounded_by={limiting}"
+    return V2SizingDecision(
+        final_score=final_score,
+        confidence_tier=confidence_tier,
+        expected_gross_edge_bps=gross_edge_bps,
+        expected_fees_bps=account_round_trip_fee_bps,
+        expected_spread_bps=spread_bps,
+        expected_slippage_bps=slippage_bps,
+        expected_funding_bps=funding_bps,
+        safety_margin_bps=settings.v2_min_expected_edge_bps,
+        expected_net_edge_bps=net_edge_bps,
+        stop_distance_pct=stop_loss_pct,
+        risk_budget_usdt=risk_budget,
+        confidence_cap_usdt=confidence_cap,
+        edge_cap_usdt=edge_cap,
+        risk_cap_usdt=risk_cap,
+        liquidity_cap_usdt=liquidity_cap,
+        symbol_cap_usdt=symbol_cap,
+        portfolio_remaining_capacity_usdt=portfolio_remaining,
+        requested_notional_usdt=requested,
+        final_sizing_reason=reason,
+        rejection_code=rejection_code,
+    )
+
+
+def _confidence_notional_cap(final_score: Decimal) -> tuple[str, Decimal]:
+    if final_score < Decimal("0.62"):
+        return "below_0.62", Decimal("0")
+    if final_score < Decimal("0.66"):
+        return "0.62_0.66", Decimal("100")
+    if final_score < Decimal("0.70"):
+        return "0.66_0.70", Decimal("150")
+    if final_score < Decimal("0.75"):
+        return "0.70_0.75", Decimal("200")
+    if final_score <= Decimal("0.80"):
+        return "0.75_0.80", Decimal("250")
+    return "above_0.80", Decimal("300")
+
+
+def _edge_notional_cap(
+    net_edge_bps: Decimal,
+    *,
+    core_symbol: bool,
+    liquidity_cap: Decimal,
+) -> Decimal:
+    if net_edge_bps < Decimal("3"):
+        return Decimal("0")
+    if net_edge_bps < Decimal("6"):
+        return Decimal("100")
+    if net_edge_bps < Decimal("12"):
+        return Decimal("150")
+    if net_edge_bps < Decimal("20"):
+        return Decimal("200")
+    if core_symbol and liquidity_cap >= Decimal("300"):
+        return Decimal("300")
+    return Decimal("250")

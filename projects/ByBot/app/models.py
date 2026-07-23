@@ -174,6 +174,7 @@ class DemoExecutionRecord(BaseModel):
     leverage: Decimal = Field(default=Decimal("1"), ge=1)
     strategy_name: str | None = None
     strategy_version: str | None = None
+    sizing_details: dict[str, Any] = Field(default_factory=dict)
     reference_entry_price: Decimal | None = Field(default=None, gt=0)
     accepted_quantity: Decimal = Field(default=Decimal("0"), ge=0)
     average_fill_price: Decimal | None = Field(default=None, gt=0)

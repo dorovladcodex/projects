@@ -77,15 +77,20 @@ class PortfolioRiskService:
         executions_by_candidate = {
             str(item.candidate_id): item for item in executions
         }
+        executions_by_id = {str(item.id): item for item in executions}
         # A Demo order cannot exist without a durable DemoExecution reservation.
         # Therefore a restored V2 reservation with neither execution_id nor a
         # matching DemoExecution is a safe pre-submit orphan and must not block
         # the symbol after restart.
         recovered_reservation = False
         for reservation in self.reservations:
-            if reservation.state not in self.ACTIVE or reservation.execution_id:
+            if reservation.state not in self.ACTIVE:
                 continue
-            execution = executions_by_candidate.get(str(reservation.candidate_id))
+            execution = (
+                executions_by_id.get(str(reservation.execution_id))
+                if reservation.execution_id is not None
+                else executions_by_candidate.get(str(reservation.candidate_id))
+            )
             if execution is not None:
                 reservation.execution_id = execution.id
                 if execution.state.value in {
@@ -98,9 +103,13 @@ class PortfolioRiskService:
                     reservation.released_at = execution.closed_at or execution.updated_at
                 else:
                     reservation.state = ReservationState.OPEN
-            else:
+            elif reservation.execution_id is None:
                 reservation.state = ReservationState.RELEASED
                 reservation.released_at = datetime.now(timezone.utc)
+            else:
+                # An execution ID without its durable execution row is an
+                # unresolved persistence inconsistency and remains reserved.
+                continue
             recovered_reservation = True
             updater = getattr(self.repository, "update_v2_portfolio_reservation", None)
             if callable(updater):
@@ -130,6 +139,31 @@ class PortfolioRiskService:
         self.peak_equity = Decimal(
             str(state.get("peak_equity", max(self.settings.risk_capital_usdt, self.equity)))
         )
+        stored_capital = Decimal(
+            str(
+                state.get(
+                    "risk_capital_usdt",
+                    self.equity
+                    - self.cumulative_realized_pnl
+                    - self.unrealized_pnl,
+                )
+            )
+        )
+        capital_rebased = stored_capital != self.settings.risk_capital_usdt
+        if capital_rebased:
+            historical_peak_gain = max(
+                Decimal("0"), self.peak_equity - stored_capital
+            )
+            self.equity = (
+                self.settings.risk_capital_usdt
+                + self.cumulative_realized_pnl
+                + self.unrealized_pnl
+            )
+            self.peak_equity = max(
+                self.settings.risk_capital_usdt,
+                self.equity,
+                self.settings.risk_capital_usdt + historical_peak_gain,
+            )
         self.realized_events = {
             str(key): {str(k): str(v) for k, v in dict(value).items()}
             for key, value in dict(state.get("realized_events") or {}).items()
@@ -140,7 +174,7 @@ class PortfolioRiskService:
             if until > now
         }
         self._recompute_account(now=now)
-        if recovered_reservation:
+        if recovered_reservation or capital_rebased:
             self._persist_state()
 
     @contextmanager
@@ -209,6 +243,15 @@ class PortfolioRiskService:
         side: Any | None = None, btc_beta: Decimal | None = None,
     ) -> PortfolioReservation | None:
         with self._global_lock, self.symbol_lock(symbol):
+            existing = next(
+                (
+                    item for item in self.reservations
+                    if str(item.candidate_id) == str(candidate_id)
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing if existing.state in self.ACTIVE else None
             if self.block_reasons(
                 symbol, notional, risk_usdt=risk_usdt, side=side, btc_beta=btc_beta
             ):
@@ -390,6 +433,7 @@ class PortfolioRiskService:
                 "current_drawdown_pct": str(self.current_drawdown_pct),
                 "cumulative_realized_pnl": str(self.cumulative_realized_pnl),
                 "unrealized_pnl": str(self.unrealized_pnl),
+                "risk_capital_usdt": str(self.settings.risk_capital_usdt),
                 "equity": str(self.equity),
                 "peak_equity": str(self.peak_equity),
                 "realized_events": self.realized_events,
@@ -416,4 +460,34 @@ def normalize_order_quantity(
     quantity = max(minimum, desired)
     if quantity * price > max_notional:
         raise ValueError("exchange minimum quantity exceeds configured maximum notional")
+    return quantity
+
+
+def normalize_sized_order_quantity(
+    target_notional: Decimal,
+    minimum_position_notional: Decimal,
+    price: Decimal,
+    instrument: UniverseInstrument,
+    hard_max_notional: Decimal,
+) -> Decimal:
+    """Normalize a sizing target without violating hard economic caps."""
+
+    quantity = normalize_order_quantity(
+        target_notional, price, instrument, hard_max_notional
+    )
+    if quantity * price >= minimum_position_notional:
+        return quantity
+    minimum_quantity = (
+        minimum_position_notional / price / instrument.qty_step
+    ).to_integral_value(rounding=ROUND_UP) * instrument.qty_step
+    minimum_exchange_quantity = (
+        instrument.min_notional_value / price / instrument.qty_step
+    ).to_integral_value(rounding=ROUND_UP) * instrument.qty_step
+    quantity = max(
+        minimum_quantity,
+        minimum_exchange_quantity,
+        instrument.min_order_qty,
+    )
+    if quantity * price > hard_max_notional:
+        raise ValueError("minimum normalized position exceeds a hard sizing cap")
     return quantity

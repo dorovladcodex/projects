@@ -46,7 +46,7 @@ from normal news/candidate restore; never delete or bypass this audit trail.
   allow missing numeric fields to silently become zero.
 - Never print `.env`, `DATABASE_URL`, API keys, authorization values, or CLI credentials.
 - V1 canary sizing uses `DEMO_RISK_CAPITAL_USDT=10000` and exactly 1x. V2 uses
-  dedicated `RISK_CAPITAL_USDT`, per-category leverage and live instrument
+  `RISK_CAPITAL_USDT=1000`, confidence/edge/risk/liquidity caps, per-category leverage and live instrument
   precision; neither path sizes from Demo wallet equity.
 
 ## Validation commands
