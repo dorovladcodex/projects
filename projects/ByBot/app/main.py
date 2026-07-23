@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
@@ -59,6 +59,7 @@ from app.v2.news import (
 )
 from app.v2.portfolio import PortfolioRiskService
 from app.v2.runtime import V2Runtime, v2_cycle_loop
+from app.startup import StartupDiagnostics
 from app.v2.models import (
     ScoreComponents,
     StrategyName,
@@ -68,7 +69,22 @@ from app.v2.models import (
 from app.v2.universe import BybitPublicUniverseClient, SymbolUniverseService
 
 settings = get_settings()
-persistence = PersistenceRepository(settings.database_url, create_schema=False)
+v2_run_id = settings.demo_run_id or datetime.now(timezone.utc).strftime(
+    "demo-v2-%Y%m%dT%H%M%SZ"
+)
+startup_diagnostics = StartupDiagnostics(
+    run_id=v2_run_id,
+    output_directory=(
+        f"{settings.v2_report_directory}/{v2_run_id}/startup"
+        if settings.v2_enabled else "artifacts/startup"
+    ),
+    diagnostic_threshold_seconds=settings.startup_diagnostic_threshold_seconds,
+)
+persistence = startup_diagnostics.run_sync(
+    "persistence_connect",
+    lambda: PersistenceRepository(settings.database_url, create_schema=False),
+    timeout_seconds=min(10, settings.startup_step_timeout_seconds),
+)
 market_data_service = build_market_data_service(settings)
 account_service = build_account_service(settings)
 demo_client = (
@@ -86,8 +102,12 @@ demo_client = (
         and settings.demo_order_execution_authorized
     ) else None
 )
-demo_execution_service = DemoExecutionService(
-    settings, persistence, demo_client, run_id=settings.demo_run_id
+demo_execution_service = startup_diagnostics.run_sync(
+    "demo_service_restore",
+    lambda: DemoExecutionService(
+        settings, persistence, demo_client, run_id=settings.demo_run_id
+    ),
+    timeout_seconds=min(10, settings.startup_step_timeout_seconds),
 )
 demo_private_websocket = (
     BybitDemoPrivateWebSocket(demo_client) if demo_client is not None else None
@@ -125,14 +145,23 @@ signal_candidate_service = SignalCandidateService(
     persistence,
     demo_execution_service,
 )
-news_service.restore()
-paper_trading_service.restore()
-signal_candidate_service.restore()
+startup_diagnostics.run_sync(
+    "news_restore",
+    news_service.restore,
+    timeout_seconds=settings.startup_step_timeout_seconds,
+)
+startup_diagnostics.run_sync(
+    "paper_restore",
+    paper_trading_service.restore,
+    timeout_seconds=settings.startup_step_timeout_seconds,
+)
+startup_diagnostics.run_sync(
+    "signal_restore",
+    signal_candidate_service.restore,
+    timeout_seconds=settings.startup_step_timeout_seconds,
+)
 _demo_canary_job_lock = Lock()
 
-v2_run_id = settings.demo_run_id or datetime.now(timezone.utc).strftime(
-    "demo-v2-%Y%m%dT%H%M%SZ"
-)
 v2_universe_service = SymbolUniverseService(
     settings,
     BybitPublicUniverseClient(
@@ -148,104 +177,167 @@ v2_execution_coordinator = V2ExecutionCoordinator(
     demo_execution_service, run_id=v2_run_id,
     market_snapshot_provider=lambda symbol: v2_feature_engine.snapshot(symbol),
 )
-v2_runtime = V2Runtime(
-    settings, persistence, v2_universe_service, v2_feature_engine,
-    V2NewsAggregator(
-        build_default_news_sources(
-            settings.v2_additional_rss_urls,
-            announcement_url=(
-                settings.v2_bybit_announcements_url
-                if settings.v2_bybit_announcements_enabled else None
+v2_runtime = startup_diagnostics.run_sync(
+    "v2_runtime_restore",
+    lambda: V2Runtime(
+        settings, persistence, v2_universe_service, v2_feature_engine,
+        V2NewsAggregator(
+            build_default_news_sources(
+                settings.v2_additional_rss_urls,
+                announcement_url=(
+                    settings.v2_bybit_announcements_url
+                    if settings.v2_bybit_announcements_enabled else None
+                ),
+            ),
+            mapper=EntityMapper({
+                Symbol(symbol): tuple(aliases)
+                for symbol, aliases in settings.v2_entity_aliases.items()
+                if symbol in Symbol._value2member_map_
+            }),
+            poll_interval_seconds=settings.v2_news_poll_interval_seconds,
+        ),
+        news_service, v2_portfolio_service, v2_execution_coordinator,
+        V2ExternalTrendService(
+            CoinGeckoSource(
+                settings.v2_coingecko_trending_url, "coingecko-trending"
+            ),
+            CoinGeckoSource(
+                settings.v2_coingecko_markets_url, "coingecko-markets"
             ),
         ),
-        mapper=EntityMapper({
-            Symbol(symbol): tuple(aliases)
-            for symbol, aliases in settings.v2_entity_aliases.items()
-            if symbol in Symbol._value2member_map_
-        }),
-        poll_interval_seconds=settings.v2_news_poll_interval_seconds,
+        run_id=v2_run_id,
     ),
-    news_service, v2_portfolio_service, v2_execution_coordinator,
-    V2ExternalTrendService(
-        CoinGeckoSource(settings.v2_coingecko_trending_url, "coingecko-trending"),
-        CoinGeckoSource(settings.v2_coingecko_markets_url, "coingecko-markets"),
-    ),
-    run_id=v2_run_id,
+    timeout_seconds=settings.startup_step_timeout_seconds,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    demo_ws_task = None
-    v2_ws_task = None
-    v2_task = None
-    if settings.v2_enabled:
-        # Public validation precedes any private leverage/order preflight so an
-        # unavailable instrument is excluded rather than crashing the bot.
-        await asyncio.to_thread(v2_universe_service.refresh)
-        accepted = v2_universe_service.accepted_symbols
-        if not accepted:
-            raise RuntimeError("V2 symbol universe has no accepted instruments")
-        settings.allowed_symbols = tuple(symbol.value for symbol in accepted)
-    if demo_execution_service.enabled:
-        await asyncio.to_thread(demo_execution_service.verify_account_and_environment)
-        await asyncio.to_thread(demo_execution_service.reconcile)
-        for job in persistence.recoverable_demo_canary_jobs():
-            asyncio.create_task(asyncio.to_thread(
-                _run_demo_canary_job, str(job["job_id"])
-            ))
-        if demo_private_websocket is not None:
-            demo_ws_task = asyncio.create_task(demo_private_stream_loop())
-    else:
-        account_service.refresh_if_stale(force=True)
-    if not settings.v2_enabled:
-        await asyncio.to_thread(news_service.poll)
-    market_data_service.refresh_all()
-    signal_candidate_service.process_pending()
-    if not settings.v2_enabled:
-        signal_candidate_service.execute_ready_candidates()
-    if settings.v2_enabled:
-        await asyncio.to_thread(v2_runtime.start)
-        v2_ws_task = asyncio.create_task(
-            v2_runtime.websocket.run(v2_universe_service.accepted_symbols)
-        )
-        v2_task = asyncio.create_task(v2_cycle_loop(v2_runtime))
-    task = asyncio.create_task(news_polling_loop())
-    signal_task = asyncio.create_task(signal_recheck_loop())
-    demo_reconcile_task = (
-        asyncio.create_task(demo_reconciliation_loop())
-        if demo_client is not None else None
-    )
+    app.state.startup_diagnostics = startup_diagnostics
+    background_tasks: list[asyncio.Task[object]] = []
     try:
+        async with asyncio.timeout(settings.startup_hard_timeout_seconds):
+            if settings.v2_enabled:
+                # Public validation precedes private preflight, while each
+                # symbol is inspected concurrently with bounded HTTP calls.
+                await startup_diagnostics.run_blocking(
+                    "v2_universe_refresh",
+                    v2_universe_service.refresh,
+                    timeout_seconds=settings.startup_step_timeout_seconds,
+                )
+                accepted = v2_universe_service.accepted_symbols
+                if not accepted:
+                    raise RuntimeError("V2 symbol universe has no accepted instruments")
+                settings.allowed_symbols = tuple(
+                    symbol.value for symbol in accepted
+                )
+            if demo_execution_service.enabled:
+                await startup_diagnostics.run_blocking(
+                    "demo_account_preflight",
+                    demo_execution_service.verify_account_and_environment,
+                    timeout_seconds=settings.startup_step_timeout_seconds,
+                )
+                await startup_diagnostics.run_blocking(
+                    "demo_reconciliation",
+                    demo_execution_service.reconcile,
+                    timeout_seconds=settings.startup_step_timeout_seconds,
+                )
+            else:
+                await startup_diagnostics.run_blocking(
+                    "account_refresh",
+                    lambda: account_service.refresh_if_stale(force=True),
+                    timeout_seconds=min(
+                        10, settings.startup_step_timeout_seconds
+                    ),
+                    critical=False,
+                )
+            if not settings.v2_enabled:
+                await startup_diagnostics.run_blocking(
+                    "initial_news_poll",
+                    news_service.poll,
+                    timeout_seconds=min(
+                        10, settings.startup_step_timeout_seconds
+                    ),
+                    critical=False,
+                )
+                await startup_diagnostics.run_blocking(
+                    "initial_market_refresh",
+                    market_data_service.refresh_all,
+                    timeout_seconds=min(
+                        10, settings.startup_step_timeout_seconds
+                    ),
+                    critical=False,
+                )
+                await startup_diagnostics.run_blocking(
+                    "restore_pending_signals",
+                    signal_candidate_service.process_pending,
+                    timeout_seconds=min(
+                        10, settings.startup_step_timeout_seconds
+                    ),
+                    critical=False,
+                )
+                signal_candidate_service.execute_ready_candidates()
+            if settings.v2_enabled:
+                await startup_diagnostics.run_blocking(
+                    "v2_runtime_start",
+                    v2_runtime.start,
+                    timeout_seconds=min(
+                        10, settings.startup_step_timeout_seconds
+                    ),
+                )
+
+        # Long-running loops are scheduled exactly once and never awaited by
+        # startup. Every task is retained for cancellation during failed
+        # startup and normal shutdown.
+        if demo_execution_service.enabled:
+            for job in persistence.recoverable_demo_canary_jobs():
+                background_tasks.append(asyncio.create_task(
+                    asyncio.to_thread(_run_demo_canary_job, str(job["job_id"])),
+                    name=f"demo-canary-recovery:{job['job_id']}",
+                ))
+            if demo_private_websocket is not None:
+                background_tasks.append(asyncio.create_task(
+                    demo_private_stream_loop(), name="demo-private-websocket"
+                ))
+        if settings.v2_enabled:
+            background_tasks.append(asyncio.create_task(
+                v2_runtime.websocket.run(v2_universe_service.accepted_symbols),
+                name="v2-public-websocket",
+            ))
+            background_tasks.append(asyncio.create_task(
+                v2_cycle_loop(v2_runtime), name="v2-cycle-loop"
+            ))
+        background_tasks.append(asyncio.create_task(
+            news_polling_loop(), name="news-polling-loop"
+        ))
+        background_tasks.append(asyncio.create_task(
+            signal_recheck_loop(), name="signal-recheck-loop"
+        ))
+        if demo_client is not None:
+            background_tasks.append(asyncio.create_task(
+                demo_reconciliation_loop(), name="demo-reconciliation-loop"
+            ))
+        startup_diagnostics.mark_ready()
         yield
+    except Exception as exc:
+        startup_diagnostics.mark_failed(exc)
+        raise
     finally:
-        task.cancel()
-        signal_task.cancel()
-        if demo_ws_task:
-            demo_ws_task.cancel()
-        if demo_reconcile_task:
-            demo_reconcile_task.cancel()
-        if v2_ws_task:
+        if settings.v2_enabled:
             v2_runtime.websocket.stop()
-            v2_ws_task.cancel()
-        if v2_task:
-            v2_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-        with suppress(asyncio.CancelledError):
-            await signal_task
-        if demo_ws_task:
-            with suppress(asyncio.CancelledError):
-                await demo_ws_task
-        if demo_reconcile_task:
-            with suppress(asyncio.CancelledError):
-                await demo_reconcile_task
-        if v2_ws_task:
-            with suppress(asyncio.CancelledError):
-                await v2_ws_task
-        if v2_task:
-            with suppress(asyncio.CancelledError):
-                await v2_task
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*background_tasks, return_exceptions=True),
+                    timeout=10,
+                )
+            except TimeoutError:
+                startup_diagnostics.capture_stacks(
+                    "shutdown", reason="background_task_cleanup_timeout"
+                )
+        startup_diagnostics.mark_stopped()
 
 
 app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
@@ -254,6 +346,11 @@ app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/startup/status")
+def startup_status() -> dict[str, object]:
+    return startup_diagnostics.payload()
 
 
 @app.get("/v2/status")

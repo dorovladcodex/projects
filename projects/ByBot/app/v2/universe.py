@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import RLock
 from typing import Any, Callable, Protocol
@@ -199,12 +200,13 @@ class SymbolUniverseService:
     def refresh(self, *, now: datetime | None = None) -> dict[Symbol, UniverseStatus]:
         checked_at = now or datetime.now(timezone.utc)
         updated: dict[Symbol, UniverseStatus] = {}
-        for value in self.settings.v2_universe_symbols:
-            symbol = Symbol(value)
+        symbols = [Symbol(value) for value in self.settings.v2_universe_symbols]
+
+        def inspect(symbol: Symbol) -> UniverseStatus:
             try:
                 instrument = self.client.inspect_symbol(symbol)
                 reasons = self._rejection_reasons(instrument, checked_at)
-                status = UniverseStatus(
+                return UniverseStatus(
                     symbol=symbol,
                     state=UniverseState.REJECTED if reasons else UniverseState.ACCEPTED,
                     accepted=not reasons,
@@ -213,7 +215,7 @@ class SymbolUniverseService:
                     checked_at=checked_at,
                 )
             except UniverseInspectionError as exc:
-                status = UniverseStatus(
+                return UniverseStatus(
                     symbol=symbol,
                     state=UniverseState.DATA_UNAVAILABLE,
                     accepted=False,
@@ -221,7 +223,7 @@ class SymbolUniverseService:
                     checked_at=checked_at,
                 )
             except Exception as exc:
-                status = UniverseStatus(
+                return UniverseStatus(
                     symbol=symbol,
                     state=UniverseState.DATA_UNAVAILABLE,
                     accepted=False,
@@ -231,6 +233,20 @@ class SymbolUniverseService:
                     ],
                     checked_at=checked_at,
                 )
+
+        # Each symbol is independent and public-only. Parallel inspection keeps
+        # the 17-symbol bootstrap bounded by the slowest few symbols instead of
+        # serializing 51 REST requests on the FastAPI lifespan.
+        workers = min(self.settings.v2_startup_universe_workers, len(symbols))
+        with ThreadPoolExecutor(
+            max_workers=max(1, workers),
+            thread_name_prefix="v2-universe",
+        ) as pool:
+            inspected = list(pool.map(inspect, symbols))
+
+        # Persist deterministically on the caller thread. Repository sessions
+        # are intentionally not shared by the inspection workers.
+        for symbol, status in zip(symbols, inspected, strict=True):
             updated[symbol] = status
             saver = getattr(self.repository, "save_v2_universe_status", None)
             if callable(saver):

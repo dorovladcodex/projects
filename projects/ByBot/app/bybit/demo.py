@@ -888,11 +888,27 @@ class DemoExecutionService:
             if link
         }
         owned_protection_order_ids: set[str] = set()
-        for symbol_value in self.settings.allowed_symbols:
-            symbol = Symbol(symbol_value)
-            self.client.get_instrument(symbol)
+        symbols = [Symbol(value) for value in self.settings.allowed_symbols]
+
+        def load_symbol_preflight(
+            symbol: Symbol,
+        ) -> tuple[Symbol, Any, list[dict[str, Any]], list[dict[str, Any]]]:
+            # These are independent read requests. Any failure still propagates
+            # and fails startup closed; concurrency only removes avoidable
+            # per-symbol serialization.
+            instrument = self.client.get_instrument(symbol)
             positions = self.client.get_positions(symbol)
             open_orders = self.client.get_open_orders(symbol=symbol)
+            return symbol, instrument, positions, open_orders
+
+        workers = min(self.settings.v2_startup_private_workers, len(symbols))
+        with ThreadPoolExecutor(
+            max_workers=max(1, workers),
+            thread_name_prefix="demo-preflight",
+        ) as pool:
+            symbol_preflight = list(pool.map(load_symbol_preflight, symbols))
+
+        for symbol, rules, positions, open_orders in symbol_preflight:
             self.symbol_open_order_counts[symbol.value] = len(open_orders)
             conflicts = [
                 order for order in open_orders
@@ -930,6 +946,7 @@ class DemoExecutionService:
                     self.settings.v2_leverage_for_symbol(symbol.value)
                     if self.settings.v2_enabled else Decimal("1")
                 ),
+                rules=rules,
             )
             for position in positions:
                 if (

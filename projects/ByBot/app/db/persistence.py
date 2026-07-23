@@ -2361,6 +2361,38 @@ class PersistenceRepository:
             self._failed(exc)
             return []
 
+    def load_v2_calibration_candidates(self) -> list[V2SignalCandidate]:
+        """Load only candidates which can contribute a realized observation.
+
+        Loading every historical V2 candidate also transfers each large feature
+        snapshot JSON document. Long validation runs can create thousands of
+        rejected candidates, so that full-table restore is neither necessary
+        nor acceptable on application startup.
+        """
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                statement = (
+                    select(V2SignalCandidateRow)
+                    .join(
+                        DemoExecutionRow,
+                        DemoExecutionRow.candidate_id == V2SignalCandidateRow.id,
+                    )
+                    .where(
+                        DemoExecutionRow.realized_exchange_pnl.is_not(None),
+                        DemoExecutionRow.accepted_quantity > 0,
+                    )
+                    .order_by(V2SignalCandidateRow.created_at)
+                )
+                return [
+                    V2SignalCandidate.model_validate(row.payload)
+                    for row in session.scalars(statement).unique().all()
+                ]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
     def reserve_v2_portfolio(
         self, reservation: PortfolioReservation, settings: Any,
     ) -> PortfolioReservation | None:

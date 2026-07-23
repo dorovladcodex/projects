@@ -122,6 +122,11 @@ class Settings(BaseSettings):
     # V2 is an explicit, Demo-only runtime. Defaults never submit an order.
     v2_enabled: bool = False
     v2_auto_demo_execution: bool = False
+    startup_hard_timeout_seconds: int = Field(default=60, ge=30, le=120)
+    startup_step_timeout_seconds: int = Field(default=30, ge=5, le=60)
+    startup_diagnostic_threshold_seconds: int = Field(default=10, ge=1, le=30)
+    v2_startup_universe_workers: int = Field(default=8, ge=1, le=17)
+    v2_startup_private_workers: int = Field(default=4, ge=1, le=12)
     v2_universe_symbols: tuple[str, ...] = (
         "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
         "ADAUSDT", "LINKUSDT", "AVAXUSDT", "SUIUSDT", "NEARUSDT",

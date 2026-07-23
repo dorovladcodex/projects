@@ -215,7 +215,12 @@ class V2Runtime:
             return
         if not self.repository.begin_v2_run(self.run_id, self.started_at):
             raise RuntimeError("V2 run boundary could not be persisted")
-        self.universe.refresh()
+        # The FastAPI lifespan validates the universe before private account
+        # preflight. Reuse that exact snapshot instead of repeating all public
+        # REST calls during the same startup. Direct/runtime-only callers still
+        # receive a refresh when no validated snapshot exists.
+        if self.universe.last_refresh_at is None:
+            self.universe.refresh()
         self._refresh_status_snapshot()
 
     async def cycle(self) -> None:
@@ -697,13 +702,21 @@ class V2Runtime:
     def _restore_calibration_history(self) -> None:
         loader = getattr(self.repository, "load_demo_executions", None)
         candidate_loader = getattr(
-            self.repository, "load_v2_signal_candidates", None
+            self.repository, "load_v2_calibration_candidates", None
         )
+        if not callable(candidate_loader):
+            legacy_loader = getattr(
+                self.repository, "load_v2_signal_candidates", None
+            )
+            candidate_loader = (
+                (lambda: legacy_loader(None))
+                if callable(legacy_loader) else None
+            )
         if not callable(loader) or not callable(candidate_loader):
             return
         try:
             candidates = {
-                str(item.id): item for item in candidate_loader(None)
+                str(item.id): item for item in candidate_loader()
             }
             observations: list[CalibrationObservation] = []
             for record in loader():
