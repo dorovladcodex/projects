@@ -116,6 +116,12 @@ class Settings(BaseSettings):
     demo_canary_market_price_buffer_pct: Decimal = Field(
         default=Decimal("5"), ge=0, le=100
     )
+    demo_canary_market_readiness_timeout_seconds: float = Field(
+        default=15.0, gt=0, le=60
+    )
+    demo_canary_websocket_warmup_seconds: float = Field(
+        default=2.0, ge=0, le=30
+    )
     demo_reconciliation_interval_seconds: int = Field(default=15, ge=5, le=300)
     demo_order_confirmation_timeout_seconds: int = Field(default=30, ge=5, le=300)
 

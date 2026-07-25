@@ -1,8 +1,36 @@
 from pathlib import Path
+import json
 import subprocess
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "bybit_demo_canary.ps1"
+
+
+def _lot_guard(
+    *,
+    price: str,
+    minimum_quantity: str,
+    step: str,
+    minimum_notional: str,
+    target: str,
+    accepted_quantity: str,
+    maximum: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(SCRIPT),
+            "-ValidateLotGuardOnly",
+            "-LotReferencePrice", price,
+            "-LotMinOrderQty", minimum_quantity,
+            "-LotQtyStep", step,
+            "-LotMinNotionalUSDT", minimum_notional,
+            "-LotTargetNotionalUSDT", target,
+            "-LotAcceptedQuantity", accepted_quantity,
+            "-MaxNotionalUSDT", maximum,
+        ],
+        text=True, capture_output=True, timeout=15,
+    )
 
 
 def test_demo_canary_requires_explicit_human_confirmation() -> None:
@@ -166,3 +194,50 @@ def test_demo_canary_script_parses_in_windows_powershell() -> None:
         text=True, capture_output=True, timeout=15,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_v2_canary_lot_guard_accepts_xrp_near_100_usdt() -> None:
+    result = _lot_guard(
+        price="2.40", minimum_quantity="1", step="0.1",
+        minimum_notional="5", target="100", accepted_quantity="41.7",
+        maximum="105",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["nearest_valid_quantity"] == 41.7
+    assert payload["accepted_notional"] == 100.08
+    assert payload["one_qty_step_notional"] == 0.24
+
+
+def test_v2_canary_lot_guard_accepts_one_coarse_btc_step_when_budget_allows() -> None:
+    result = _lot_guard(
+        price="64185", minimum_quantity="0.001", step="0.001",
+        minimum_notional="5", target="100", accepted_quantity="0.002",
+        maximum="150",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["lower_target_quantity"] == 0.001
+    assert payload["nearest_valid_quantity"] == 0.002
+    assert payload["accepted_notional"] == 128.37
+    assert payload["one_qty_step_notional"] == 64.185
+
+
+def test_v2_canary_lot_guard_rejects_explicit_budget_overrun() -> None:
+    result = _lot_guard(
+        price="64185", minimum_quantity="0.001", step="0.001",
+        minimum_notional="5", target="100", accepted_quantity="0.002",
+        maximum="105",
+    )
+    assert result.returncode == 1
+    assert "exceeds explicit MaxNotionalUSDT" in result.stderr
+
+
+def test_v2_canary_lot_guard_rejects_multi_step_oversizing() -> None:
+    result = _lot_guard(
+        price="64185", minimum_quantity="0.001", step="0.001",
+        minimum_notional="5", target="100", accepted_quantity="0.003",
+        maximum="200",
+    )
+    assert result.returncode == 1
+    assert "not the nearest safe exchange-valid quantity" in result.stderr

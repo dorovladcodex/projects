@@ -6,10 +6,18 @@ param(
     [decimal]$MarketPriceBufferPct = 5,
     [switch]$ExerciseTrailingUpdate,
     [switch]$ExerciseFlatDuringProtectionRace,
+    [switch]$EnterDrainBeforeFlatRace,
     [ValidateSet(0, 100, 200)]
     [int]$V2SizingTier = 0,
     [switch]$SkipControlledRestart,
     [switch]$AuthorizeCalculatedMinimumQuantity,
+    [switch]$ValidateLotGuardOnly,
+    [decimal]$LotReferencePrice = 0,
+    [decimal]$LotMinOrderQty = 0,
+    [decimal]$LotQtyStep = 0,
+    [decimal]$LotMinNotionalUSDT = 0,
+    [decimal]$LotTargetNotionalUSDT = 0,
+    [decimal]$LotAcceptedQuantity = 0,
     [ValidateRange(90, 900)]
     [int]$StartupTimeoutSeconds = 360
 )
@@ -32,10 +40,88 @@ $script:NoCandidateCreated = $true
 $script:NoReservationCreated = $true
 $script:NoOrderSubmitted = $true
 $script:ReportWritten = $false
+$script:MarketReadiness = $null
+$script:PhaseBeforeRestart = $null
+$script:PhaseImmediatelyAfterRestart = $null
+$script:FinalPhase = $null
+$script:ExecutionsBeforeRestart = $null
+$script:ExecutionsAfterRestart = $null
+$script:AdmissionsBeforeRestart = $null
+$script:AdmissionsAfterRestart = $null
 
 function Assert-Condition {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) { throw $Message }
+}
+
+function Get-QuantityCeiling {
+    param([decimal]$Quantity, [decimal]$Step)
+    Assert-Condition ($Step -gt 0) "Quantity step must be positive"
+    return [decimal]::Ceiling($Quantity / $Step) * $Step
+}
+
+function Get-QuantityFloor {
+    param([decimal]$Quantity, [decimal]$Step)
+    Assert-Condition ($Step -gt 0) "Quantity step must be positive"
+    return [decimal]::Floor($Quantity / $Step) * $Step
+}
+
+function Get-ExchangeLotAwareCanaryGuard {
+    param(
+        [decimal]$TargetNotional,
+        [decimal]$ReferencePrice,
+        [decimal]$MinOrderQty,
+        [decimal]$QtyStep,
+        [decimal]$MinNotional,
+        [decimal]$AcceptedQuantity,
+        [decimal]$ExplicitMaximumNotional
+    )
+    Assert-Condition ($TargetNotional -gt 0) "Target notional must be positive"
+    Assert-Condition ($ReferencePrice -gt 0) "Executable reference price must be positive"
+    Assert-Condition ($MinOrderQty -gt 0) "Exchange minimum quantity must be positive"
+    Assert-Condition ($QtyStep -gt 0) "Exchange quantity step must be positive"
+    Assert-Condition ($MinNotional -ge 0) "Exchange minimum notional cannot be negative"
+    Assert-Condition ($AcceptedQuantity -gt 0) "Accepted quantity must be positive"
+    Assert-Condition ($ExplicitMaximumNotional -gt 0) "Explicit maximum notional must be positive"
+
+    $minimumByNotional = Get-QuantityCeiling `
+        ($MinNotional / $ReferencePrice) $QtyStep
+    $roundedMinimumQuantity = Get-QuantityCeiling $MinOrderQty $QtyStep
+    $minimumValidQuantity = if (
+        $roundedMinimumQuantity -ge $minimumByNotional
+    ) { $roundedMinimumQuantity } else { $minimumByNotional }
+    $lowerTargetQuantity = Get-QuantityFloor `
+        ($TargetNotional / $ReferencePrice) $QtyStep
+    $upperTargetQuantity = Get-QuantityCeiling `
+        ($TargetNotional / $ReferencePrice) $QtyStep
+    $nearestSafeQuantity = if (
+        $minimumValidQuantity -ge $upperTargetQuantity
+    ) { $minimumValidQuantity } else { $upperTargetQuantity }
+    $acceptedNotional = $AcceptedQuantity * $ReferencePrice
+    $oneStepNotional = $QtyStep * $ReferencePrice
+
+    Assert-Condition ($AcceptedQuantity -ge $minimumValidQuantity) `
+        "Accepted quantity is below the exchange minimum"
+    Assert-Condition (
+        (($AcceptedQuantity / $QtyStep) % [decimal]1) -eq [decimal]0
+    ) "Accepted quantity is not aligned to qtyStep"
+    Assert-Condition ($AcceptedQuantity -eq $nearestSafeQuantity) `
+        "Accepted quantity is not the nearest safe exchange-valid quantity"
+    Assert-Condition ($acceptedNotional -le $ExplicitMaximumNotional) `
+        "Accepted notional exceeds explicit MaxNotionalUSDT"
+
+    return [ordered]@{
+        target_notional = $TargetNotional
+        executable_reference_price = $ReferencePrice
+        minimum_valid_quantity = $minimumValidQuantity
+        lower_target_quantity = $lowerTargetQuantity
+        nearest_valid_quantity = $nearestSafeQuantity
+        normalized_accepted_quantity = $AcceptedQuantity
+        accepted_notional = $acceptedNotional
+        qty_step = $QtyStep
+        one_qty_step_notional = $oneStepNotional
+        explicit_maximum_notional = $ExplicitMaximumNotional
+    }
 }
 
 function Protect-Text {
@@ -119,6 +205,25 @@ function Safe-ReadTextFile {
         finally { $stream.Dispose() }
     }
     catch { return "" }
+}
+
+if ($ValidateLotGuardOnly) {
+    try {
+        $validation = Get-ExchangeLotAwareCanaryGuard `
+            -TargetNotional $LotTargetNotionalUSDT `
+            -ReferencePrice $LotReferencePrice `
+            -MinOrderQty $LotMinOrderQty `
+            -QtyStep $LotQtyStep `
+            -MinNotional $LotMinNotionalUSDT `
+            -AcceptedQuantity $LotAcceptedQuantity `
+            -ExplicitMaximumNotional $MaxNotionalUSDT
+        $validation | ConvertTo-Json -Compress
+        exit 0
+    }
+    catch {
+        [Console]::Error.WriteLine($_.Exception.Message)
+        exit 1
+    }
 }
 
 function Stop-Uvicorn {
@@ -285,7 +390,40 @@ function Write-CanaryReport {
         failure_stage = $script:FailureStage
         failure_reason = $FailureReason
         kill_switch_active = if ($DemoStatus) { [bool]$DemoStatus.kill_switch_active } else { $null }
-        kill_switch_reasons = if ($DemoStatus) { @($DemoStatus.kill_switch_reasons) } else { @() }
+        active_kill_switch_reasons = if ($DemoStatus) {
+            @($DemoStatus.active_kill_switch_reasons)
+        } else { @() }
+        historical_kill_switch_reasons = if ($DemoStatus) {
+            @($DemoStatus.historical_kill_switch_reasons)
+        } else { @() }
+        # Backward-compatible field now means active blockers only.
+        kill_switch_reasons = if ($DemoStatus) {
+            @($DemoStatus.active_kill_switch_reasons)
+        } else { @() }
+        market_readiness = $script:MarketReadiness
+        phase_before_restart = $script:PhaseBeforeRestart
+        phase_immediately_after_restart = $script:PhaseImmediatelyAfterRestart
+        final_phase = $script:FinalPhase
+        entries_submitted_after_restart = if (
+            $null -ne $script:ExecutionsBeforeRestart -and
+            $null -ne $script:ExecutionsAfterRestart
+        ) {
+            [Math]::Max(
+                0,
+                [int]$script:ExecutionsAfterRestart -
+                [int]$script:ExecutionsBeforeRestart
+            )
+        } else { $null }
+        entries_admitted_after_restart = if (
+            $null -ne $script:AdmissionsBeforeRestart -and
+            $null -ne $script:AdmissionsAfterRestart
+        ) {
+            [Math]::Max(
+                0,
+                [int]$script:AdmissionsAfterRestart -
+                [int]$script:AdmissionsBeforeRestart
+            )
+        } else { $null }
         no_candidate_created = $script:NoCandidateCreated
         no_reservation_created = $script:NoReservationCreated
         no_order_submitted = $script:NoOrderSubmitted
@@ -357,6 +495,14 @@ if ($null -eq $MaxNotionalUSDT -or $MaxNotionalUSDT -le [decimal]0) {
 }
 if ($MarketPriceBufferPct -lt [decimal]0 -or $MarketPriceBufferPct -gt [decimal]100) {
     [Console]::Error.WriteLine("MarketPriceBufferPct must be between 0 and 100.")
+    exit 1
+}
+if ($EnterDrainBeforeFlatRace -and (
+    -not $ExerciseFlatDuringProtectionRace -or -not $V2SizingTier
+)) {
+    [Console]::Error.WriteLine(
+        "EnterDrainBeforeFlatRace requires the V2 flat-protection race canary."
+    )
     exit 1
 }
 
@@ -445,25 +591,38 @@ try {
 
     # Preview reads current instrument rules and price without creating a
     # candidate, risk decision, execution reservation, or exchange order.
-    $plan = $null
+    $script:FailureStage = "exchange_minimum_preview"
+    $preview = Invoke-Api -Method "POST" -Path "/demo/canary/preview" -Body @{
+        symbol = $Symbol
+        max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
+    }
+    $plan = $preview.plan
+    $script:MarketReadiness = $preview.market_readiness
+    Assert-Condition ($null -ne $script:MarketReadiness) `
+        "Market-data readiness report is missing"
+    Assert-Condition (
+        $script:MarketReadiness.source -in @("WS", "REST")
+    ) "Canary market-data source is not authoritative"
+    Assert-Condition (
+        [decimal]$script:MarketReadiness.age_seconds -ge [decimal]0
+    ) "Canary market snapshot age is invalid"
+    Write-Host "CANARY MARKET SOURCE: $($script:MarketReadiness.source)"
+    Write-Host "CANARY MARKET EXCHANGE TIMESTAMP: $($script:MarketReadiness.exchange_timestamp)"
+    Write-Host "CANARY MARKET RECEIVED AT: $($script:MarketReadiness.received_at)"
+    Write-Host "CANARY MARKET AGE SECONDS: $($script:MarketReadiness.age_seconds)"
+    Write-Host "CANARY MARKET READINESS WAIT SECONDS: $($script:MarketReadiness.waited_seconds)"
+    Write-Host "CANARY MARKET READINESS: PASS"
+    Assert-Condition ($null -ne $plan) "Exchange minimum plan is missing"
+    Assert-Condition ($plan.symbol -eq $Symbol) "Preview returned the wrong symbol"
+    Assert-Condition ($plan.instrument_status -eq "Trading") `
+        "$Symbol is not Trading"
+    Assert-Condition ($null -ne $plan.calculated_quantity) `
+        "Calculated minimum order quantity is missing"
+    Assert-Condition ([decimal]$plan.calculated_quantity -gt [decimal]0) `
+        "Calculated minimum order quantity is invalid"
     if (-not $V2SizingTier) {
-        $script:FailureStage = "exchange_minimum_preview"
-        $preview = Invoke-Api -Method "POST" -Path "/demo/canary/preview" -Body @{
-            symbol = $Symbol
-            max_notional_usdt = $MaxNotionalUSDT.ToString([Globalization.CultureInfo]::InvariantCulture)
-        }
-        $plan = $preview.plan
-        Assert-Condition ($null -ne $plan) "Exchange minimum plan is missing"
-        Assert-Condition ($plan.symbol -eq $Symbol) "Preview returned the wrong symbol"
-        Assert-Condition ($plan.instrument_status -eq "Trading") `
-            "$Symbol is not Trading"
-        Assert-Condition ($null -ne $plan.calculated_quantity) `
-            "Calculated minimum order quantity is missing"
-        Assert-Condition ([decimal]$plan.calculated_quantity -gt [decimal]0) `
-            "Calculated minimum order quantity is invalid"
         Assert-Condition ([decimal]$plan.buffered_required_notional -le $MaxNotionalUSDT) `
             "Buffered required budget exceeds explicit MaxNotionalUSDT"
-
         Write-Host "DEMO SYMBOL: $($plan.symbol)"
         Write-Host "MIN ORDER QTY: $($plan.min_order_qty)"
         Write-Host "QTY STEP: $($plan.qty_step)"
@@ -545,15 +704,35 @@ try {
     Assert-Condition ([bool]$entry.execution.order_link_id) "orderLinkId is missing"
     Assert-Condition ([bool]$entry.execution.order_id) "Bybit did not accept an entry order ID"
     if ($V2SizingTier) {
+        $lotGuard = Get-ExchangeLotAwareCanaryGuard `
+            -TargetNotional ([decimal]$entry.sizing.requested_notional_usdt) `
+            -ReferencePrice ([decimal]$entry.execution.reference_entry_price) `
+            -MinOrderQty ([decimal]$plan.min_order_qty) `
+            -QtyStep ([decimal]$plan.qty_step) `
+            -MinNotional ([decimal]$plan.min_notional_value) `
+            -AcceptedQuantity ([decimal]$entry.execution.requested_quantity) `
+            -ExplicitMaximumNotional $MaxNotionalUSDT
+        Assert-Condition (
+            [decimal]$entry.sizing.normalized_accepted_quantity -eq
+            [decimal]$lotGuard.normalized_accepted_quantity
+        ) "Production sizing quantity differs from the exchange-lot guard"
         Assert-Condition (
             [decimal]$entry.sizing.normalized_accepted_notional_usdt -le
-            ([decimal]$V2SizingTier * [decimal]"1.05")
-        ) "Normalized V2 notional exceeds the guarded exchange-lot tolerance"
+            [decimal]$entry.sizing.symbol_cap_usdt
+        ) "Normalized V2 notional exceeds the production symbol cap"
         Assert-Condition (
-            [decimal]$entry.sizing.normalized_accepted_notional_usdt -ge
-            [decimal]100
-        ) "Normalized V2 notional is below the configured minimum"
-        Write-Host "V2 SIZING TIER $V2SizingTier`: $($entry.sizing.normalized_accepted_notional_usdt) USDT PASS"
+            [decimal]$entry.sizing.normalized_accepted_notional_usdt -le
+            [decimal]$entry.sizing.portfolio_remaining_capacity_usdt
+        ) "Normalized V2 notional exceeds production portfolio capacity"
+        Write-Host "V2 TARGET NOTIONAL: $($lotGuard.target_notional)"
+        Write-Host "V2 EXECUTABLE REFERENCE PRICE: $($lotGuard.executable_reference_price)"
+        Write-Host "V2 MINIMUM VALID QUANTITY: $($lotGuard.minimum_valid_quantity)"
+        Write-Host "V2 NEAREST VALID QUANTITY: $($lotGuard.nearest_valid_quantity)"
+        Write-Host "V2 NORMALIZED ACCEPTED QUANTITY: $($lotGuard.normalized_accepted_quantity)"
+        Write-Host "V2 ACCEPTED NOTIONAL: $($lotGuard.accepted_notional)"
+        Write-Host "V2 QTY STEP: $($lotGuard.qty_step)"
+        Write-Host "V2 ONE QTY STEP NOTIONAL: $($lotGuard.one_qty_step_notional)"
+        Write-Host "V2 EXCHANGE-LOT GUARD: PASS"
     }
     else {
         Assert-Condition ($null -ne $entry.plan) "Final exchange minimum plan is missing"
@@ -588,12 +767,12 @@ try {
     if ($V2SizingTier) {
         $actualAcceptedNotional = [decimal]$opened.accepted_quantity * `
             [decimal]$opened.average_fill_price
-        $minimumCanaryNotional = [decimal]$V2SizingTier * [decimal]"0.95"
-        $maximumCanaryNotional = [decimal]$V2SizingTier * [decimal]"1.05"
         Assert-Condition (
-            $actualAcceptedNotional -ge $minimumCanaryNotional -and
-            $actualAcceptedNotional -le $maximumCanaryNotional
-        ) "Actual accepted V2 notional is outside the guarded 5% canary tolerance"
+            [decimal]$opened.accepted_quantity -eq
+            [decimal]$lotGuard.normalized_accepted_quantity
+        ) "Actual accepted quantity differs from the guarded exchange lot"
+        Assert-Condition ($actualAcceptedNotional -le $MaxNotionalUSDT) `
+            "Actual accepted V2 notional exceeds explicit MaxNotionalUSDT"
         Write-Host "V2 ACTUAL ACCEPTED NOTIONAL: $actualAcceptedNotional USDT"
     }
     Write-Host "DEMO ENTRY FILL CONFIRMED: PASS"
@@ -621,6 +800,13 @@ try {
     }
     elseif ($ExerciseFlatDuringProtectionRace) {
         $script:FailureStage = "flat_during_protection_race"
+        if ($EnterDrainBeforeFlatRace) {
+            $drain = Invoke-Api -Method "POST" -Path "/v2/stop-new-entries"
+            Assert-Condition ($drain.run_phase -eq "DRAINING") `
+                "V2 runtime did not enter DRAINING before the exact close"
+            $script:PhaseBeforeRestart = [string]$drain.run_phase
+            Write-Host "DEMO DRAINING BEFORE CLOSE: PASS"
+        }
         $race = Invoke-Api -Method "POST" `
             -Path "/demo/canary/$executionId/flat-during-protection-race" `
             -TimeoutSec 90
@@ -648,12 +834,25 @@ try {
         Write-Host "SIZING-ONLY CONTROLLED RESTART: NOT REQUIRED"
     }
     else {
+        $preRestartV2 = Invoke-Api -Path "/v2/status"
+        $script:AdmissionsBeforeRestart = [int](
+            $preRestartV2.signal_metrics.admitted_signals
+        )
+        $script:ExecutionsBeforeRestart = @(Get-RunExecutions).Count
         Stop-Uvicorn
         Start-UvicornReady $python $port $stdoutPath $stderrPath `
             $StartupTimeoutSeconds
+        $restartV2 = Invoke-Api -Path "/v2/status"
+        $script:PhaseImmediatelyAfterRestart = [string]$restartV2.run_phase
+        if ($EnterDrainBeforeFlatRace) {
+            Assert-Condition (
+                $script:PhaseImmediatelyAfterRestart -ne "RUNNING"
+            ) "V2 runtime phase regressed to RUNNING after restart"
+        }
         $null = Assert-DemoSafety
         $null = Invoke-DemoReconcile
         $restored = Get-Execution -ExecutionId $executionId
+        $script:ExecutionsAfterRestart = @(Get-RunExecutions).Count
     }
     Assert-Condition ($null -ne $restored) "Execution was not restored after restart"
     $closedDuringRestart = $false
@@ -711,6 +910,18 @@ try {
     }
 
     $finalReconcile = Invoke-DemoReconcile
+    if ($EnterDrainBeforeFlatRace) {
+        $finalV2 = Invoke-Api -Path "/v2/status"
+        $script:FinalPhase = [string]$finalV2.run_phase
+        $script:AdmissionsAfterRestart = [int](
+            $finalV2.signal_metrics.admitted_signals
+        )
+        Assert-Condition ($finalV2.run_phase -eq "FINISHED") `
+            "V2 runtime did not reach FINISHED after exact terminalization"
+        Assert-Condition (@($finalV2.drain_active_execution_ids).Count -eq 0) `
+            "Drain retained an active execution after terminalization"
+        Write-Host "DEMO DRAIN TERMINALIZATION: PASS"
+    }
     $finalDemo = Invoke-Api -Path "/demo/status"
     Assert-Condition ([int]$finalDemo.bot_owned_open_positions -eq 0) `
         "Final Demo position is not flat"

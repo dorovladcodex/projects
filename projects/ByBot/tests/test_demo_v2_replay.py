@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -155,6 +156,65 @@ def test_duplicate_close_and_restart_during_closing_remain_idempotent() -> None:
     assert result.terminal_event_count == 1
     assert result.risk_ledger_application_count == 1
     assert result.unresolved_execution_ids == []
+
+
+@pytest.mark.parametrize(
+    "name,expected_pnl",
+    [
+        ("eth_protection_pending_20260724.json", Decimal("0.34716065")),
+        ("xrp_late_stop_20260724.json", Decimal("-0.37705234")),
+    ],
+)
+@pytest.mark.parametrize(
+    "miss_close_websocket,restart_before_close",
+    [(False, False), (True, False), (False, True)],
+)
+def test_20260724_incidents_terminalize_from_exact_rest_evidence(
+    name: str,
+    expected_pnl: Decimal,
+    miss_close_websocket: bool,
+    restart_before_close: bool,
+) -> None:
+    fixture = DemoReplayFixture.load(FIXTURES / name)
+    result = DemoV2ReplayHarness(
+        fixture,
+        miss_close_websocket=miss_close_websocket,
+        restart_before_close=restart_before_close,
+        duplicate_close_event=not miss_close_websocket,
+    ).run()
+
+    assert result.record.state == DemoExecutionState.DEMO_CLOSED
+    assert result.record.realized_exchange_pnl == expected_pnl
+    assert result.terminal_event_count == 1
+    assert result.risk_ledger_application_count == 1
+    assert result.reservation_release_count == 1
+    assert result.unresolved_execution_ids == []
+    assert result.exchange_mutation_attempts == 0
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        DemoExecutionState.DEMO_PROTECTION_PENDING,
+        DemoExecutionState.DEMO_POSITION_OPEN,
+        DemoExecutionState.DEMO_CLOSING,
+        DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
+    ],
+)
+def test_exact_full_close_terminalizes_from_every_owned_nonterminal_state(
+    state: DemoExecutionState,
+) -> None:
+    fixture = replace(
+        DemoReplayFixture.load(
+            FIXTURES / "eth_protection_pending_20260724.json"
+        ),
+        initial_close_state=state,
+    )
+
+    result = DemoV2ReplayHarness(fixture, miss_close_websocket=True).run()
+
+    assert result.record.state == DemoExecutionState.DEMO_CLOSED
+    assert result.terminal_event_count == 1
 
 
 def test_reporting_and_durable_ledger_use_same_exact_near_execution(

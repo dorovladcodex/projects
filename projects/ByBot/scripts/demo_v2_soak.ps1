@@ -452,7 +452,8 @@ try {
         $drainComplete = $false
         $drainTimedOut = $false
         $drainBlockers = @()
-        while (-not $drainComplete -and -not $drainTimedOut) {
+        $drainTimeoutIncidentWritten = $false
+        while (-not $drainComplete) {
             if ($script:process.HasExited) {
                 throw 'FastAPI exited during bounded drain reconciliation.'
             }
@@ -465,17 +466,34 @@ try {
                     $status.drain_seconds_remaining
                 )
                 $drainComplete = [string]$status.run_phase -eq 'FINISHED'
-                $drainTimedOut = [bool]$status.drain_timed_out
+                if ([bool]$status.drain_timed_out) {
+                    $drainTimedOut = $true
+                }
                 $drainBlockers = @($status.drain_safety_blockers)
             } catch {
                 Write-Warning 'Transient drain status failure; retrying while Uvicorn is healthy.'
             }
-            if (-not $drainComplete -and -not $drainTimedOut) {
+            if ($drainTimedOut -and -not $drainTimeoutIncidentWritten) {
+                $incident = [ordered]@{
+                    run_id = $runId
+                    detected_at = [DateTime]::UtcNow.ToString('o')
+                    event_type = 'V2_DRAIN_TIMEOUT'
+                    phase = [string]$status.run_phase
+                    active_execution_ids = @($status.drain_active_execution_ids)
+                    safety_blockers = @($status.drain_safety_blockers)
+                    position_management_continues = $true
+                }
+                $incident | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 `
+                    (Join-Path $artifactDir 'drain-timeout-incident.json')
+                $drainTimeoutIncidentWritten = $true
+                Write-Warning (
+                    'Bounded drain timed out; incident preserved and position ' +
+                    'management remains active until durable terminalization.'
+                )
+            }
+            if (-not $drainComplete) {
                 Start-Sleep -Seconds 10
             }
-        }
-        if ($drainTimedOut) {
-            Write-Warning ('Bounded drain timed out: ' + ($drainBlockers -join '; '))
         }
         if ($OptionalForceDemoCleanup) {
             $cleanup = Invoke-RestMethod "$base/demo/cleanup" -Method Post -TimeoutSec 60

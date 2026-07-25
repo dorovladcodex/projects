@@ -170,6 +170,17 @@ def test_three_concurrent_positions_drain_independently() -> None:
     assert status.phase == V2RunPhase.FINISHED
 
 
+def test_operator_draining_without_nominal_deadline_finishes_after_late_close() -> None:
+    drain = V2DrainController(None, lead_seconds=300, timeout_seconds=900)
+
+    drain.force_draining()
+    waiting = drain.evaluate(active_execution_ids=["late-close"])
+    finished = drain.evaluate(active_execution_ids=[])
+
+    assert waiting.phase == V2RunPhase.DRAINING
+    assert finished.phase == V2RunPhase.FINISHED
+
+
 def test_exchange_generated_tp_sl_are_owned_and_ids_are_persisted() -> None:
     item = execution()
     tp = protection_order(item, "TakeProfit", "tp-id")

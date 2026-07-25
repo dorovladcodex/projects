@@ -79,6 +79,7 @@ def exact_close_reconciliation_blockers(
     if record.execution_environment != ExecutionEnvironment.BYBIT_DEMO:
         blockers.append("execution does not belong to BYBIT_DEMO")
     if record.state not in {
+        DemoExecutionState.DEMO_PROTECTION_PENDING,
         DemoExecutionState.DEMO_POSITION_OPEN,
         DemoExecutionState.DEMO_CLOSING,
         DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,

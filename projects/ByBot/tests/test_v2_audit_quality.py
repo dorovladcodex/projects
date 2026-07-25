@@ -16,7 +16,9 @@ from app.bybit.demo import (
     canonical_exit_attribution,
 )
 from app.config import NewsClassifierMode, Settings
-from app.models import DemoExecutionRecord, DemoExecutionState, NewsItem, Side, Symbol
+from app.models import (
+    DemoExecutionRecord, DemoExecutionState, DemoFill, NewsItem, Side, Symbol,
+)
 from app.news.classifier import CodexCLINewsClassifier, build_news_classifier
 from app.v2.analytics import (
     V2ReportGenerator, _liquidation_metrics_at, _news_funnel_blockers, _trade_row,
@@ -39,13 +41,23 @@ from tests.test_v2_system import feature
 
 
 def _record(side: Side = Side.SELL) -> DemoExecutionRecord:
+    entry_at = datetime.fromtimestamp(1784152882, tz=timezone.utc)
     return DemoExecutionRecord(
         candidate_id=uuid4(), run_id="audit", order_link_id="entry-link",
+        order_id="entry-order",
         state=DemoExecutionState.DEMO_POSITION_OPEN, symbol=Symbol.WIFUSDT,
         side=side, requested_quantity=Decimal("163"),
         accepted_quantity=Decimal("163"), average_fill_price=Decimal("0.15311"),
         stop_loss=Decimal("0.15348"), take_profit=Decimal("0.15256"),
-        created_at=datetime.fromtimestamp(1784152882, tz=timezone.utc),
+        fills=[DemoFill(
+            execution_id="entry-exec",
+            order_id="entry-order",
+            quantity=Decimal("163"),
+            price=Decimal("0.15311"),
+            fee=Decimal("0.013"),
+            executed_at=entry_at,
+        )],
+        created_at=entry_at,
     )
 
 

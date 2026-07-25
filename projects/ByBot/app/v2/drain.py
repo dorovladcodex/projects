@@ -12,6 +12,14 @@ class V2RunPhase(str, Enum):
     FINISHED = "FINISHED"
 
 
+_PHASE_ORDER = {
+    V2RunPhase.RUNNING: 0,
+    V2RunPhase.DRAINING: 1,
+    V2RunPhase.RECONCILING: 2,
+    V2RunPhase.FINISHED: 3,
+}
+
+
 @dataclass(frozen=True)
 class V2DrainStatus:
     phase: V2RunPhase
@@ -38,38 +46,62 @@ class V2DrainController:
         *,
         lead_seconds: int,
         timeout_seconds: int,
+        restored_phase: V2RunPhase | str | None = None,
+        drain_started_at: datetime | None = None,
+        now: datetime | None = None,
     ) -> None:
         self.nominal_end_at = _utc(nominal_end_at) if nominal_end_at else None
         self.lead_seconds = lead_seconds
         self.timeout_seconds = timeout_seconds
-        self.phase = V2RunPhase.RUNNING
-        self.drain_started_at: datetime | None = None
+        self.phase = V2RunPhase(restored_phase or V2RunPhase.RUNNING)
+        self.drain_started_at = (
+            _utc(drain_started_at) if drain_started_at else None
+        )
+        current = _utc(now or datetime.now(timezone.utc))
+        if (
+            restored_phase is not None
+            and self.phase == V2RunPhase.RUNNING
+            and self.nominal_end_at is not None
+            and current >= self.nominal_end_at
+        ):
+            self.phase = V2RunPhase.DRAINING
+            self.drain_started_at = (
+                self.drain_started_at
+                or self.nominal_end_at - timedelta(seconds=self.lead_seconds)
+            )
 
     def evaluate(
         self,
         *,
         now: datetime | None = None,
         active_execution_ids: list[str] | tuple[str, ...] = (),
+        finalization_ready: bool | None = None,
     ) -> V2DrainStatus:
         current = _utc(now or datetime.now(timezone.utc))
         active = tuple(sorted(set(active_execution_ids)))
+        ready = not active if finalization_ready is None else finalization_ready
         nominal = self.nominal_end_at
         if nominal is None:
+            if self.phase != V2RunPhase.RUNNING and ready:
+                self._advance(V2RunPhase.FINISHED)
             return self._status(current, active, timed_out=False)
 
         drain_at = nominal - timedelta(seconds=self.lead_seconds)
         deadline = nominal + timedelta(seconds=self.timeout_seconds)
         if current >= drain_at and self.phase == V2RunPhase.RUNNING:
-            self.phase = V2RunPhase.DRAINING
+            self._advance(V2RunPhase.DRAINING)
             self.drain_started_at = drain_at
         if current >= nominal and self.phase in {
             V2RunPhase.RUNNING,
             V2RunPhase.DRAINING,
         }:
-            self.phase = V2RunPhase.RECONCILING
+            self._advance(V2RunPhase.RECONCILING)
             self.drain_started_at = self.drain_started_at or current
-        if current >= nominal and not active:
-            self.phase = V2RunPhase.FINISHED
+        if (
+            self.phase == V2RunPhase.RECONCILING
+            or current >= nominal
+        ) and self.phase != V2RunPhase.RUNNING and ready:
+            self._advance(V2RunPhase.FINISHED)
 
         timed_out = current >= deadline and bool(active)
         return self._status(current, active, timed_out=timed_out)
@@ -77,9 +109,16 @@ class V2DrainController:
     def force_draining(self, *, now: datetime | None = None) -> V2DrainStatus:
         current = _utc(now or datetime.now(timezone.utc))
         if self.phase == V2RunPhase.RUNNING:
-            self.phase = V2RunPhase.DRAINING
+            self._advance(V2RunPhase.DRAINING)
             self.drain_started_at = current
         return self._status(current, (), timed_out=False)
+
+    def advance(self, phase: V2RunPhase) -> None:
+        self._advance(phase)
+
+    def _advance(self, phase: V2RunPhase) -> None:
+        if _PHASE_ORDER[phase] > _PHASE_ORDER[self.phase]:
+            self.phase = phase
 
     def _status(
         self, current: datetime, active: tuple[str, ...], *, timed_out: bool

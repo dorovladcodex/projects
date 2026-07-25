@@ -79,9 +79,20 @@ class BybitRestMarketDataClient:
         ask_price = _to_float(raw, "ask1Price")
         volume_24h = _to_optional_float(raw, "volume24h")
 
+        received_at = datetime.now(timezone.utc)
+        exchange_timestamp = received_at
+        raw_exchange_time = data.get("time")
+        if raw_exchange_time not in (None, ""):
+            try:
+                exchange_timestamp = datetime.fromtimestamp(
+                    int(raw_exchange_time) / 1000, tz=timezone.utc
+                )
+            except (TypeError, ValueError, OSError) as exc:
+                raise ValueError("Bybit ticker response time is invalid") from exc
+
         return MarketSnapshot(
             symbol=symbol,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=exchange_timestamp,
             last_price=last_price,
             bid_price=bid_price,
             ask_price=ask_price,
@@ -148,6 +159,16 @@ class MarketDataService:
         self.last_error = "; ".join(errors) if errors else "No market data refreshed"
         if refreshed:
             self.last_updated = datetime.now(timezone.utc)
+
+    def refresh_symbol(self, symbol: Symbol) -> MarketSnapshot:
+        """Fetch one requested symbol directly, independent of startup symbols."""
+
+        snapshot = self._with_derived_metrics(self.provider.get_snapshot(symbol))
+        self._append(snapshot)
+        self.status = "OK"
+        self.last_error = None
+        self.last_updated = datetime.now(timezone.utc)
+        return snapshot
 
     def latest_snapshots(self) -> list[MarketSnapshot]:
         return [items[-1] for items in self.history.values() if items]

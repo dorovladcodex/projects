@@ -48,6 +48,12 @@ TERMINAL_DEMO_STATES = {
     DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
     DemoExecutionState.DEMO_FAILED_FLAT_VERIFIED,
 }
+EXACT_CLOSE_TERMINALIZABLE_STATES = {
+    DemoExecutionState.DEMO_PROTECTION_PENDING,
+    DemoExecutionState.DEMO_POSITION_OPEN,
+    DemoExecutionState.DEMO_CLOSING,
+    DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
+}
 CANONICAL_EXIT_ATTRIBUTIONS = {
     "take_profit", "stop_loss", "strategy_exit", "stale_signal",
     "maximum_holding_time", "reconciliation_close", "manual_external_close",
@@ -1573,8 +1579,8 @@ class DemoExecutionService:
         )
         if (
             not finalized
-            and record.state == DemoExecutionState.DEMO_CLOSING
-            and record.close_fills
+            and record.state in EXACT_CLOSE_TERMINALIZABLE_STATES
+            and (record.close_fills or record.close_order_id)
             and record.closed_at is not None
             and not any(
                 str(item.get("symbol") or "") == record.symbol.value
@@ -1603,11 +1609,7 @@ class DemoExecutionService:
     ) -> bool:
         """Finalize an owned position only from exact, complete REST evidence."""
 
-        if record.state not in {
-            DemoExecutionState.DEMO_POSITION_OPEN,
-            DemoExecutionState.DEMO_CLOSING,
-            DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
-        }:
+        if record.state not in EXACT_CLOSE_TERMINALIZABLE_STATES:
             return False
         if any(
             str(item.get("symbol") or "") == record.symbol.value
@@ -1615,7 +1617,86 @@ class DemoExecutionService:
             for item in positions
         ):
             return False
-        if any(_is_execution_owned_open_order(item, record) for item in realtime):
+        if any(
+            str(item.get("symbol") or "") == record.symbol.value
+            for item in realtime
+        ):
+            return False
+        if not record.order_id or record.accepted_quantity <= 0:
+            return False
+        entry_orders = [
+            item for item in history
+            if str(item.get("orderId") or "") == record.order_id
+        ]
+        if entry_orders and not any(
+            str(item.get("orderStatus") or "") == "Filled"
+            and str(item.get("symbol") or "") == record.symbol.value
+            and (
+                not record.order_link_id
+                or str(item.get("orderLinkId") or "") == record.order_link_id
+            )
+            for item in entry_orders
+        ):
+            return False
+        entry_executions = [
+            item for item in executions
+            if str(item.get("orderId") or "") == record.order_id
+            and str(item.get("symbol") or "") == record.symbol.value
+            and (
+                (record.side == Side.BUY and str(item.get("side") or "").upper() == "BUY")
+                or (record.side == Side.SELL and str(item.get("side") or "").upper() == "SELL")
+            )
+        ]
+        all_records = self.repository.load_demo_executions()
+        durable_entry_quantity = sum(
+            (
+                fill.quantity
+                for fill in record.fills
+                if fill.order_id == record.order_id
+            ),
+            Decimal("0"),
+        )
+        remote_entry_quantity = sum(
+            (
+                _decimal(item.get("execQty"), default="0")
+                for item in entry_executions
+            ),
+            Decimal("0"),
+        )
+        durable_entry_is_exact = bool(
+            record.fills
+            and durable_entry_quantity == record.accepted_quantity
+            and all(fill.order_id == record.order_id for fill in record.fills)
+        )
+        remote_entry_is_exact = bool(
+            entry_executions
+            and remote_entry_quantity == record.accepted_quantity
+        )
+        if (
+            not (durable_entry_is_exact or remote_entry_is_exact)
+            or (
+                entry_executions
+                and remote_entry_quantity != record.accepted_quantity
+            )
+            or any(
+                _exchange_identity_used_by_other(
+                    all_records,
+                    record,
+                    fill.order_id,
+                    fill.execution_id,
+                )
+                for fill in record.fills
+            )
+            or any(
+                _exchange_identity_used_by_other(
+                    all_records,
+                    record,
+                    str(item.get("orderId") or ""),
+                    str(item.get("execId") or ""),
+                )
+                for item in entry_executions
+            )
+        ):
             return False
         close_order = next(
             (
@@ -1628,7 +1709,6 @@ class DemoExecutionService:
         if close_order is None and record.accepted_quantity > 0:
             entry_time_ms = _record_entry_time_ms(record)
             expected_side = "SELL" if record.side == Side.BUY else "BUY"
-            all_records = self.repository.load_demo_executions()
             candidates: list[dict[str, Any]] = []
             for item in history:
                 order_id = str(item.get("orderId") or "")
@@ -1699,6 +1779,12 @@ class DemoExecutionService:
         )
         if record.accepted_quantity <= 0 or close_quantity != record.accepted_quantity:
             return False
+        for item in entry_executions:
+            self._apply_fill(record, item)
+        if sum(
+            (fill.quantity for fill in record.fills), Decimal("0")
+        ) != record.accepted_quantity:
+            return False
         record.close_order_id = selected_close_order_id
         attribute_exchange_close(
             record, close_order, source="rest_exact_full_close_order"
@@ -1753,11 +1839,7 @@ class DemoExecutionService:
     ) -> bool:
         """Finalize complete durable fills without consulting symbol-level PnL."""
         if (
-            record.state not in {
-                DemoExecutionState.DEMO_POSITION_OPEN,
-                DemoExecutionState.DEMO_CLOSING,
-                DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
-            }
+            record.state not in EXACT_CLOSE_TERMINALIZABLE_STATES
             or not record.order_id
             or not record.close_order_id
             or not record.fills
@@ -1767,7 +1849,10 @@ class DemoExecutionService:
                 and _decimal(item.get("size"), default="0") > 0
                 for item in positions
             )
-            or any(_is_execution_owned_open_order(item, record) for item in realtime)
+            or any(
+                str(item.get("symbol") or "") == record.symbol.value
+                for item in realtime
+            )
         ):
             return False
         attribution = canonical_exit_attribution(
@@ -1862,7 +1947,7 @@ class DemoExecutionService:
     def _ws_close_requires_terminal_reconciliation(
         topic: str, item: dict[str, Any], record: DemoExecutionRecord,
     ) -> bool:
-        if record.state != DemoExecutionState.DEMO_CLOSING:
+        if record.state not in EXACT_CLOSE_TERMINALIZABLE_STATES:
             return False
         if topic == "execution":
             exec_id = str(item.get("execId") or "")
@@ -1972,14 +2057,13 @@ class DemoExecutionService:
     def retry_stuck_terminalizations(
         self, *, now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Retry aged CLOSING records with read-only REST reconciliation."""
+        """Retry aged non-terminal owned executions with read-only REST evidence."""
         current = now or datetime.now(timezone.utc)
         retried: list[str] = []
         resolved: list[str] = []
         for record in self.repository.load_demo_executions():
             if (
-                record.state != DemoExecutionState.DEMO_CLOSING
-                or not record.close_fills
+                record.state not in EXACT_CLOSE_TERMINALIZABLE_STATES
                 or current - _aware(record.closed_at or record.updated_at)
                 < timedelta(seconds=self.settings.v2_terminalization_warning_seconds)
             ):
@@ -2147,10 +2231,7 @@ class DemoExecutionService:
         for record in local:
             if (
                 record.symbol.value not in active_symbols
-                and record.state in {
-                    DemoExecutionState.DEMO_POSITION_OPEN,
-                    DemoExecutionState.DEMO_CLOSING,
-                }
+                and record.state in EXACT_CLOSE_TERMINALIZABLE_STATES
             ):
                 # Never select PnL or a close by symbol.  The local list was
                 # loaded before account-wide REST processing and can lag a WS
@@ -2552,10 +2633,17 @@ class DemoExecutionService:
                 def close_exact_owned_position(
                     current: DemoExecutionRecord,
                 ) -> None:
+                    current.state = DemoExecutionState.DEMO_PROTECTION_PENDING
+                    current.updated_at = datetime.now(timezone.utc)
+                    self.repository.save_demo_execution(
+                        current,
+                        event_type="CANARY_PROTECTION_TRANSITION_PENDING",
+                    )
                     self._submit_reduce_only_close(
                         current,
                         current.accepted_quantity,
                         "canary_close",
+                        preserve_transition_state=True,
                     )
                     deadline = time.monotonic() + 20
                     while time.monotonic() < deadline:
@@ -3177,6 +3265,10 @@ class DemoExecutionService:
             "private_ws_domain": self.client.private_ws_url if self.client else None,
             "kill_switch_active": self.kill_switch_active,
             "kill_switch_reasons": list(self.kill_switch_reasons),
+            "active_kill_switch_reasons": (
+                list(self.kill_switch_reasons) if self.kill_switch_active else []
+            ),
+            "historical_kill_switch_reasons": list(self.kill_switch_reasons),
             "kill_switch_activations": len(self.kill_switch_reasons),
             "websocket_connected": self.websocket_connected,
             "websocket_reconnects": self.websocket_reconnects,
@@ -3291,7 +3383,7 @@ class DemoExecutionService:
         record.exchange_order_status = status or record.exchange_order_status
         if record.state in {
             DemoExecutionState.DEMO_FULLY_FILLED,
-            DemoExecutionState.DEMO_PROTECTION_PENDING,
+            *EXACT_CLOSE_TERMINALIZABLE_STATES,
             *TERMINAL_DEMO_STATES,
         } or (
             record.protection_confirmed and record.state in {
@@ -3626,14 +3718,20 @@ class DemoExecutionService:
             self._activate_kill_switch(f"unprotected position: {reason}")
 
     def _submit_reduce_only_close(
-        self, record: DemoExecutionRecord, quantity: Decimal, reason: str
+        self,
+        record: DemoExecutionRecord,
+        quantity: Decimal,
+        reason: str,
+        *,
+        preserve_transition_state: bool = False,
     ) -> None:
         if self.client is None or record.close_order_id or record.close_order_link_id:
             return
         link = deterministic_order_link_id(
             self.order_prefix, record.candidate_id, "emergency"
         )
-        record.state = DemoExecutionState.DEMO_CLOSING
+        if not preserve_transition_state:
+            record.state = DemoExecutionState.DEMO_CLOSING
         record.close_order_link_id = link
         record.exit_attribution = canonical_exit_attribution(reason)
         record.close_reason = record.exit_attribution
@@ -3842,11 +3940,7 @@ class DemoExecutionService:
         candidates = [
             record for record in all_records
             if record.symbol.value == symbol
-            and record.state in {
-                DemoExecutionState.DEMO_POSITION_OPEN,
-                DemoExecutionState.DEMO_CLOSING,
-                DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
-            }
+            and record.state in EXACT_CLOSE_TERMINALIZABLE_STATES
             and (
                 not side
                 or (record.side == Side.BUY and side == "SELL")

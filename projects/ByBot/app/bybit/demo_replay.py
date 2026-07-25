@@ -35,6 +35,7 @@ class DemoReplayFixture:
     entry_fee: Decimal
     close_fee: Decimal
     close_source: str
+    initial_close_state: DemoExecutionState = DemoExecutionState.DEMO_POSITION_OPEN
     sparse_entry_fill_order_id: bool = False
 
     @classmethod
@@ -54,6 +55,9 @@ class DemoReplayFixture:
             entry_fee=Decimal(value["entry_fee"]),
             close_fee=Decimal(value["close_fee"]),
             close_source=value["close_source"],
+            initial_close_state=DemoExecutionState(
+                value.get("initial_close_state", "DEMO_POSITION_OPEN")
+            ),
             sparse_entry_fill_order_id=bool(
                 value.get("sparse_entry_fill_order_id", False)
             ),
@@ -282,12 +286,16 @@ class DemoV2ReplayHarness:
         stale_closed_pnl: list[dict[str, Any]] | None = None,
         duplicate_close_event: bool = False,
         restart_during_closing: bool = False,
+        miss_close_websocket: bool = False,
+        restart_before_close: bool = False,
     ) -> None:
         self.fixture = fixture
         self.historical_records = list(historical_records or [])
         self.stale_closed_pnl = list(stale_closed_pnl or [])
         self.duplicate_close_event = duplicate_close_event
         self.restart_during_closing = restart_during_closing
+        self.miss_close_websocket = miss_close_websocket
+        self.restart_before_close = restart_before_close
 
     def run(self) -> DemoReplayResult:
         opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -340,20 +348,32 @@ class DemoV2ReplayHarness:
         service.handle_private_event({"topic": "execution", "data": [entry]})
         lifecycle.append("entry fully filled")
         current = repository.get_demo_execution(str(candidate_id))
-        current.state = DemoExecutionState.DEMO_POSITION_OPEN
+        current.state = self.fixture.initial_close_state
         current.protection_confirmed = True
         current.updated_at = opened_at + timedelta(seconds=10)
         repository.save_demo_execution(current, event_type="DEMO_POSITION_OPEN")
         lifecycle.append("position open")
 
-        service.handle_private_event({
-            "topic": "execution", "data": [client.executions[1]],
-        })
-        lifecycle.append("TP execution fill" if self.fixture.close_source == "take_profit" else "SL execution fill")
-        service.handle_private_event({
-            "topic": "order", "data": [client.history[1]],
-        })
-        lifecycle.append("CLOSE_Filled")
+        if self.restart_before_close:
+            service = DemoExecutionService(
+                settings, repository, client, run_id=self.fixture.run_id
+            )
+            lifecycle.append("service restarted before close")
+        if not self.miss_close_websocket:
+            service.handle_private_event({
+                "topic": "execution", "data": [client.executions[1]],
+            })
+            lifecycle.append(
+                "TP execution fill"
+                if self.fixture.close_source == "take_profit"
+                else "SL execution fill"
+            )
+            service.handle_private_event({
+                "topic": "order", "data": [client.history[1]],
+            })
+            lifecycle.append("CLOSE_Filled")
+        else:
+            lifecycle.append("close websocket missed")
         if self.duplicate_close_event:
             service.handle_private_event({
                 "topic": "execution", "data": [client.executions[1]],

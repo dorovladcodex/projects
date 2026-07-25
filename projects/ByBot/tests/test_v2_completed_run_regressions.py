@@ -43,7 +43,7 @@ def _closing_record(
         take_profit=Decimal("67000"),
         protection_confirmed=True,
         fills=[DemoFill(
-            execution_id="entry-exec",
+            execution_id=f"entry-exec{suffix}",
             order_id=f"entry-order{suffix}",
             quantity=Decimal(quantity),
             price=Decimal("65000"),

@@ -1492,6 +1492,7 @@ class PersistenceRepository:
                     ):
                         return True
                     _preserve_demo_execution_exchange_identity(record, existing)
+                    _preserve_demo_execution_monotonic_state(record, existing)
                     row = _demo_execution_row(record)
                     for column in (
                         "execution_environment", "risk_decision_id", "run_id",
@@ -2544,7 +2545,49 @@ class PersistenceRepository:
                 if row is None:
                     return False
                 current = dict(row.payload or {})
-                current["runtime"] = payload
+                existing_runtime = dict(current.get("runtime") or {})
+                existing_finalization = dict(
+                    existing_runtime.get("run_finalization") or {}
+                )
+                incoming = dict(payload)
+                incoming_finalization = dict(
+                    incoming.get("run_finalization") or {}
+                )
+                phase_order = {
+                    "RUNNING": 0,
+                    "DRAINING": 1,
+                    "RECONCILING": 2,
+                    "FINISHED": 3,
+                }
+                existing_phase = max(
+                    (
+                        str(existing_finalization.get("phase") or "RUNNING"),
+                        str(row.status or "RUNNING"),
+                    ),
+                    key=lambda value: phase_order.get(value, -1),
+                )
+                if not incoming_finalization:
+                    incoming_finalization = existing_finalization
+                incoming_phase = str(
+                    incoming_finalization.get("phase") or existing_phase
+                )
+                if phase_order.get(incoming_phase, -1) < phase_order.get(
+                    existing_phase, -1
+                ):
+                    incoming_finalization = (
+                        existing_finalization or {"phase": existing_phase}
+                    )
+                    incoming["run_finalization"] = incoming_finalization
+                    incoming_phase = existing_phase
+                elif incoming_finalization:
+                    incoming["run_finalization"] = incoming_finalization
+                current["runtime"] = incoming
+                if phase_order.get(incoming_phase, -1) >= phase_order.get(
+                    str(row.status), -1
+                ):
+                    row.status = incoming_phase
+                if incoming_phase == "FINISHED" and row.finished_at is None:
+                    row.finished_at = datetime.now(timezone.utc)
                 row.payload = current
             return True
         except SQLAlchemyError as exc:
@@ -2558,6 +2601,30 @@ class PersistenceRepository:
             with Session(self.engine) as session:
                 row = session.get(V2RunRow, run_id)
                 return dict((row.payload or {}).get("runtime") or {}) if row else {}
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return {}
+
+    def load_v2_run_state(self, run_id: str) -> dict[str, Any]:
+        if not self.available:
+            return {}
+        try:
+            with Session(self.engine) as session:
+                row = session.get(V2RunRow, run_id)
+                if row is None:
+                    return {}
+                return {
+                    "run_id": row.run_id,
+                    "started_at": _utc_aware(row.started_at).isoformat(),
+                    "finished_at": (
+                        _utc_aware(row.finished_at).isoformat()
+                        if row.finished_at else None
+                    ),
+                    "status": row.status,
+                    "runtime": dict(
+                        (row.payload or {}).get("runtime") or {}
+                    ),
+                }
         except SQLAlchemyError as exc:
             self._failed(exc)
             return {}
@@ -2644,6 +2711,55 @@ def _preserve_demo_execution_exchange_identity(
         record.close_order_link_id = (
             existing.close_order_link_id or payload.get("close_order_link_id")
         )
+
+
+def _preserve_demo_execution_monotonic_state(
+    record: DemoExecutionRecord, existing: DemoExecutionRow,
+) -> None:
+    """Merge late lifecycle evidence without regressing durable exposure state."""
+    try:
+        current = DemoExecutionRecord.model_validate(existing.payload)
+    except (TypeError, ValueError):
+        return
+    rank = {
+        DemoExecutionState.DEMO_SUBMITTING: 0,
+        DemoExecutionState.DEMO_ORDER_ACKNOWLEDGED: 1,
+        DemoExecutionState.DEMO_ACCEPTED: 1,
+        DemoExecutionState.DEMO_PARTIALLY_FILLED: 2,
+        DemoExecutionState.DEMO_FILLED: 3,
+        DemoExecutionState.DEMO_FULLY_FILLED: 3,
+        DemoExecutionState.DEMO_PROTECTION_PENDING: 4,
+        DemoExecutionState.DEMO_POSITION_OPEN: 5,
+        DemoExecutionState.DEMO_CLOSING: 6,
+        DemoExecutionState.DEMO_RECONCILIATION_REQUIRED: 6,
+    }
+    if rank.get(record.state, 99) >= rank.get(current.state, -1):
+        return
+
+    record.state = current.state
+    for name in (
+        "protection_confirmed", "take_profit", "stop_loss", "tp_identifier",
+        "sl_identifier", "tp_order_id", "sl_order_id",
+        "protection_position_idx", "protection_orders_verified_at",
+        "position_confirmed_at", "protection_confirmed_at",
+        "close_order_id", "close_order_link_id", "average_close_price",
+        "gross_realized_pnl", "realized_exchange_pnl", "paper_shadow_pnl",
+        "close_reason", "exit_attribution", "exit_attribution_evidence",
+        "closed_at", "cleanup_result",
+    ):
+        current_value = getattr(current, name)
+        if current_value not in (None, "", [], {}):
+            setattr(record, name, current_value)
+    record.fills = _merge_demo_fills(current.fills, record.fills)
+    record.close_fills = _merge_demo_fills(
+        current.close_fills, record.close_fills
+    )
+
+
+def _merge_demo_fills(existing: list[Any], incoming: list[Any]) -> list[Any]:
+    merged = {item.execution_id: item for item in existing}
+    merged.update({item.execution_id: item for item in incoming})
+    return sorted(merged.values(), key=lambda item: item.executed_at)
 
 
 def _demo_execution_row(record: DemoExecutionRecord) -> DemoExecutionRow:

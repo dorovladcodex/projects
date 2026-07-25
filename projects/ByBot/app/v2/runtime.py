@@ -69,19 +69,74 @@ class V2Runtime:
             settings.v2_min_calibration_samples
         )
         self._restore_calibration_history()
-        self.started_at = datetime.now(timezone.utc)
+        run_state_loader = getattr(repository, "load_v2_run_state", None)
+        restored_run = (
+            run_state_loader(run_id) if callable(run_state_loader) else {}
+        ) or {}
+        restored = dict(restored_run.get("runtime") or {})
+        if not restored:
+            restored = (
+                repository.load_v2_run_runtime(run_id)
+                if hasattr(repository, "load_v2_run_runtime") else {}
+            )
+        self.started_at = _aware_utc_datetime(
+            restored_run.get("started_at")
+        ) if restored_run.get("started_at") else datetime.now(timezone.utc)
         self.last_cycle_at: datetime | None = None
         self.last_error: str | None = None
         self.stop_new_entries = False
+        restored_finalization = dict(restored.get("run_finalization") or {})
+        phase_order = {
+            V2RunPhase.RUNNING.value: 0,
+            V2RunPhase.DRAINING.value: 1,
+            V2RunPhase.RECONCILING.value: 2,
+            V2RunPhase.FINISHED.value: 3,
+        }
+        phase_values = [
+            str(value)
+            for value in (
+                restored_finalization.get("phase"),
+                restored_run.get("status"),
+            )
+            if value
+        ]
+        persisted_phase_value = max(
+            phase_values or [V2RunPhase.RUNNING.value],
+            key=lambda value: phase_order.get(value, -1),
+        )
+        try:
+            persisted_phase = V2RunPhase(str(persisted_phase_value))
+        except ValueError:
+            persisted_phase = V2RunPhase.RUNNING
+        nominal_value = (
+            restored_finalization.get("nominal_end_at")
+            if "nominal_end_at" in restored_finalization
+            else settings.v2_run_nominal_end_at
+        )
+        restored_nominal = (
+            _aware_utc_datetime(nominal_value) if nominal_value else None
+        )
+        drain_started_value = restored_finalization.get("drain_started_at")
+        restored_drain_started = (
+            _aware_utc_datetime(drain_started_value)
+            if drain_started_value else None
+        )
         self.drain = V2DrainController(
-            settings.v2_run_nominal_end_at,
+            restored_nominal,
             lead_seconds=settings.v2_drain_lead_seconds,
             timeout_seconds=settings.v2_drain_timeout_seconds,
+            restored_phase=persisted_phase,
+            drain_started_at=restored_drain_started,
         )
+        self._persisted_phase = persisted_phase
+        self._initial_restored_phase = self.drain.phase
+        self._restored_runtime_updated_at = restored.get("updated_at")
+        self._restoration_detected = bool(restored_run or restored)
+        if self.drain.phase != V2RunPhase.RUNNING:
+            self.stop_new_entries = True
         self.cycles = 0
         self._last_rest_poll_at: datetime | None = None
         self._execution_pools: dict[Symbol, ThreadPoolExecutor] = {}
-        restored = repository.load_v2_run_runtime(run_id) if hasattr(repository, "load_v2_run_runtime") else {}
         self.failure_circuit_breaker_active = bool(
             restored.get("failure_circuit_breaker_active", False)
         )
@@ -221,6 +276,8 @@ class V2Runtime:
         # receive a refresh when no validated snapshot exists.
         if self.universe.last_refresh_at is None:
             self.universe.refresh()
+        if getattr(self, "_restoration_detected", False):
+            self._restore_finalization_on_startup()
         self._refresh_status_snapshot()
 
     async def cycle(self) -> None:
@@ -1120,9 +1177,7 @@ class V2Runtime:
             source_metric[key] = int(source_metric.get(key) or 0) + 1
 
     def _runtime_metrics_payload(self) -> dict[str, Any]:
-        drain_status = self.drain.evaluate(
-            active_execution_ids=self._active_execution_ids()
-        )
+        drain_status = self._update_drain_state()
         return {
             "run_valid": self.run_valid,
             "run_invalid_reasons": list(self.run_invalid_reasons),
@@ -1591,6 +1646,65 @@ class V2Runtime:
             "existing_position_management_active": True,
         }
 
+    def execution_entries_allowed(self) -> bool:
+        return bool(
+            self.drain.phase == V2RunPhase.RUNNING
+            and not self.stop_new_entries
+            and self.run_valid
+        )
+
+    def _restore_finalization_on_startup(self) -> None:
+        if self.drain.phase != V2RunPhase.RUNNING:
+            self.stop_new_entries = True
+            self._enforce_terminalization_invariants()
+            self._sync_reservations()
+        status = self._update_drain_state()
+        remote = self._remote_finalization_snapshot()
+        self._persist_runtime_metrics()
+        incident = V2Incident(
+            id=uuid5(
+                NAMESPACE_URL,
+                (
+                    f"bybot-v2-phase-restore:{self.run_id}:"
+                    f"{self._persisted_phase.value}:"
+                    f"{self._initial_restored_phase.value}:"
+                    f"{self._restored_runtime_updated_at or 'initial'}"
+                ),
+            ),
+            run_id=self.run_id,
+            event_type="V2_RUN_PHASE_RESTORED",
+            payload={
+                "persisted_phase": self._persisted_phase.value,
+                "initial_restored_phase": self._initial_restored_phase.value,
+                "restored_phase": status.phase.value,
+                "run_id": self.run_id,
+                "nominal_end_at": (
+                    status.nominal_end_at.isoformat()
+                    if status.nominal_end_at else None
+                ),
+                "drain_started_at": (
+                    status.drain_started_at.isoformat()
+                    if status.drain_started_at else None
+                ),
+                "active_executions": list(status.active_execution_ids),
+                "unresolved_executions": remote["unresolved_executions"],
+                "remote_positions": remote["remote_positions"],
+                "remote_orders": remote["remote_orders"],
+                "remote_state_authoritative": remote[
+                    "remote_state_authoritative"
+                ],
+                "entries_enabled": self.execution_entries_allowed(),
+                "finalization_result": (
+                    "FINISHED"
+                    if status.phase == V2RunPhase.FINISHED
+                    else "WAITING_FOR_AUTHORITATIVE_FLAT_STATE"
+                    if status.phase != V2RunPhase.RUNNING
+                    else "RUNNING_RESTORED"
+                ),
+            },
+        )
+        self.repository.save_v2_incident(incident)
+
     def _active_execution_ids(self) -> list[str]:
         terminal = {
             "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE", "DEMO_FAILED",
@@ -1604,9 +1718,46 @@ class V2Runtime:
             if item.run_id == self.run_id and item.state.value not in terminal
         ]
 
+    def _remote_finalization_snapshot(self) -> dict[str, Any]:
+        active = self._active_execution_ids()
+        status_loader = getattr(self.execution.demo_execution, "as_status", None)
+        if not callable(status_loader):
+            return {
+                "remote_state_authoritative": not active,
+                "remote_positions": 0 if not active else None,
+                "remote_orders": 0 if not active else None,
+                "unresolved_executions": len(active),
+                "ready": not active,
+            }
+        status = status_loader()
+        remote_positions = int(status.get("bot_owned_open_positions") or 0)
+        remote_orders = (
+            int(status.get("bot_owned_open_orders") or 0)
+            + int(status.get("unrelated_open_orders") or 0)
+        )
+        authoritative = bool(status.get("remote_state_authoritative"))
+        return {
+            "remote_state_authoritative": authoritative,
+            "remote_positions": remote_positions,
+            "remote_orders": remote_orders,
+            "unresolved_executions": len(active),
+            "ready": bool(
+                authoritative
+                and not active
+                and remote_positions == 0
+                and remote_orders == 0
+            ),
+        }
+
     def _update_drain_state(self) -> Any:
+        active = self._active_execution_ids()
+        remote = self._remote_finalization_snapshot()
         status = self.drain.evaluate(
-            active_execution_ids=self._active_execution_ids()
+            active_execution_ids=active,
+            finalization_ready=(
+                bool(remote["ready"])
+                if self.drain.phase != V2RunPhase.RUNNING else False
+            ),
         )
         if status.phase != V2RunPhase.RUNNING:
             self.stop_new_entries = True

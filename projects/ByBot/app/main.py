@@ -13,6 +13,12 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from starlette.status import HTTP_202_ACCEPTED
 
 from app.bybit.market_data import build_market_data_service, snapshot_to_payload
+from app.bybit.canary_market import (
+    CanaryMarketObservation,
+    CanaryMarketReadiness,
+    CanaryMarketReadinessError,
+    wait_for_canary_market_data,
+)
 from app.bybit.private import build_account_service
 from app.bybit.demo import (
     BybitDemoPrivateWebSocket,
@@ -421,6 +427,14 @@ def v2_sizing_canary(
     _require_demo_canary()
     if not settings.v2_enabled or notional_tier not in {100, 200}:
         raise HTTPException(status_code=404, detail="V2 sizing canary unavailable")
+    if not v2_runtime.execution_entries_allowed():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "V2 run finalization blocks new entries",
+                "run_phase": v2_runtime.status().get("run_phase"),
+            },
+        )
     feature = v2_feature_engine.snapshot(symbol)
     if feature is None or not feature.fresh:
         raise HTTPException(
@@ -1157,7 +1171,8 @@ def demo_canary_preview(request: DemoCanaryPreviewRequest) -> dict[str, object]:
     """Build a side-effect-free exchange-minimum plan for operator review."""
 
     _require_demo_canary()
-    snapshot = _fresh_canary_snapshot(request.symbol)
+    readiness = _fresh_canary_snapshot(request.symbol)
+    snapshot = readiness.observation.snapshot
     buffer_pct = (
         request.market_price_buffer_pct
         if request.market_price_buffer_pct is not None
@@ -1174,21 +1189,83 @@ def demo_canary_preview(request: DemoCanaryPreviewRequest) -> dict[str, object]:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {
         "plan": canary_plan_payload(plan),
+        "market_readiness": readiness.as_payload(),
         "side_effects_created": False,
         "live_execution_blocked": True,
     }
 
 
-def _fresh_canary_snapshot(symbol: Symbol) -> MarketSnapshot:
-    previous = market_data_service.latest_snapshot(symbol)
-    market_data_service.refresh_all()
-    snapshot = market_data_service.latest_snapshot(symbol)
-    if snapshot is None or snapshot is previous:
-        raise HTTPException(status_code=503, detail="fresh Demo market data is unavailable")
-    age = datetime.now(timezone.utc) - snapshot.timestamp
-    if age > timedelta(seconds=settings.signal_confirmation_window_seconds):
-        raise HTTPException(status_code=503, detail="Demo market data is stale")
-    return snapshot
+def _fresh_canary_snapshot(symbol: Symbol) -> CanaryMarketReadiness:
+    accepted_symbols = (
+        v2_universe_service.accepted_symbols
+        if settings.v2_enabled
+        else tuple(Symbol(value) for value in settings.allowed_symbols)
+    )
+    websocket_provider = _v2_canary_websocket_observation if settings.v2_enabled else None
+    try:
+        return wait_for_canary_market_data(
+            symbol,
+            accepted_symbols=accepted_symbols,
+            websocket_provider=websocket_provider,
+            rest_provider=_canary_rest_observation,
+            timeout_seconds=settings.demo_canary_market_readiness_timeout_seconds,
+            websocket_warmup_seconds=settings.demo_canary_websocket_warmup_seconds,
+            freshness_seconds=(
+                settings.v2_market_stale_seconds
+                if settings.v2_enabled
+                else settings.signal_confirmation_window_seconds
+            ),
+        )
+    except CanaryMarketReadinessError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": str(exc),
+                "readiness": exc.report,
+                "side_effects_created": False,
+            },
+        ) from exc
+
+
+def _v2_canary_websocket_observation(
+    symbol: Symbol,
+) -> CanaryMarketObservation | None:
+    feature = v2_feature_engine.snapshot(symbol)
+    if feature is None:
+        return None
+    ticker_at = feature.source_timestamps.get("ticker")
+    book_at = feature.source_timestamps.get("orderbook")
+    if ticker_at is None or book_at is None:
+        return None
+    exchange_timestamp = min(ticker_at, book_at)
+    snapshot = MarketSnapshot(
+        symbol=symbol,
+        timestamp=exchange_timestamp,
+        last_price=float(feature.last_price),
+        bid_price=float(feature.bid_price),
+        ask_price=float(feature.ask_price),
+        trend_score=0.0,
+        volatility_pct=0.0,
+        liquidity_ok=feature.ask_price >= feature.bid_price,
+        api_stable=True,
+        volume_24h=float(feature.volume_24h),
+    )
+    return CanaryMarketObservation(
+        snapshot=snapshot,
+        source="WS",
+        exchange_timestamp=exchange_timestamp,
+        received_at=feature.timestamp,
+    )
+
+
+def _canary_rest_observation(symbol: Symbol) -> CanaryMarketObservation:
+    snapshot = market_data_service.refresh_symbol(symbol)
+    return CanaryMarketObservation(
+        snapshot=snapshot,
+        source="REST",
+        exchange_timestamp=snapshot.timestamp,
+        received_at=datetime.now(timezone.utc),
+    )
 
 
 @app.get("/demo/canary/{execution_id}")

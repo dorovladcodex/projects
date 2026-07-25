@@ -1,0 +1,18 @@
+{
+  "execution_id": "a14783b5-e6b1-4d04-ba51-ac1524912525",
+  "run_id": "demo-v2-20260724T083214398Z",
+  "symbol": "XRPUSDT",
+  "side": "SELL",
+  "entry_order_id": "59b90a0d-cc60-44d9-82bf-12f3e8943855",
+  "order_link_id": "bybot-31916b-e-f7022a3c17a66d2c0395",
+  "close_order_id": "12e13ba8-ffce-422f-91af-29741b357477",
+  "entry_execution_id": "98d26202-8996-4d7d-9c5a-380e1a2fe3a4",
+  "close_execution_id": "d150c46d-5329-4026-9ed6-74fb08856106",
+  "quantity": "92",
+  "entry_price": "1.088",
+  "close_price": "1.0909",
+  "entry_fee": "0.0550528",
+  "close_fee": "0.05519954",
+  "close_source": "stop_loss",
+  "initial_close_state": "DEMO_POSITION_OPEN"
+}
