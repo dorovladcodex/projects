@@ -800,6 +800,13 @@ class DemoExecutionService:
         self.complete_fills = 0
         self.bot_owned_open_orders = 0
         self.unrelated_open_orders = 0
+        self.bot_owned_active_orders = 0
+        self.bot_owned_pending_cancel_orders = 0
+        self.bot_owned_terminal_residual_orders = 0
+        self.confirmed_unrelated_orders = 0
+        self.ownership_conflicts = 0
+        self.order_snapshot_at: datetime | None = None
+        self._status_lock = RLock()
         self.bot_owned_open_positions = 0
         self.account_verified = False
         self.account_verified_at: datetime | None = None
@@ -1619,6 +1626,8 @@ class DemoExecutionService:
             return False
         if any(
             str(item.get("symbol") or "") == record.symbol.value
+            and str(item.get("orderId") or "")
+            not in {record.tp_order_id, record.sl_order_id}
             for item in realtime
         ):
             return False
@@ -1811,7 +1820,17 @@ class DemoExecutionService:
             if record.failure_reason
             else DemoExecutionState.DEMO_CLOSED
         )
-        record.cleanup_result = "remote position flat and bot-owned orders zero"
+        residual_ids = {
+            str(item.get("orderId") or "")
+            for item in realtime
+            if str(item.get("orderId") or "")
+            in {record.tp_order_id, record.sl_order_id}
+        }
+        record.cleanup_result = (
+            "remote position flat; exact protection cancellation pending"
+            if residual_ids
+            else "remote position flat and bot-owned orders zero"
+        )
         record.last_error = None
         record.closed_at = max(fill.executed_at for fill in record.close_fills)
         record.updated_at = datetime.now(timezone.utc)
@@ -1851,6 +1870,8 @@ class DemoExecutionService:
             )
             or any(
                 str(item.get("symbol") or "") == record.symbol.value
+                and str(item.get("orderId") or "")
+                not in {record.tp_order_id, record.sl_order_id}
                 for item in realtime
             )
         ):
@@ -1923,7 +1944,17 @@ class DemoExecutionService:
             if record.failure_reason
             else DemoExecutionState.DEMO_CLOSED
         )
-        record.cleanup_result = "remote position flat and bot-owned orders zero"
+        residual_ids = {
+            str(item.get("orderId") or "")
+            for item in realtime
+            if str(item.get("orderId") or "")
+            in {record.tp_order_id, record.sl_order_id}
+        }
+        record.cleanup_result = (
+            "remote position flat; exact protection cancellation pending"
+            if residual_ids
+            else "remote position flat and bot-owned orders zero"
+        )
         record.last_error = None
         record.updated_at = datetime.now(timezone.utc)
         terminalizer = getattr(self.repository, "terminalize_demo_execution", None)
@@ -2079,6 +2110,188 @@ class DemoExecutionService:
             "exchange_mutations_performed": False,
         }
 
+    def _publish_order_ownership_snapshot(
+        self,
+        classification: dict[str, list[dict[str, Any]]],
+        positions: list[dict[str, Any]],
+        *,
+        captured_at: datetime,
+    ) -> None:
+        active = classification["bot_owned_active"]
+        pending = classification["bot_owned_pending_cancel"]
+        residual = classification["bot_owned_terminal_residual"]
+        unrelated = classification["unrelated_external"]
+        conflicts = classification["ownership_conflicts"]
+        active_positions = [
+            item
+            for item in positions
+            if _decimal(item.get("size"), default="0") > 0
+        ]
+        local = self.repository.load_demo_executions()
+        active_owned_symbols = {
+            item.symbol.value
+            for item in local
+            if item.state not in TERMINAL_DEMO_STATES
+        }
+        symbol_counts: dict[str, int] = {}
+        for order in [*active, *pending, *residual, *unrelated, *conflicts]:
+            symbol = str(order.get("symbol") or "")
+            if symbol:
+                symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
+        with self._status_lock:
+            self.bot_owned_active_orders = len(active)
+            self.bot_owned_pending_cancel_orders = len(pending)
+            self.bot_owned_terminal_residual_orders = len(residual)
+            self.confirmed_unrelated_orders = len(unrelated)
+            self.ownership_conflicts = len(conflicts)
+            self.bot_owned_open_orders = len(active) + len(pending) + len(residual)
+            self.unrelated_open_orders = len(unrelated) + len(conflicts)
+            self.bot_owned_open_positions = sum(
+                str(item.get("symbol") or "") in active_owned_symbols
+                for item in active_positions
+            )
+            self.symbol_open_order_counts = symbol_counts
+            self.order_snapshot_at = captured_at
+            self.last_reconciliation_at = captured_at
+
+    def _cancel_terminal_protection_residuals(
+        self,
+        records: list[DemoExecutionRecord],
+        remote_orders: list[dict[str, Any]],
+        positions: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        terminal = [
+            record
+            for record in records
+            if record.state in TERMINAL_DEMO_STATES
+            and (record.tp_order_id or record.sl_order_id)
+        ]
+        if not terminal:
+            return remote_orders, positions
+        timeout = float(
+            getattr(
+                self.settings,
+                "demo_terminal_residual_cancel_timeout_seconds",
+                5.0,
+            )
+        )
+        classification = classify_demo_order_ownership(
+            remote_orders,
+            records,
+            positions,
+            terminal_residual_timeout_seconds=timeout,
+            bot_order_link_prefix=f"{self.settings.demo_order_link_prefix}-",
+        )
+        exact_ids = {
+            str(order.get("orderId") or "")
+            for order in [
+                *classification["bot_owned_pending_cancel"],
+                *classification["bot_owned_terminal_residual"],
+            ]
+            if order.get("orderId")
+        }
+        if not exact_ids:
+            return remote_orders, positions
+        self._publish_order_ownership_snapshot(
+            classification,
+            positions,
+            captured_at=datetime.now(timezone.utc),
+        )
+        by_id = {
+            str(order.get("orderId") or ""): order for order in remote_orders
+        }
+        requested: set[str] = set()
+        request_audited: set[str] = set()
+        deadline = time.monotonic() + timeout
+        while exact_ids and time.monotonic() < deadline:
+            for record in terminal:
+                record_ids = {
+                    value
+                    for value in (record.tp_order_id, record.sl_order_id)
+                    if value and value in exact_ids
+                }
+                if not record_ids:
+                    continue
+                if any(
+                    str(item.get("symbol") or "") == record.symbol.value
+                    and _decimal(item.get("size"), default="0") > 0
+                    for item in positions
+                ):
+                    continue
+                for order_id in sorted(record_ids - requested):
+                    order = by_id.get(order_id)
+                    if order is None or not _is_execution_owned_open_order(
+                        order, record
+                    ):
+                        continue
+                    try:
+                        self.client.cancel_order(record.symbol, order_id)
+                    except DemoExchangeError:
+                        # "Already gone" and propagation races are decided only
+                        # by the subsequent authoritative GET.
+                        pass
+                    requested.add(order_id)
+                if record_ids & requested and str(record.id) not in request_audited:
+                    record.last_protection_verification = {
+                        "result": "TERMINAL_RESIDUAL_CANCEL_REQUESTED",
+                        "order_ids": sorted(record_ids & requested),
+                        "requested_at": datetime.now(timezone.utc).isoformat(),
+                        "emergency_cleanup": False,
+                    }
+                    self.repository.save_demo_execution(
+                        record,
+                        event_type="DEMO_PROTECTION_RESIDUAL_CANCEL_REQUESTED",
+                    )
+                    request_audited.add(str(record.id))
+            time.sleep(0.25)
+            remote_orders = self.client.get_open_orders(settle_coin="USDT")
+            positions = self.client.get_positions(settle_coin="USDT")
+            by_id = {
+                str(order.get("orderId") or ""): order
+                for order in remote_orders
+            }
+            exact_ids &= set(by_id)
+        if exact_ids:
+            reason = (
+                "terminal protection residual cancellation timeout: "
+                + ", ".join(sorted(exact_ids))
+            )
+            self.reconciliation_incidents += 1
+            self._activate_kill_switch(reason)
+            for record in terminal:
+                if exact_ids & {
+                    record.tp_order_id,
+                    record.sl_order_id,
+                }:
+                    record.last_error = reason
+                    self.repository.save_demo_execution(
+                        record,
+                        event_type="DEMO_PROTECTION_RESIDUAL_CANCEL_TIMEOUT",
+                    )
+        elif requested:
+            for record in terminal:
+                record_ids = {
+                    value
+                    for value in (record.tp_order_id, record.sl_order_id)
+                    if value
+                }
+                if record_ids & requested:
+                    record.cleanup_result = (
+                        "remote position flat and bot-owned orders zero"
+                    )
+                    record.last_error = None
+                    record.last_protection_verification = {
+                        "result": "TERMINAL_RESIDUAL_CANCEL_VERIFIED",
+                        "order_ids": sorted(record_ids & requested),
+                        "verified_at": datetime.now(timezone.utc).isoformat(),
+                        "emergency_cleanup": False,
+                    }
+                    self.repository.save_demo_execution(
+                        record,
+                        event_type="DEMO_PROTECTION_RESIDUAL_CANCEL_VERIFIED",
+                    )
+        return remote_orders, positions
+
     def reconcile(self) -> dict[str, Any]:
         if not self.enabled or self.client is None:
             return {"status": "DISABLED"}
@@ -2098,7 +2311,6 @@ class DemoExecutionService:
         history = self.client.get_order_history(settle_coin="USDT")
         executions = self.client.get_executions(settle_coin="USDT")
         closed_pnl = self.client.get_closed_pnl(settle_coin="USDT")
-        self.last_reconciliation_at = datetime.now(timezone.utc)
         local = self.repository.load_demo_executions()
         unexpected_errors: list[Exception] = []
         for record in list(local):
@@ -2120,21 +2332,6 @@ class DemoExecutionService:
             if link
         }
         bot_prefix = f"{self.settings.demo_order_link_prefix}-"
-        owned_protection_ids = {
-            str(order.get("orderId") or "")
-            for order in remote_orders
-            if any(
-                _is_owned_bybit_protection_order(order, record, positions)
-                for record in local
-                if record.state == DemoExecutionState.DEMO_POSITION_OPEN
-            )
-        }
-        self.bot_owned_open_orders = sum(
-            str(item.get("orderLinkId") or "").startswith(bot_prefix)
-            or str(item.get("orderId") or "") in owned_protection_ids
-            for item in remote_orders
-        )
-        self.unrelated_open_orders = len(remote_orders) - self.bot_owned_open_orders
         remote_by_link: dict[str, list[dict[str, Any]]] = {}
         for order in [*remote_orders, *history]:
             link = str(order.get("orderLinkId") or "")
@@ -2188,16 +2385,6 @@ class DemoExecutionService:
                 self.reconciliation_incidents += 1
                 self._activate_kill_switch("local Demo order is missing remotely")
         active_positions = [p for p in positions if _decimal(p.get("size"), default="0") > 0]
-        active_owned_symbols = {
-            item.symbol.value for item in local
-            if item.state not in {
-                *TERMINAL_DEMO_STATES,
-            }
-        }
-        self.bot_owned_open_positions = sum(
-            str(item.get("symbol") or "") in active_owned_symbols
-            for item in active_positions
-        )
         for position in active_positions:
             symbol = str(position.get("symbol") or "")
             owned = next(
@@ -2256,11 +2443,41 @@ class DemoExecutionService:
                 )
                 record.updated_at = datetime.now(timezone.utc)
                 self.repository.save_demo_execution(record, event_type="REST_POSITION_RECONCILED")
+        local = self.repository.load_demo_executions()
+        remote_orders, positions = self._cancel_terminal_protection_residuals(
+            local,
+            remote_orders,
+            positions,
+        )
+        classification = classify_demo_order_ownership(
+            remote_orders,
+            local,
+            positions,
+            terminal_residual_timeout_seconds=float(
+                self.settings.demo_terminal_residual_cancel_timeout_seconds
+            ),
+            bot_order_link_prefix=f"{self.settings.demo_order_link_prefix}-",
+        )
+        captured_at = datetime.now(timezone.utc)
+        self._publish_order_ownership_snapshot(
+            classification,
+            positions,
+            captured_at=captured_at,
+        )
         result = {
             "status": "OK" if not self.kill_switch_active else "BLOCKED",
             "remote_orders": len(remote_orders),
             "bot_owned_open_orders": self.bot_owned_open_orders,
             "unrelated_open_orders": self.unrelated_open_orders,
+            "bot_owned_active_orders": self.bot_owned_active_orders,
+            "bot_owned_pending_cancel_orders": (
+                self.bot_owned_pending_cancel_orders
+            ),
+            "bot_owned_terminal_residual_orders": (
+                self.bot_owned_terminal_residual_orders
+            ),
+            "confirmed_unrelated_orders": self.confirmed_unrelated_orders,
+            "ownership_conflicts": self.ownership_conflicts,
             "remote_positions": len(active_positions),
             "incidents": self.reconciliation_incidents,
             "open_orders_by_symbol": dict(self.symbol_open_order_counts),
@@ -2642,7 +2859,7 @@ class DemoExecutionService:
                     self._submit_reduce_only_close(
                         current,
                         current.accepted_quantity,
-                        "canary_close",
+                        "invalidated_setup",
                         preserve_transition_state=True,
                     )
                     deadline = time.monotonic() + 20
@@ -3244,12 +3461,28 @@ class DemoExecutionService:
             max(_aware(value) for value in active_remote_watermarks)
             if active_remote_watermarks else None
         )
+        with self._status_lock:
+            order_snapshot_at = self.order_snapshot_at
+            last_reconciliation_at = self.last_reconciliation_at
+            bot_owned_active_orders = self.bot_owned_active_orders
+            bot_owned_pending_cancel_orders = (
+                self.bot_owned_pending_cancel_orders
+            )
+            bot_owned_terminal_residual_orders = (
+                self.bot_owned_terminal_residual_orders
+            )
+            confirmed_unrelated_orders = self.confirmed_unrelated_orders
+            ownership_conflicts = self.ownership_conflicts
+            bot_owned_open_orders = self.bot_owned_open_orders
+            unrelated_open_orders = self.unrelated_open_orders
+            bot_owned_open_positions = self.bot_owned_open_positions
+            symbol_open_order_counts = dict(self.symbol_open_order_counts)
         remote_state_authoritative = bool(
             not self.reconciliation_in_progress
-            and self.last_reconciliation_at is not None
+            and last_reconciliation_at is not None
             and (
                 latest_active_remote_watermark is None
-                or _aware(self.last_reconciliation_at)
+                or _aware(last_reconciliation_at)
                 >= latest_active_remote_watermark
             )
         )
@@ -3273,8 +3506,8 @@ class DemoExecutionService:
             "websocket_connected": self.websocket_connected,
             "websocket_reconnects": self.websocket_reconnects,
             "reconciliation_incidents": self.reconciliation_incidents,
-            "symbol_open_order_counts": dict(self.symbol_open_order_counts),
-            "open_orders_by_symbol": dict(self.symbol_open_order_counts),
+            "symbol_open_order_counts": symbol_open_order_counts,
+            "open_orders_by_symbol": symbol_open_order_counts,
             "usdt_order_reconciliation_ok": self.usdt_order_reconciliation_ok,
             "usdt_position_reconciliation_ok": self.usdt_position_reconciliation_ok,
             "usdt_order_reconciliation": (
@@ -3289,9 +3522,27 @@ class DemoExecutionService:
             "partial_fills": self.partial_fills,
             "complete_fills": self.complete_fills,
             "states": counts,
-            "bot_owned_open_orders": self.bot_owned_open_orders,
-            "unrelated_open_orders": self.unrelated_open_orders,
-            "bot_owned_open_positions": self.bot_owned_open_positions,
+            "bot_owned_open_orders": bot_owned_open_orders,
+            "bot_owned_active_orders": bot_owned_active_orders,
+            "bot_owned_pending_cancel_orders": bot_owned_pending_cancel_orders,
+            "bot_owned_terminal_residual_orders": (
+                bot_owned_terminal_residual_orders
+            ),
+            "confirmed_unrelated_orders": confirmed_unrelated_orders,
+            "ownership_conflicts": ownership_conflicts,
+            "unrelated_open_orders": unrelated_open_orders,
+            "bot_owned_open_positions": bot_owned_open_positions,
+            "order_snapshot_age_ms": (
+                max(
+                    0.0,
+                    (
+                        datetime.now(timezone.utc) - _aware(order_snapshot_at)
+                    ).total_seconds()
+                    * 1000,
+                )
+                if order_snapshot_at
+                else None
+            ),
             "remote_state_authoritative": remote_state_authoritative,
             "remote_state_snapshot_state": remote_state_snapshot_state,
             "reconciliation_in_progress": self.reconciliation_in_progress,
@@ -3309,8 +3560,8 @@ class DemoExecutionService:
             "run_id": self.run_id,
             "order_link_prefix": self.order_prefix,
             "last_reconciliation_at": (
-                self.last_reconciliation_at.isoformat()
-                if self.last_reconciliation_at else None
+                last_reconciliation_at.isoformat()
+                if last_reconciliation_at else None
             ),
             "sleep_resume_reconciliations": self.sleep_resume_reconciliations,
             "terminalization_retry_warnings": self.terminalization_retry_warnings,
@@ -4342,6 +4593,98 @@ def _is_execution_owned_open_order(
     return expected_trigger is not None and _decimal(
         order.get("triggerPrice"), default="0"
     ) == expected_trigger
+
+
+def classify_demo_order_ownership(
+    orders: list[dict[str, Any]],
+    executions: list[DemoExecutionRecord],
+    positions: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+    terminal_residual_timeout_seconds: float = 5.0,
+    bot_order_link_prefix: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Classify an authoritative open-order snapshot without symbol-only ownership."""
+
+    current = _aware(now or datetime.now(timezone.utc))
+    result = {
+        "bot_owned_active": [],
+        "bot_owned_pending_cancel": [],
+        "bot_owned_terminal_residual": [],
+        "unrelated_external": [],
+        "ownership_conflicts": [],
+    }
+    identities: dict[str, list[tuple[DemoExecutionRecord, str]]] = {}
+    links: dict[str, list[DemoExecutionRecord]] = {}
+    for execution in executions:
+        for role, order_id in (
+            ("entry", execution.order_id),
+            ("close", execution.close_order_id),
+            ("take_profit", execution.tp_order_id),
+            ("stop_loss", execution.sl_order_id),
+        ):
+            if order_id:
+                identities.setdefault(str(order_id), []).append((execution, role))
+        for link in (execution.order_link_id, execution.close_order_link_id):
+            if link:
+                links.setdefault(str(link), []).append(execution)
+
+    for order in orders:
+        order_id = str(order.get("orderId") or "")
+        order_link = str(order.get("orderLinkId") or "")
+        exact = identities.get(order_id, []) if order_id else []
+        exact_links = links.get(order_link, []) if order_link else []
+        exact_execution_ids = {
+            str(execution.id) for execution, _role in exact
+        } | {str(execution.id) for execution in exact_links}
+        if len(exact_execution_ids) > 1:
+            result["ownership_conflicts"].append(order)
+            continue
+        if exact:
+            execution, role = exact[0]
+            if execution.state in TERMINAL_DEMO_STATES:
+                closed_at = execution.closed_at or execution.updated_at
+                age = max(0.0, (current - _aware(closed_at)).total_seconds())
+                key = (
+                    "bot_owned_pending_cancel"
+                    if role in {"take_profit", "stop_loss"}
+                    and age <= terminal_residual_timeout_seconds
+                    else "bot_owned_terminal_residual"
+                )
+                result[key].append(order)
+            else:
+                result["bot_owned_active"].append(order)
+            continue
+        if len(exact_links) == 1:
+            execution = exact_links[0]
+            key = (
+                "bot_owned_terminal_residual"
+                if execution.state in TERMINAL_DEMO_STATES
+                else "bot_owned_active"
+            )
+            result[key].append(order)
+            continue
+        if (
+            bot_order_link_prefix
+            and order_link.startswith(bot_order_link_prefix)
+        ):
+            # A bot-shaped identity with no durable owner is unsafe, but it is
+            # not a manual/unrelated order and must be reported distinctly.
+            result["ownership_conflicts"].append(order)
+            continue
+        generated_matches = [
+            execution
+            for execution in executions
+            if execution.state not in TERMINAL_DEMO_STATES
+            and _is_owned_bybit_protection_order(order, execution, positions)
+        ]
+        if len(generated_matches) == 1:
+            result["bot_owned_active"].append(order)
+        elif len(generated_matches) > 1:
+            result["ownership_conflicts"].append(order)
+        else:
+            result["unrelated_external"].append(order)
+    return result
 
 
 def _is_owned_bybit_protection_order(

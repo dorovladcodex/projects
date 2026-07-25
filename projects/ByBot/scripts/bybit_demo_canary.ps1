@@ -823,6 +823,8 @@ try {
             "Exact race close order ID is missing"
         Assert-Condition (@($race.execution.close_fills).Count -gt 0) `
             "Exact race close fill is missing"
+        Assert-Condition ($race.execution.exit_attribution -eq "strategy_exit") `
+            "Post-close protection canary did not use strategy_exit attribution"
         Write-Host "DEMO FLAT-DURING-PROTECTION HANDOFF: PASS"
     }
 

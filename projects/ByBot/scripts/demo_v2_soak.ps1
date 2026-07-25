@@ -323,6 +323,27 @@ function Wait-UvicornReady {
     throw ('FastAPI did not become ready within ' + $TimeoutSeconds + ' seconds.')
 }
 
+function Assert-AuthoritativeOrderOwnership {
+    param([string]$BaseUrl)
+    $demo = Invoke-RestMethod ($BaseUrl + '/demo/status') -TimeoutSec 3
+    $confirmed = [int]$demo.confirmed_unrelated_orders
+    $conflicts = [int]$demo.ownership_conflicts
+    if ($confirmed -eq 0 -and $conflicts -eq 0) { return }
+
+    # Never fail from a cached mixed-age snapshot.  The production
+    # reconciliation path performs exact-ID ownership and bounded exact
+    # protection cancellation before publishing one atomic status snapshot.
+    $null = Invoke-RestMethod ($BaseUrl + '/demo/reconcile') `
+        -Method Post -TimeoutSec 15
+    $demo = Invoke-RestMethod ($BaseUrl + '/demo/status') -TimeoutSec 3
+    if ([int]$demo.ownership_conflicts -gt 0) {
+        throw 'Authoritative Demo ownership conflict detected.'
+    }
+    if ([int]$demo.confirmed_unrelated_orders -gt 0) {
+        throw 'Authoritative unrelated Demo order detected.'
+    }
+}
+
 function Invoke-FinalValidation {
     if ($script:finalValidationRan) { return }
     $script:finalValidationRan = $true
@@ -443,6 +464,7 @@ try {
             }
             try {
                 $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 3
+                Assert-AuthoritativeOrderOwnership -BaseUrl $base
                 Write-Host ("{0:u} symbols={1} signals={2} open={3} kill={4}" -f [DateTime]::UtcNow,$status.accepted_symbols.Count,$status.signal_count,$status.open_reservations,$status.kill_switch_active)
                 if ($status.kill_switch_active) { Write-Warning 'Kill switch active; no reset will be attempted.' }
             } catch { Write-Warning 'Transient status failure; durable reconciliation remains authoritative.' }
@@ -459,6 +481,7 @@ try {
             }
             try {
                 $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 3
+                Assert-AuthoritativeOrderOwnership -BaseUrl $base
                 Write-Host (
                     "{0:u} phase={1} active={2} drain_remaining={3}" -f `
                     [DateTime]::UtcNow,$status.run_phase,`

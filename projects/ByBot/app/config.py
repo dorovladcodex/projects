@@ -124,6 +124,9 @@ class Settings(BaseSettings):
     )
     demo_reconciliation_interval_seconds: int = Field(default=15, ge=5, le=300)
     demo_order_confirmation_timeout_seconds: int = Field(default=30, ge=5, le=300)
+    demo_terminal_residual_cancel_timeout_seconds: float = Field(
+        default=5.0, ge=1.0, le=30.0
+    )
 
     # V2 is an explicit, Demo-only runtime. Defaults never submit an order.
     v2_enabled: bool = False

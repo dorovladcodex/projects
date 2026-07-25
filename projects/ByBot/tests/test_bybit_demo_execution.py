@@ -1461,9 +1461,11 @@ def test_reconciliation_uses_usdt_scope_and_keeps_unrelated_visibility() -> None
     assert client.execution_scopes == [(None, "USDT")]
     assert client.closed_pnl_scopes == [(None, "USDT")]
     assert client.position_scopes == [(None, "USDT")]
-    assert result["bot_owned_open_orders"] == 1
-    assert result["unrelated_open_orders"] == 1
-    assert demo.as_status()["unrelated_open_orders"] == 1
+    assert result["bot_owned_open_orders"] == 0
+    assert result["confirmed_unrelated_orders"] == 1
+    assert result["ownership_conflicts"] == 1
+    assert result["unrelated_open_orders"] == 2
+    assert demo.as_status()["unrelated_open_orders"] == 2
     assert client.orders == []
 
 

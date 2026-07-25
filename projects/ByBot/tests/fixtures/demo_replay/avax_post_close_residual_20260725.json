@@ -1,0 +1,53 @@
+{
+  "run_id": "demo-v2-20260725T165509579Z",
+  "execution_id": "a4bcfabe-d6ca-4894-ac80-5c79ec82daf4",
+  "candidate_id": "fbe13408-f8ed-464a-98c9-506e2ee82202",
+  "symbol": "AVAXUSDT",
+  "side": "SELL",
+  "state": "DEMO_CLOSED",
+  "accepted_quantity": "15.1",
+  "entry_order_id": "1cd5c198-1b1e-4a9d-9f95-4cbc87566203",
+  "close_order_id": "f9eb2b8a-bc9f-47bf-857f-a9f0aeab1ec0",
+  "closed_at": "2026-07-25T17:08:16.175Z",
+  "protection_orders": [
+    {
+      "orderId": "72de70fb-5f45-4a75-b4f3-2acd54e852a5",
+      "orderLinkId": "",
+      "symbol": "AVAXUSDT",
+      "side": "Buy",
+      "orderType": "Market",
+      "reduceOnly": true,
+      "closeOnTrigger": true,
+      "positionIdx": 0,
+      "stopOrderType": "TakeProfit",
+      "createType": "CreateByTakeProfit",
+      "triggerPrice": "6.606",
+      "qty": "15.1",
+      "createdTime": "1784999013359",
+      "updatedTime": "1784999296175",
+      "orderStatus": "Untriggered"
+    },
+    {
+      "orderId": "8f443f0c-3cfa-4bc2-9b7a-b41cb36d2992",
+      "orderLinkId": "",
+      "symbol": "AVAXUSDT",
+      "side": "Buy",
+      "orderType": "Market",
+      "reduceOnly": true,
+      "closeOnTrigger": true,
+      "positionIdx": 0,
+      "stopOrderType": "StopLoss",
+      "createType": "CreateByStopLoss",
+      "triggerPrice": "6.673",
+      "qty": "15.1",
+      "createdTime": "1784999013359",
+      "updatedTime": "1784999296175",
+      "orderStatus": "Untriggered"
+    }
+  ],
+  "terminal_history": {
+    "orderStatus": "Deactivated",
+    "cancelType": "CancelByTpSlTsClear",
+    "updatedTime": "1784999296175"
+  }
+}
