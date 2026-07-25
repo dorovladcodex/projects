@@ -7,6 +7,7 @@ param(
     [switch]$ExerciseTrailingUpdate,
     [switch]$ExerciseFlatDuringProtectionRace,
     [switch]$EnterDrainBeforeFlatRace,
+    [switch]$ExerciseDepthGate,
     [ValidateSet(0, 100, 200)]
     [int]$V2SizingTier = 0,
     [switch]$SkipControlledRestart,
@@ -585,6 +586,30 @@ try {
             (@($v2Preflight.blockers) -join "; ")
         )
         Write-Host "V2 EXECUTION PREFLIGHT: PASS"
+    }
+    if ($ExerciseDepthGate) {
+        Assert-Condition ($V2SizingTier -eq 100) `
+            "Depth-gate canary requires V2SizingTier 100"
+        $depthGate = Invoke-Api -Method "POST" `
+            -Path "/v2/canary/depth-gate/$Symbol" -TimeoutSec 90
+        Assert-Condition (
+            $depthGate.rejection_code -eq "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT"
+        ) "Stage A did not produce the expected final-depth rejection"
+        Assert-Condition ($depthGate.execution_created -eq $false) `
+            "Stage A created a durable Demo execution"
+        Assert-Condition (
+            $depthGate.exchange_order_submission_invoked -eq $false
+        ) "Stage A invoked exchange order submission"
+        Assert-Condition (
+            $depthGate.reservation_release_result -eq "RELEASED" -and
+            $depthGate.reservation_state -eq "RELEASED"
+        ) "Stage A reservation was not released exactly once"
+        Assert-Condition (
+            [int]$depthGate.cycle_failures_after -eq
+            [int]$depthGate.cycle_failures_before
+        ) "Stage A created a cycle failure"
+        Write-Host "DEPTH GATE STAGE A REJECTION: PASS"
+        Write-Host "DEPTH GATE STAGE A RESERVATION RELEASE: PASS"
     }
     $initialUnrelatedOrders = [int]$demo.unrelated_open_orders
     Write-Host "DEMO ACCOUNT VERIFIED: PASS"

@@ -287,16 +287,27 @@ class PortfolioRiskService:
         *,
         closed_at: datetime | None = None,
         activate_cooldown: bool = True,
-    ) -> None:
+    ) -> bool:
         current = closed_at or datetime.now(timezone.utc)
-        item = self._transition(reservation_id, ReservationState.RELEASED)
-        if item:
+        with self._global_lock:
+            item = next(
+                (
+                    row for row in self.reservations
+                    if str(row.id) == str(reservation_id)
+                ),
+                None,
+            )
+            if item is None or item.state == ReservationState.RELEASED:
+                return False
+            item.state = ReservationState.RELEASED
             item.released_at = current
             if activate_cooldown and item.execution_id is not None:
                 self.symbol_cooldown_until[item.symbol] = current + timedelta(
                     seconds=self.settings.v2_symbol_cooldown_seconds
                 )
-            updater = getattr(self.repository, "update_v2_portfolio_reservation", None)
+            updater = getattr(
+                self.repository, "update_v2_portfolio_reservation", None
+            )
             if callable(updater):
                 updater(item)
             if not activate_cooldown and item.execution_id is None:
@@ -308,6 +319,7 @@ class PortfolioRiskService:
                     max(remaining_entries) if remaining_entries else None
                 )
             self._persist_state()
+            return True
 
     def apply_realized_pnl(self, pnl: Decimal, peak_equity: Decimal, equity: Decimal) -> None:
         """Backward-compatible manual ledger update used by older callers."""
@@ -412,6 +424,10 @@ class PortfolioRiskService:
         with self._global_lock:
             item = next((row for row in self.reservations if str(row.id) == str(reservation_id)), None)
             if item is None:
+                return None
+            if item.state == state and (
+                execution_id is None or str(item.execution_id) == str(execution_id)
+            ):
                 return None
             item.state = state
             if execution_id is not None:

@@ -184,6 +184,9 @@ class V2ReportGenerator:
         signal_metrics.setdefault("pre_execution_admissions", 0)
         signal_metrics.setdefault("persistence_rejections", 0)
         signal_metrics.setdefault("execution_policy_rejections", 0)
+        signal_metrics.setdefault("pre_submit_rejections", 0)
+        signal_metrics.setdefault("final_depth_rejections", 0)
+        signal_metrics.setdefault("pre_submit_rejections_by_code", {})
         signal_metrics.setdefault("cooldown_rejections", 0)
         signal_metrics.setdefault(
             "admitted_signals", sum(bool(item.get("admitted")) for item in signals)
@@ -266,6 +269,15 @@ class V2ReportGenerator:
             "persistence_rejections": persistence_rejections,
             "execution_policy_rejections": signal_metrics.get(
                 "execution_policy_rejections", 0
+            ),
+            "pre_submit_rejections": signal_metrics.get(
+                "pre_submit_rejections", 0
+            ),
+            "final_depth_rejections": signal_metrics.get(
+                "final_depth_rejections", 0
+            ),
+            "pre_submit_rejections_by_code": signal_metrics.get(
+                "pre_submit_rejections_by_code", {}
             ),
             "cooldown_rejections": signal_metrics.get("cooldown_rejections", 0),
             "admitted_signals": signal_metrics.get(
@@ -387,6 +399,27 @@ def _rejection_row(item: dict[str, Any]) -> dict[str, Any]:
         "rejection_reason": item.get("rejection_reason") or item.get("reason"),
     }
     row.update(_sizing_row(item.get("sizing") or {}))
+    audit = item.get("pre_submit_rejection") or {}
+    row.update({
+        "pre_submit_rejection_code": audit.get("code"),
+        "pre_submit_requested_notional_usdt": audit.get(
+            "requested_notional_usdt"
+        ),
+        "pre_submit_minimum_notional_usdt": audit.get(
+            "minimum_notional_usdt"
+        ),
+        "pre_submit_available_depth_notional_usdt": audit.get(
+            "available_depth_notional_usdt"
+        ),
+        "pre_submit_executable_depth_notional_usdt": audit.get(
+            "executable_depth_notional_usdt"
+        ),
+        "pre_submit_slippage_limit_bps": audit.get("slippage_limit_bps"),
+        "pre_submit_snapshot_source": audit.get("snapshot_source"),
+        "pre_submit_snapshot_timestamp": audit.get("snapshot_timestamp"),
+        "pre_submit_snapshot_age_seconds": audit.get("snapshot_age_seconds"),
+        "reservation_release_result": audit.get("reservation_release_result"),
+    })
     return row
 
 

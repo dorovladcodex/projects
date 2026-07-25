@@ -180,17 +180,31 @@ class V2Runtime:
                 "pre_execution_admissions": 0,
                 "persistence_rejections": 0,
                 "execution_policy_rejections": 0,
+                "pre_submit_rejections": 0,
+                "final_depth_rejections": 0,
+                "pre_submit_rejections_by_code": {},
                 "cooldown_rejections": 0,
                 "admitted_signals": 0,
                 "by_strategy": {},
                 "by_symbol": {},
             }
         )
+        for name, default in (
+            ("pre_submit_rejections", 0),
+            ("final_depth_rejections", 0),
+            ("pre_submit_rejections_by_code", {}),
+        ):
+            self.signal_metrics.setdefault(name, default)
         self._candidate_signatures: dict[str, datetime] = {}
         for restored_candidate in self.candidates:
             self._candidate_signatures[_candidate_signature(restored_candidate)] = (
                 restored_candidate.created_at
             )
+        self._handled_pre_submit_rejections = {
+            str(item.id)
+            for item in self.candidates
+            if item.pre_submit_rejection is not None
+        }
         self._status_lock = RLock()
         self._status_snapshot: dict[str, Any] = {
             "enabled": settings.v2_enabled,
@@ -875,12 +889,81 @@ class V2Runtime:
                     result, stage="demo_execution", cycle_id=cycle_id,
                     symbol=candidate.symbol, strategy=candidate.strategy_name.value,
                 )
+            elif isinstance(result, dict) and result.get("handled_pre_submit_rejection"):
+                self._record_pre_submit_rejection(candidate, result)
             elif isinstance(result, dict) and result.get("handled_policy_rejection"):
                 self._record_execution_policy_rejection(candidate, result)
             elif isinstance(result, dict) and result.get("handled_persistence_rejection"):
                 self._record_execution_persistence_rejection(candidate, result)
             elif isinstance(result, dict) and result.get("execution_id"):
                 self._record_signal_metric("admitted_signals", candidate)
+
+    def _record_pre_submit_rejection(
+        self,
+        candidate: V2SignalCandidate,
+        result: dict[str, Any],
+    ) -> None:
+        rejected_at = _aware_utc_datetime(result.get("rejected_at"))
+        code = str(result.get("rejection_code") or "FINAL_MARKET_REJECTED")
+        candidate_key = str(candidate.id)
+        if candidate_key in self._handled_pre_submit_rejections:
+            return
+        incident = V2Incident(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"bybot-v2-pre-submit-rejection:{self.run_id}:{candidate.id}",
+            ),
+            run_id=self.run_id,
+            event_type="PRE_SUBMIT_ENTRY_REJECTED",
+            symbol=candidate.symbol,
+            candidate_id=candidate.id,
+            error_category=code,
+            payload={
+                "candidate_id": str(candidate.id),
+                "signal_id": result.get("signal_id"),
+                "reservation_id": result.get("reservation_id"),
+                "execution_id": None,
+                "symbol": candidate.symbol.value,
+                "strategy": candidate.strategy_name.value,
+                "rejection_code": code,
+                "rejection_message": result.get("rejection_message"),
+                "processing_stage": "final_pre_submit_market_gate",
+                "pre_submit_audit": result.get("pre_submit_audit") or {},
+                "reservation_release_result": result.get(
+                    "reservation_release_result"
+                ),
+                "exchange_mutation_performed": False,
+                "exchange_order_submission_invoked": False,
+                "rejected_at": rejected_at.isoformat(),
+            },
+            occurred_at=rejected_at,
+        )
+        if not self.repository.save_v2_incident(incident):
+            raise RuntimeError("pre-submit rejection incident persistence failed")
+        self._handled_pre_submit_rejections.add(candidate_key)
+        self._record_signal_metric("pre_submit_rejections", candidate)
+        if code in {
+            "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT",
+            "FINAL_EXECUTABLE_DEPTH_MISSING",
+        }:
+            self._record_signal_metric("final_depth_rejections", candidate)
+        by_code = self.signal_metrics.setdefault("pre_submit_rejections_by_code", {})
+        by_code[code] = int(by_code.get(code) or 0) + 1
+        self.logger.info(
+            "V2 final pre-submit rejected candidate: %s",
+            result.get("rejection_message"),
+            extra={
+                "event_timestamp": rejected_at,
+                "run_id": self.run_id,
+                "candidate_id": str(candidate.id),
+                "strategy": candidate.strategy_name.value,
+                "symbol": candidate.symbol.value,
+                "event_type": "PRE_SUBMIT_ENTRY_REJECTED",
+                "execution_environment": "BYBIT_DEMO",
+                "error_category": code,
+                "processing_stage": "final_pre_submit_market_gate",
+            },
+        )
 
     def _record_execution_persistence_rejection(
         self,

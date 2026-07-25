@@ -201,6 +201,28 @@ class V2SizingDecision(BaseModel):
     rejection_code: str | None = None
 
 
+class PreSubmitRejectionAudit(BaseModel):
+    """Durable evidence for an expected no-mutation entry rejection."""
+
+    code: str
+    message: str
+    requested_notional_usdt: Decimal
+    minimum_notional_usdt: Decimal
+    minimum_orderbook_depth_usdt: Decimal
+    available_depth_quantity: Decimal | None = None
+    available_depth_notional_usdt: Decimal | None = None
+    executable_depth_notional_usdt: Decimal | None = None
+    slippage_limit_bps: Decimal
+    depth_window_bps: Decimal = Decimal("10")
+    snapshot_source: str
+    snapshot_timestamp: datetime | None = None
+    source_timestamp: datetime | None = None
+    snapshot_age_seconds: Decimal | None = None
+    reservation_id: UUID | None = None
+    reservation_release_result: str | None = None
+    rejected_at: datetime
+
+
 class V2SignalCandidate(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     run_id: str
@@ -250,6 +272,7 @@ class V2SignalCandidate(BaseModel):
     execution_dispatched_at: datetime | None = None
     execution_rejected_at: datetime | None = None
     sizing: V2SizingDecision | None = None
+    pre_submit_rejection: PreSubmitRejectionAudit | None = None
 
 
 class PortfolioReservation(BaseModel):

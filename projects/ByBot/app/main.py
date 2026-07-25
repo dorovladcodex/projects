@@ -526,6 +526,156 @@ def v2_sizing_canary(
     }
 
 
+@app.post("/v2/canary/depth-gate/{symbol}")
+def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
+    """Deterministic no-order replay through the production final depth gate."""
+
+    _require_demo_canary()
+    if not settings.v2_enabled:
+        raise HTTPException(status_code=404, detail="V2 depth canary unavailable")
+    feature = v2_feature_engine.snapshot(symbol)
+    if feature is None or not feature.fresh:
+        raise HTTPException(
+            status_code=503, detail="fresh V2 feature snapshot is unavailable"
+        )
+    initial_depth = feature.ask_depth_10bps_usdt or feature.ask_depth_usdt
+    initial_executable = (
+        initial_depth * settings.v2_max_book_participation_pct / Decimal("100")
+    )
+    if initial_executable < settings.v2_min_position_notional_usdt:
+        raise HTTPException(
+            status_code=409,
+            detail="initial executable depth cannot support the minimum canary",
+        )
+    # Copy one fresh, real feature snapshot, then constrain only the final
+    # canary observation. Production thresholds and the production coordinator
+    # remain unchanged; the deterministic Stage A can never reach create_order.
+    final_feature = feature.model_copy(deep=True)
+    insufficient_depth = min(
+        max(
+            Decimal("1"),
+            settings.v2_min_orderbook_depth_usdt - Decimal("1"),
+        ),
+        (
+            settings.v2_min_position_notional_usdt
+            * Decimal("100")
+            / settings.v2_max_book_participation_pct
+            - Decimal("1")
+        ),
+    )
+    final_feature.ask_depth_10bps_usdt = insufficient_depth
+    final_feature.ask_depth_usdt = insufficient_depth
+    final_feature.timestamp = datetime.now(timezone.utc)
+    final_feature.source_timestamps["orderbook"] = final_feature.timestamp
+    score = Decimal("0.64")
+    desired_net_edge = Decimal("10")
+    impact = min(
+        Decimal("25"),
+        settings.v2_min_position_notional_usdt
+        / initial_depth
+        * Decimal("10000"),
+    )
+    slippage = max(
+        settings.v2_slippage_bps * Decimal("2"),
+        feature.spread_bps + impact,
+    )
+    now = datetime.now(timezone.utc)
+    candidate = V2SignalCandidate(
+        run_id=v2_run_id,
+        strategy_name=StrategyName.VOLUME_BREAKOUT,
+        strategy_version="depth-gate-canary-v1",
+        symbol=symbol,
+        side=StrategySide.LONG,
+        created_at=now,
+        expires_at=now + timedelta(minutes=2),
+        market_regime=feature.market_regime,
+        feature_snapshot=feature,
+        raw_strategy_score=score,
+        confidence=score,
+        estimated_edge_bps=(
+            settings.v2_taker_fee_bps * Decimal("2")
+            + slippage
+            + desired_net_edge
+        ),
+        expected_fees_bps=settings.v2_taker_fee_bps * Decimal("2"),
+        expected_slippage_bps=slippage,
+        expected_funding_bps=Decimal("0"),
+        entry_reason="guarded V2 final executable-depth rejection canary",
+        threshold=Decimal("0.62"),
+        distance_to_threshold=score - Decimal("0.62"),
+        score_components=ScoreComponents(
+            strategy_score=score,
+            liquidity_score=score,
+            market_confirmation_score=score,
+            relative_strength_score=score,
+            estimated_fee_penalty=Decimal("0"),
+            estimated_slippage_penalty=Decimal("0"),
+            correlation_penalty=Decimal("0"),
+            portfolio_exposure_penalty=Decimal("0"),
+            final_score=score,
+        ),
+        admitted=True,
+        state="READY",
+        stop_loss_pct=Decimal("0.5"),
+        take_profit_pct=Decimal("1"),
+        maximum_holding_seconds=1800,
+    )
+    coordinator = V2ExecutionCoordinator(
+        settings,
+        persistence,
+        v2_universe_service,
+        v2_portfolio_service,
+        demo_execution_service,
+        run_id=v2_run_id,
+        market_snapshot_provider=lambda requested_symbol: (
+            final_feature if requested_symbol == symbol else None
+        ),
+    )
+    failures_before = sum(v2_runtime.failure_occurrences.values())
+    result = coordinator.execute(candidate, manual_canary=True)
+    if not result.get("handled_pre_submit_rejection"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "depth canary did not reach expected rejection",
+                "result": result,
+            },
+        )
+    v2_runtime._record_pre_submit_rejection(candidate, result)
+    failures_after = sum(v2_runtime.failure_occurrences.values())
+    active_execution = persistence.get_demo_execution(str(candidate.id))
+    reservation = next(
+        (
+            item for item in v2_portfolio_service.reservations
+            if str(item.id) == str(result.get("reservation_id"))
+        ),
+        None,
+    )
+    return {
+        "stage": "A",
+        "run_id": v2_run_id,
+        "candidate_id": str(candidate.id),
+        "rejection_code": result.get("rejection_code"),
+        "requested_notional_usdt": (
+            str(candidate.sizing.requested_notional_usdt)
+            if candidate.sizing else None
+        ),
+        "initial_available_depth_notional_usdt": str(initial_depth),
+        "canary_final_available_depth_notional_usdt": str(insufficient_depth),
+        "pre_submit_audit": result.get("pre_submit_audit"),
+        "reservation_release_result": result.get("reservation_release_result"),
+        "reservation_state": reservation.state.value if reservation else None,
+        "execution_created": active_execution is not None,
+        "exchange_order_submission_invoked": result.get(
+            "exchange_order_submission_invoked"
+        ),
+        "cycle_failures_before": failures_before,
+        "cycle_failures_after": failures_after,
+        "production_v2_depth_gate_used": True,
+        "live_execution_blocked": True,
+    }
+
+
 @app.get("/status")
 def status() -> dict[str, object]:
     refresh_runtime_state(refresh_account=True)

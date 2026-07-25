@@ -16,6 +16,7 @@ from app.models import (
     SignalRiskPreview, SimpleTrend,
 )
 from app.v2.models import (
+    PreSubmitRejectionAudit,
     ReservationState,
     StrategySide,
     V2SignalCandidate,
@@ -31,6 +32,14 @@ from app.v2.universe import SymbolUniverseService
 class ExpectedDemoPolicyRejection:
     code: str
     risk_control: str
+
+
+class PreSubmitMarketRejection(Exception):
+    """Expected fresh-market no-order decision made at the final gate."""
+
+    def __init__(self, audit: PreSubmitRejectionAudit) -> None:
+        super().__init__(audit.message)
+        self.audit = audit
 
 
 EXPECTED_DEMO_POLICY_REJECTIONS: dict[str, ExpectedDemoPolicyRejection] = {
@@ -301,6 +310,57 @@ class V2ExecutionCoordinator:
                 ),
                 sizing_details=candidate.sizing.model_dump(mode="json"),
             )
+        except PreSubmitMarketRejection as exc:
+            durable_execution = self.repository.get_demo_execution(str(candidate.id))
+            if durable_execution is not None:
+                raise DemoSafetyError(
+                    "Demo execution exists after a rejected final pre-submit gate"
+                ) from exc
+            released = self.portfolio.release(
+                reservation.id, activate_cooldown=False
+            )
+            rejected_at = datetime.now(timezone.utc)
+            audit = exc.audit.model_copy(update={
+                "reservation_id": reservation.id,
+                "reservation_release_result": (
+                    "RELEASED" if released else "ALREADY_RELEASED"
+                ),
+                "rejected_at": rejected_at,
+            })
+            candidate.admitted = False
+            candidate.state = "EXECUTION_REJECTED"
+            candidate.rejection_reason = audit.message
+            candidate.execution_rejected_at = rejected_at
+            candidate.pre_submit_rejection = audit
+            if candidate.sizing is not None:
+                candidate.sizing.rejection_code = audit.code
+                candidate.sizing.final_sizing_reason = audit.message
+            if not self.repository.save_v2_signal_candidate(candidate):
+                raise RuntimeError(
+                    "pre-submit rejection persistence failed"
+                ) from exc
+            self.last_error = audit.message
+            return {
+                "execution_attempted": False,
+                "candidate_id": str(candidate.id),
+                "signal_id": str(candidate.id),
+                "reservation_id": str(reservation.id),
+                "execution_id": None,
+                "state": candidate.state,
+                "symbol": candidate.symbol.value,
+                "strategy": candidate.strategy_name.value,
+                "rejection_code": audit.code,
+                "rejection_message": audit.message,
+                "processing_stage": "final_pre_submit_market_gate",
+                "rejected_at": rejected_at.isoformat(),
+                "handled_pre_submit_rejection": True,
+                "pre_submit_audit": audit.model_dump(mode="json"),
+                "reservation_release_result": audit.reservation_release_result,
+                "exchange_mutation_performed": False,
+                "exchange_order_submission_invoked": False,
+                "exchange_order_submitted": False,
+                "exchange_environment": "BYBIT_DEMO",
+            }
         except DemoSafetyError as exc:
             policy = classify_expected_demo_policy_rejection(exc)
             if policy is None:
@@ -373,23 +433,102 @@ class V2ExecutionCoordinator:
             if self.market_snapshot_provider is not None
             else candidate.feature_snapshot
         )
-        if current is None or not current.fresh:
-            raise DemoSafetyError("final pre-submit market data is unavailable or stale")
         now = datetime.now(timezone.utc)
-        if (now - current.timestamp).total_seconds() > self.settings.v2_max_signal_submit_age_seconds:
-            raise DemoSafetyError("final pre-submit market snapshot is too old")
+        requested_notional = (
+            candidate.sizing.requested_notional_usdt
+            if candidate.sizing is not None else Decimal("0")
+        )
+        if current is None:
+            raise self._pre_submit_rejection(
+                code="FINAL_MARKET_DATA_UNAVAILABLE",
+                message="final pre-submit market data is unavailable",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                now=now,
+            )
+        snapshot_age = Decimal(str(max(
+            0.0, (now - current.timestamp).total_seconds()
+        )))
+        if not current.fresh:
+            raise self._pre_submit_rejection(
+                code="FINAL_MARKET_DATA_STALE",
+                message="final pre-submit market data is stale",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                now=now,
+                snapshot_age=snapshot_age,
+            )
+        if snapshot_age > Decimal(str(
+            self.settings.v2_max_signal_submit_age_seconds
+        )):
+            raise self._pre_submit_rejection(
+                code="FINAL_MARKET_DATA_STALE",
+                message="final pre-submit market snapshot is too old",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                now=now,
+                snapshot_age=snapshot_age,
+            )
         if current.spread_bps > self.settings.v2_max_spread_bps:
-            raise DemoSafetyError("final pre-submit spread is too wide")
+            raise self._pre_submit_rejection(
+                code="FINAL_SPREAD_TOO_WIDE",
+                message="final pre-submit spread is too wide",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                now=now,
+                snapshot_age=snapshot_age,
+            )
         depth = (
             current.ask_depth_10bps_usdt or current.ask_depth_usdt
             if candidate.side == StrategySide.LONG
             else current.bid_depth_10bps_usdt or current.bid_depth_usdt
         )
-        if depth < self.settings.v2_min_orderbook_depth_usdt:
-            raise DemoSafetyError("final pre-submit executable depth is insufficient")
         current_entry = (
             current.ask_price if candidate.side == StrategySide.LONG else current.bid_price
         )
+        if (
+            not depth.is_finite() or depth < 0
+            or not current_entry.is_finite() or current_entry <= 0
+        ):
+            raise DemoSafetyError("malformed final pre-submit depth calculation")
+        if depth == 0:
+            raise self._pre_submit_rejection(
+                code="FINAL_EXECUTABLE_DEPTH_MISSING",
+                message="final pre-submit executable depth is missing",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                current_entry=current_entry,
+                depth=depth,
+                now=now,
+                snapshot_age=snapshot_age,
+            )
+        executable_notional = (
+            depth * self.settings.v2_max_book_participation_pct
+            / Decimal("100")
+        )
+        if (
+            depth < self.settings.v2_min_orderbook_depth_usdt
+            or executable_notional < self.settings.v2_min_position_notional_usdt
+            or (
+                requested_notional > 0
+                and executable_notional < requested_notional
+            )
+        ):
+            raise self._pre_submit_rejection(
+                code="FINAL_EXECUTABLE_DEPTH_INSUFFICIENT",
+                message="final pre-submit executable depth is insufficient",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                current_entry=current_entry,
+                depth=depth,
+                now=now,
+                snapshot_age=snapshot_age,
+            )
         deviation = abs(current_entry / original_entry_price - Decimal("1")) * Decimal("10000")
         if deviation > self.settings.v2_max_price_deviation_bps:
             raise DemoSafetyError("price moved beyond the pre-submit tolerance")
@@ -426,6 +565,51 @@ class V2ExecutionCoordinator:
         candidate.sizing.normalized_accepted_notional_usdt = accepted_notional
         self.repository.save_v2_signal_candidate(candidate)
         return current_entry, quantity
+
+    def _pre_submit_rejection(
+        self,
+        *,
+        code: str,
+        message: str,
+        candidate: V2SignalCandidate,
+        requested_notional: Decimal,
+        now: datetime,
+        current: Any | None = None,
+        current_entry: Decimal | None = None,
+        depth: Decimal | None = None,
+        snapshot_age: Decimal | None = None,
+    ) -> PreSubmitMarketRejection:
+        source_timestamp = (
+            current.source_timestamps.get("orderbook")
+            if current is not None else None
+        )
+        available_quantity = (
+            depth / current_entry
+            if depth is not None and current_entry is not None and current_entry > 0
+            else None
+        )
+        executable_notional = (
+            depth * self.settings.v2_max_book_participation_pct
+            / Decimal("100")
+            if depth is not None else None
+        )
+        audit = PreSubmitRejectionAudit(
+            code=code,
+            message=message,
+            requested_notional_usdt=requested_notional,
+            minimum_notional_usdt=self.settings.v2_min_position_notional_usdt,
+            minimum_orderbook_depth_usdt=self.settings.v2_min_orderbook_depth_usdt,
+            available_depth_quantity=available_quantity,
+            available_depth_notional_usdt=depth,
+            executable_depth_notional_usdt=executable_notional,
+            slippage_limit_bps=self.settings.v2_slippage_bps,
+            snapshot_source="v2_feature_engine:public_orderbook",
+            snapshot_timestamp=current.timestamp if current is not None else None,
+            source_timestamp=source_timestamp,
+            snapshot_age_seconds=snapshot_age,
+            rejected_at=now,
+        )
+        return PreSubmitMarketRejection(audit)
 
     def _persist_compatibility_candidate(
         self, candidate: V2SignalCandidate, quantity: Decimal, notional: Decimal,

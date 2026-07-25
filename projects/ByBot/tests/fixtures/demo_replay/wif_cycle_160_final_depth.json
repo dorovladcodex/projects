@@ -1,0 +1,38 @@
+{
+  "run_id": "demo-v2-20260725T180941803Z",
+  "cycle_id": "demo-v2-20260725T180941803Z:160",
+  "candidate_id": "dafe2691-7b55-499e-9b10-78d341362605",
+  "signal_id": "dafe2691-7b55-499e-9b10-78d341362605",
+  "risk_decision_id": 102,
+  "reservation_id": "57ad98ac-82b2-4a5e-a34f-81006cc52094",
+  "symbol": "WIFUSDT",
+  "strategy": "OIFundingSqueezeStrategy",
+  "side": "LONG",
+  "final_score": "0.6539279375091853078772551182",
+  "requested_notional_usdt": "100",
+  "minimum_notional_usdt": "100",
+  "symbol_cap_usdt": "150",
+  "initial_snapshot": {
+    "timestamp": "2026-07-25T19:06:11.102191Z",
+    "ask_price": "0.15498",
+    "bid_price": "0.15497",
+    "ask_depth_10bps_usdt": "20218.44189",
+    "bid_depth_10bps_usdt": "11740.14980",
+    "orderbook_timestamp": "2026-07-25T19:06:11.257000Z"
+  },
+  "next_persisted_snapshot": {
+    "timestamp": "2026-07-25T19:06:25.721908Z",
+    "ask_price": "0.15478",
+    "bid_price": "0.15476",
+    "ask_depth_10bps_usdt": "4914.34258",
+    "bid_depth_10bps_usdt": "6384.80006"
+  },
+  "minimum_orderbook_depth_usdt": "10000",
+  "max_book_participation_pct": "5",
+  "jit_snapshot_was_persisted": false,
+  "known_jit_ask_depth_upper_bound_usdt": "10000",
+  "historical_exception": "DemoSafetyError",
+  "expected_rejection_code": "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT",
+  "exchange_order_submission_invoked": false,
+  "reservation_final_state": "RELEASED"
+}
