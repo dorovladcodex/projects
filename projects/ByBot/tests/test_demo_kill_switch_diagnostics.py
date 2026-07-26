@@ -168,6 +168,42 @@ def test_read_only_client_has_no_exchange_mutation_methods() -> None:
         assert not hasattr(client, method)
 
 
+def test_read_only_client_syncs_clock_after_timestamp_rejection(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("app.bybit.demo_diagnostics.time.time", lambda: 1000.0)
+    calls = []
+
+    def fake_get(url, params, headers, timeout):
+        del params, timeout
+        calls.append((url, headers))
+        if url == f"{DEMO_READ_ONLY_REST_URL}/v5/market/time":
+            return {"retCode": 0, "result": {"timeNano": "1006000000000"}}
+        private_attempts = sum("/v5/account/wallet-balance" in row[0] for row in calls)
+        if private_attempts == 1:
+            return {
+                "retCode": 10002,
+                "retMsg": "server timestamp outside recv_window",
+            }
+        return {"retCode": 0, "result": {"list": []}}
+
+    client = ReadOnlyBybitDemoClient(
+        "key", "secret", http_get=fake_get
+    )
+
+    client.verify()
+
+    assert len(calls) == 3
+    assert calls[0][1]["X-BAPI-TIMESTAMP"] == "1000000"
+    assert "X-BAPI-API-KEY" not in calls[1][1]
+    assert calls[2][1]["X-BAPI-TIMESTAMP"] == "1006000"
+    for method in (
+        "create_order", "cancel_order", "amend_order", "set_trading_stop",
+        "set_leverage", "close_position",
+    ):
+        assert not hasattr(client, method)
+
+
 def test_active_recoverable_latch_with_flat_remote_state_passes() -> None:
     result = run_demo_diagnostics(
         config(), repository=DiagnosticRepository(), client=DiagnosticClient()

@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+from threading import RLock
 import time
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
@@ -109,6 +110,8 @@ class ReadOnlyBybitDemoClient:
         self._api_secret = api_secret
         self.timeout_seconds = timeout_seconds
         self._http_get = http_get or _read_only_url_get
+        self._clock_offset_ms = 0
+        self._clock_sync_lock = RLock()
 
     def verify(self) -> None:
         self._get(
@@ -166,30 +169,62 @@ class ReadOnlyBybitDemoClient:
         )
 
     def _get(self, path: str, params: dict[str, str]) -> dict[str, Any]:
-        timestamp = str(int(time.time() * 1000))
-        query = urlencode(sorted(params.items()))
-        recv_window = "5000"
-        signature = hmac.new(
-            self._api_secret.encode("utf-8"),
-            f"{timestamp}{self._api_key}{recv_window}{query}".encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        payload = self._http_get(
-            f"{self.base_url}{path}",
-            params,
-            {
-                "X-BAPI-API-KEY": self._api_key,
-                "X-BAPI-TIMESTAMP": timestamp,
-                "X-BAPI-RECV-WINDOW": recv_window,
-                "X-BAPI-SIGN": signature,
-            },
-            self.timeout_seconds,
-        )
-        if int(payload.get("retCode", -1)) != 0:
-            raise DemoDiagnosticsError(
-                f"Bybit read-only request failed: retCode={payload.get('retCode')}"
+        for attempt in range(2):
+            timestamp = str(int(time.time() * 1000) + self._clock_offset_ms)
+            query = urlencode(sorted(params.items()))
+            recv_window = "5000"
+            signature = hmac.new(
+                self._api_secret.encode("utf-8"),
+                f"{timestamp}{self._api_key}{recv_window}{query}".encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
+            payload = self._http_get(
+                f"{self.base_url}{path}",
+                params,
+                {
+                    "X-BAPI-API-KEY": self._api_key,
+                    "X-BAPI-TIMESTAMP": timestamp,
+                    "X-BAPI-RECV-WINDOW": recv_window,
+                    "X-BAPI-SIGN": signature,
+                },
+                self.timeout_seconds,
             )
-        return payload
+            ret_code = int(payload.get("retCode", -1))
+            ret_msg = str(payload.get("retMsg") or "")
+            if ret_code == 0:
+                return payload
+            if attempt == 0 and ret_code == 10002 and (
+                "server timestamp" in ret_msg.casefold()
+                or "recv_window" in ret_msg.casefold()
+            ):
+                self._synchronize_server_clock()
+                continue
+            raise DemoDiagnosticsError(
+                f"Bybit read-only request failed: retCode={ret_code}"
+            )
+        raise DemoDiagnosticsError("Bybit read-only timestamp retry was exhausted")
+
+    def _synchronize_server_clock(self) -> None:
+        with self._clock_sync_lock:
+            before_ms = int(time.time() * 1000)
+            payload = self._http_get(
+                f"{self.base_url}/v5/market/time",
+                {},
+                {"User-Agent": "ByBot/1.0 READ_ONLY"},
+                self.timeout_seconds,
+            )
+            after_ms = int(time.time() * 1000)
+            if int(payload.get("retCode", -1)) != 0:
+                raise DemoDiagnosticsError(
+                    "Bybit read-only clock synchronization failed"
+                )
+            server_ms = _diagnostic_server_time_ms(payload)
+            offset_ms = server_ms - ((before_ms + after_ms) // 2)
+            if abs(offset_ms) > 60_000:
+                raise DemoDiagnosticsError(
+                    "Bybit read-only clock offset exceeds safety bound"
+                )
+            self._clock_offset_ms = offset_ms
 
     def _paginate(
         self, path: str, params: dict[str, str], identity_field: str
@@ -215,6 +250,17 @@ class ReadOnlyBybitDemoClient:
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         return list(rows.values())
+
+
+def _diagnostic_server_time_ms(payload: dict[str, Any]) -> int:
+    if payload.get("time") not in (None, ""):
+        return int(str(payload["time"]))
+    result = payload.get("result") or {}
+    if result.get("timeNano") not in (None, ""):
+        return int(str(result["timeNano"])) // 1_000_000
+    if result.get("timeSecond") not in (None, ""):
+        return int(str(result["timeSecond"])) * 1000
+    raise DemoDiagnosticsError("Bybit read-only server time is unavailable")
 
 
 @dataclass

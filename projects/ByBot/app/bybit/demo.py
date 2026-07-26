@@ -498,6 +498,8 @@ class BybitDemoRestClient:
         self.recv_window_ms = recv_window_ms
         self.timeout_seconds = timeout_seconds
         self._http_request = http_request or _url_request
+        self._clock_offset_ms = 0
+        self._clock_sync_lock = RLock()
 
     def verify_credentials(self) -> bool:
         self._request(
@@ -692,7 +694,29 @@ class BybitDemoRestClient:
     ) -> dict[str, Any]:
         if not path.startswith("/v5/"):
             raise DemoSafetyError("Only Bybit V5 endpoints are allowed")
-        timestamp = str(int(time.time() * 1000))
+        for attempt in range(2):
+            data = self._signed_request_once(method, path, params)
+            ret_code = int(data.get("retCode") or 0)
+            ret_msg = str(data.get("retMsg") or "unknown error")
+            if ret_code == 0 or ret_code in (allowed_ret_codes or set()):
+                return data
+            if attempt == 0 and _is_timestamp_window_rejection(ret_code, ret_msg):
+                self._synchronize_server_clock()
+                continue
+            raise DemoExchangeError(
+                f"Bybit Demo request failed: {ret_msg}",
+                ret_code=ret_code,
+                ret_msg=ret_msg,
+            )
+        raise DemoExchangeError("Bybit Demo timestamp retry was exhausted")
+
+    def _signed_request_once(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, str],
+    ) -> dict[str, Any]:
+        timestamp = str(int(time.time() * 1000) + self._clock_offset_ms)
         recv_window = str(self.recv_window_ms)
         if method == "GET":
             body_text = urlencode(sorted(params.items()))
@@ -715,16 +739,55 @@ class BybitDemoRestClient:
             "X-BAPI-TIMESTAMP": timestamp,
             "X-BAPI-RECV-WINDOW": recv_window,
         }
-        data = self._http_request(method, url, headers, body, self.timeout_seconds)
-        ret_code = int(data.get("retCode") or 0)
-        if ret_code != 0 and ret_code not in (allowed_ret_codes or set()):
-            ret_msg = str(data.get("retMsg") or "unknown error")
-            raise DemoExchangeError(
-                f"Bybit Demo request failed: {ret_msg}",
-                ret_code=ret_code,
-                ret_msg=ret_msg,
+        return self._http_request(
+            method, url, headers, body, self.timeout_seconds
+        )
+
+    def _synchronize_server_clock(self) -> None:
+        """Calibrate signed request time after an explicit Bybit 10002 reject."""
+        with self._clock_sync_lock:
+            local_before_ms = int(time.time() * 1000)
+            data = self._http_request(
+                "GET",
+                f"{self.base_url}/v5/market/time",
+                {"User-Agent": "ByBot/1.0 DEMO_ONLY"},
+                None,
+                self.timeout_seconds,
             )
-        return data
+            local_after_ms = int(time.time() * 1000)
+            if int(data.get("retCode") or 0) != 0:
+                raise DemoExchangeError(
+                    "Bybit Demo clock synchronization failed"
+                )
+            server_ms = _server_time_ms(data)
+            midpoint_ms = (local_before_ms + local_after_ms) // 2
+            offset_ms = server_ms - midpoint_ms
+            if abs(offset_ms) > 60_000:
+                raise DemoExchangeError(
+                    "Bybit Demo clock offset exceeds safety bound"
+                )
+            self._clock_offset_ms = offset_ms
+
+
+def _is_timestamp_window_rejection(ret_code: int, ret_msg: str) -> bool:
+    normalized = ret_msg.casefold()
+    return ret_code == 10002 and (
+        "server timestamp" in normalized or "recv_window" in normalized
+    )
+
+
+def _server_time_ms(data: dict[str, Any]) -> int:
+    top_level = data.get("time")
+    if top_level not in (None, ""):
+        return int(str(top_level))
+    result = data.get("result") or {}
+    nanoseconds = result.get("timeNano")
+    if nanoseconds not in (None, ""):
+        return int(str(nanoseconds)) // 1_000_000
+    seconds = result.get("timeSecond")
+    if seconds not in (None, ""):
+        return int(str(seconds)) * 1000
+    raise DemoExchangeError("Bybit Demo server time is unavailable")
 
 
 class BybitDemoPrivateWebSocket:

@@ -704,6 +704,88 @@ def test_v5_list_pagination_stops_repeated_cursor() -> None:
     assert calls == 2
 
 
+def test_timestamp_window_rejection_syncs_demo_clock_and_retries_once(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("app.bybit.demo.time.time", lambda: 1000.0)
+    calls: list[tuple[str, str, dict[str, str]]] = []
+
+    def fake_http(method, url, headers, body, timeout):
+        del body, timeout
+        calls.append((method, url, headers))
+        if url == f"{DEMO_REST_URL}/v5/market/time":
+            return {"retCode": 0, "time": 1_006_000, "result": {}}
+        private_attempts = sum("/v5/account/info" in row[1] for row in calls)
+        if private_attempts == 1:
+            return {
+                "retCode": 10002,
+                "retMsg": (
+                    "invalid request, please check your server timestamp or "
+                    "recv_window param"
+                ),
+            }
+        return {"retCode": 0, "result": {"marginMode": "REGULAR_MARGIN"}}
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+
+    assert client.get_account_info()["marginMode"] == "REGULAR_MARGIN"
+    assert len(calls) == 3
+    first, clock, retry = calls
+    assert first[2]["X-BAPI-TIMESTAMP"] == "1000000"
+    assert clock[1] == f"{DEMO_REST_URL}/v5/market/time"
+    assert "X-BAPI-API-KEY" not in clock[2]
+    assert retry[2]["X-BAPI-TIMESTAMP"] == "1006000"
+
+
+def test_non_timestamp_exchange_error_is_not_retried() -> None:
+    calls: list[str] = []
+
+    def fake_http(method, url, headers, body, timeout):
+        del method, headers, body, timeout
+        calls.append(url)
+        return {"retCode": 10001, "retMsg": "params error"}
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+
+    with pytest.raises(DemoExchangeError) as captured:
+        client.get_account_info()
+
+    assert captured.value.ret_code == 10001
+    assert len(calls) == 1
+    assert "/v5/market/time" not in calls[0]
+
+
+def test_timestamp_retry_exhaustion_does_not_loop_or_hide_exchange_error(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("app.bybit.demo.time.time", lambda: 1000.0)
+    calls: list[str] = []
+
+    def fake_http(method, url, headers, body, timeout):
+        del method, headers, body, timeout
+        calls.append(url)
+        if url == f"{DEMO_REST_URL}/v5/market/time":
+            return {"retCode": 0, "result": {"timeSecond": "1006"}}
+        return {
+            "retCode": 10002,
+            "retMsg": "server timestamp outside recv_window",
+        }
+
+    client = BybitDemoRestClient(
+        api_key="fake", api_secret="fake", http_request=fake_http
+    )
+
+    with pytest.raises(DemoExchangeError) as captured:
+        client.get_account_info()
+
+    assert captured.value.ret_code == 10002
+    assert len(calls) == 3
+
+
 def test_demo_startup_does_not_change_leverage_with_open_position() -> None:
     client = LeveragePreparationClient(leverage="10", position_size="0.01")
 
