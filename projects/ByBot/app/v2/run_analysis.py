@@ -29,6 +29,110 @@ _COMPLETED_TRADE_STATES = {
 }
 
 
+class _StableReadSnapshotClient:
+    """Reuse immutable read-only exchange evidence during final analysis.
+
+    A completed run may contain many executions for the same symbol. Repeating
+    the same paginated history, fill, PnL and transaction-log requests for
+    every execution can exceed the runner's bounded final-analysis deadline.
+    Mutable safety state (positions and open orders) is cached only after two
+    consecutive identical authoritative reads.
+    """
+
+    def __init__(
+        self,
+        client: ReadOnlyBybitDemoClient,
+        universe_symbols: tuple[str, ...] = (),
+    ) -> None:
+        self._client = client
+        self._universe_symbols = universe_symbols
+        self._verified = False
+        self._immutable: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._stable: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self._previous: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    def verify(self) -> None:
+        if not self._verified:
+            self._client.verify()
+            self._verified = True
+
+    def get_order_history(self, symbol: Any) -> list[dict[str, Any]]:
+        return self._immutable_rows(
+            "order_history", symbol.value, lambda: self._client.get_order_history(symbol)
+        )
+
+    def get_executions(self, symbol: Any) -> list[dict[str, Any]]:
+        return self._immutable_rows(
+            "executions", symbol.value, lambda: self._client.get_executions(symbol)
+        )
+
+    def get_closed_pnl(self, symbol: Any) -> list[dict[str, Any]]:
+        return self._immutable_rows(
+            "closed_pnl", symbol.value, lambda: self._client.get_closed_pnl(symbol)
+        )
+
+    def get_transaction_log(self) -> list[dict[str, Any]]:
+        return self._immutable_rows(
+            "transaction_log", "USDT", self._client.get_transaction_log
+        )
+
+    def get_positions(self, symbol: Any) -> list[dict[str, Any]]:
+        return self._stable_rows(
+            "positions", symbol.value, lambda: self._client.get_positions(symbol)
+        )
+
+    def get_usdt_positions(self) -> list[dict[str, Any]]:
+        loader = getattr(self._client, "get_usdt_positions", None)
+        if callable(loader):
+            return self._stable_rows("usdt_positions", "USDT", loader)
+        return [
+            row
+            for symbol in self._configured_symbols()
+            for row in self.get_positions(symbol)
+        ]
+
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        return self._stable_rows(
+            "open_orders", "USDT", self._client.get_open_orders
+        )
+
+    def _configured_symbols(self) -> list[Any]:
+        from app.models import Symbol
+
+        return [Symbol(value) for value in self._universe_symbols]
+
+    def _immutable_rows(
+        self,
+        kind: str,
+        scope: str,
+        loader: Any,
+    ) -> list[dict[str, Any]]:
+        key = (kind, scope)
+        if key not in self._immutable:
+            self._immutable[key] = list(loader())
+        return list(self._immutable[key])
+
+    def _stable_rows(
+        self,
+        kind: str,
+        scope: str,
+        loader: Any,
+    ) -> list[dict[str, Any]]:
+        key = (kind, scope)
+        if key in self._stable:
+            return list(self._stable[key])
+        current = list(loader())
+        previous = self._previous.get(key)
+        if previous is not None and _canonical_rows(previous) == _canonical_rows(current):
+            self._stable[key] = current
+        self._previous[key] = current
+        return list(current)
+
+
+def _canonical_rows(rows: list[dict[str, Any]]) -> str:
+    return json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def analyze_demo_v2_run(
     run_id: str,
     config: DemoDiagnosticsConfig,
@@ -43,9 +147,10 @@ def analyze_demo_v2_run(
     repo = repository or PersistenceRepository(config.database_url, create_schema=False)
     if not repo.available:
         raise RuntimeError("database persistence is unavailable")
-    read_client = client or ReadOnlyBybitDemoClient(
+    raw_client = client or ReadOnlyBybitDemoClient(
         config.api_key, config.api_secret, base_url=config.rest_url
     )
+    read_client = _StableReadSnapshotClient(raw_client, config.universe_symbols)
     diagnostics = run_demo_diagnostics(
         config, repository=repo, client=read_client
     )

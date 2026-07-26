@@ -362,6 +362,41 @@ def test_fill_before_ack_is_supported_without_negative_latency_failure() -> None
     assert "fill_before_ack_supported" in row["latency_diagnostic_codes"]
 
 
+def test_exchange_timestamp_rounding_within_ten_ms_is_diagnostic_only() -> None:
+    now = datetime.now(timezone.utc)
+    row = _trade_row({
+        "id": "execution",
+        "run_id": "run",
+        "state": "DEMO_CLOSED",
+        "exchange_order_created_at": now.isoformat(),
+        "exchange_fill_at": (now - timedelta(milliseconds=1)).isoformat(),
+    })
+
+    assert row["exchange_order_to_fill_ms"] == 0.0
+    assert row["latency_validation_errors"] == []
+    assert (
+        "exchange_clock_rounding:exchange_order_to_fill"
+        in row["latency_diagnostic_codes"]
+    )
+
+
+def test_exchange_timestamp_inversion_beyond_tolerance_remains_failure() -> None:
+    now = datetime.now(timezone.utc)
+    row = _trade_row({
+        "id": "execution",
+        "run_id": "run",
+        "state": "DEMO_CLOSED",
+        "exchange_order_created_at": now.isoformat(),
+        "exchange_fill_at": (now - timedelta(milliseconds=11)).isoformat(),
+    })
+
+    assert row["exchange_order_to_fill_ms"] is None
+    assert (
+        "negative_latency:exchange_order_to_fill"
+        in row["latency_validation_errors"]
+    )
+
+
 def test_naive_timestamp_is_reported_as_incompatible_clock_input() -> None:
     now = datetime.now(timezone.utc)
     row = _trade_row({

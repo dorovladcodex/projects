@@ -7,7 +7,7 @@ from pathlib import Path
 from app.bybit.demo import DemoExecutionService
 from app.bybit.demo_diagnostics import DemoDiagnosticsConfig
 from app.models import DemoExecutionState
-from app.v2.run_analysis import analyze_demo_v2_run
+from app.v2.run_analysis import _StableReadSnapshotClient, analyze_demo_v2_run
 from tests.test_bybit_demo_execution import FakeDemoClient, MemoryRepository, demo_settings
 from tests.test_demo_execution_recovery import ReadClient, record
 from tests.test_v2_completed_run_regressions import _close_payload, _closing_record
@@ -133,6 +133,66 @@ def test_analyzer_identifies_one_unresolved_without_mutation(tmp_path: Path) -> 
     assert result["unresolved_execution_ids"] == [str(item.id)]
     assert result["unresolved"][0]["read_only_repair_eligible"] is True
     assert result["mutation_attempted"] is False
+
+
+def test_final_analysis_reuses_stable_read_only_exchange_snapshots() -> None:
+    class CountingReadClient(ReadClient):
+        def __init__(self) -> None:
+            super().__init__(close_kind="take_profit")
+            self.calls: dict[str, int] = {}
+
+        def _count(self, name: str) -> None:
+            self.calls[name] = self.calls.get(name, 0) + 1
+
+        def verify(self):
+            self._count("verify")
+
+        def get_order_history(self, symbol):
+            self._count("history")
+            return super().get_order_history(symbol)
+
+        def get_executions(self, symbol):
+            self._count("executions")
+            return super().get_executions(symbol)
+
+        def get_positions(self, symbol):
+            self._count("positions")
+            return super().get_positions(symbol)
+
+        def get_open_orders(self):
+            self._count("orders")
+            return super().get_open_orders()
+
+        def get_closed_pnl(self, symbol):
+            self._count("pnl")
+            return super().get_closed_pnl(symbol)
+
+        def get_transaction_log(self):
+            self._count("transactions")
+            return super().get_transaction_log()
+
+    raw = CountingReadClient()
+    cached = _StableReadSnapshotClient(raw, ("BTCUSDT",))
+    cached.verify()
+    cached.verify()
+    for _ in range(3):
+        cached.get_order_history(record().symbol)
+        cached.get_executions(record().symbol)
+        cached.get_closed_pnl(record().symbol)
+        cached.get_transaction_log()
+    for _ in range(4):
+        cached.get_positions(record().symbol)
+        cached.get_open_orders()
+
+    assert raw.calls == {
+        "verify": 1,
+        "history": 1,
+        "executions": 1,
+        "pnl": 1,
+        "transactions": 1,
+        "positions": 2,
+        "orders": 2,
+    }
 
 
 def test_runner_finally_stops_uvicorn_and_prevents_duplicate_listener() -> None:

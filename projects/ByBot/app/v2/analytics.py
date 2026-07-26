@@ -579,9 +579,9 @@ def _trade_row(item: dict[str, Any]) -> dict[str, Any]:
         "total_signal_to_fill_ms": _validated_latency_ms(item.get("signal_created_at"), local_fill, errors, "total_signal_to_fill"),
         "latency_validation_errors": errors,
         "latency_diagnostic_codes": [],
-        "exchange_order_to_fill_ms": _validated_latency_ms(
+        "exchange_order_to_fill_ms": _validated_exchange_latency_ms(
             item.get("exchange_order_created_at"), exchange_fill, errors,
-            "exchange_order_to_fill",
+            diagnostics, "exchange_order_to_fill",
         ),
         "execution_stage_durations_ms": json.dumps(
             item.get("execution_stage_durations_ms") or {}, sort_keys=True
@@ -708,6 +708,38 @@ def _validated_latency_ms(
     if value < 0:
         errors.append(f"negative_latency:{label}")
         return None
+    return value
+
+
+def _validated_exchange_latency_ms(
+    start: object,
+    finish: object,
+    errors: list[str],
+    diagnostics: list[str],
+    label: str,
+    *,
+    clock_tolerance_ms: float = 10.0,
+) -> float | None:
+    """Validate two exchange timestamps with bounded millisecond tolerance.
+
+    Bybit serializes order and fill times independently at millisecond
+    precision. A fill can therefore appear a few milliseconds before the
+    corresponding order-created timestamp even though the exchange events are
+    causally compatible. Larger inversions remain analytics failures.
+    """
+    if not start or not finish:
+        return None
+    try:
+        value = _raw_latency_ms(start, finish)
+    except (TypeError, ValueError, OverflowError):
+        errors.append(f"invalid_utc_timestamp:{label}")
+        return None
+    if value < -clock_tolerance_ms:
+        errors.append(f"negative_latency:{label}")
+        return None
+    if value < 0:
+        diagnostics.append(f"exchange_clock_rounding:{label}")
+        return 0.0
     return value
 
 
