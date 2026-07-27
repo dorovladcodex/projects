@@ -1,0 +1,17 @@
+{
+  "run_id": "demo-v2-20260727T084654711Z",
+  "cycle": 1012,
+  "stage": "demo_execution",
+  "candidate_id": "2c313309-30b8-4c61-ba46-672ba77c6770",
+  "reservation_id": "9b8b4d7e-54a3-4ad2-966b-049b73c31e75",
+  "symbol": "SOLUSDT",
+  "strategy": "LiquidationMomentumStrategy",
+  "failed_read": "get_closed_pnl",
+  "error_category": "TRANSPORT",
+  "error": "URLError: WinError 10054 connection reset",
+  "durable_execution_created": false,
+  "exchange_order_submission_invoked": false,
+  "remote_order_history": [],
+  "remote_execution_history": [],
+  "expected_rejection_code": "EXTERNAL_DEPENDENCY_UNAVAILABLE"
+}

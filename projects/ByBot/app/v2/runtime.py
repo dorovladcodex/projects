@@ -963,6 +963,23 @@ class V2Runtime:
                 )
             elif isinstance(result, dict) and result.get("handled_pre_submit_rejection"):
                 self._record_pre_submit_rejection(candidate, result)
+                if result.get("handled_external_dependency_rejection"):
+                    message = str(
+                        result.get("rejection_message")
+                        or "Demo REST entry preflight is unavailable"
+                    )
+                    category = str(
+                        result.get("dependency_error_category") or "TRANSPORT"
+                    )
+                    if category == "DNS_RESOLUTION":
+                        message = f"getaddrinfo failed: {message}"
+                    elif category == "TIMEOUT":
+                        message = f"timed out: {message}"
+                    self._handle_dependency_failure(
+                        ConnectionError(message),
+                        stage="demo_execution_pre_mutation",
+                        cycle_id=cycle_id,
+                    )
             elif isinstance(result, dict) and result.get("handled_policy_rejection"):
                 self._record_execution_policy_rejection(candidate, result)
             elif isinstance(result, dict) and result.get("handled_persistence_rejection"):
@@ -1286,9 +1303,9 @@ class V2Runtime:
     ) -> bool:
         active_count, protected = self._active_protection_state()
         host = (
-            "api-demo.bybit.com"
-            if stage == "position_monitoring"
-            else "api.bybit.com"
+            "api.bybit.com"
+            if stage in {"rest_metrics", "universe_refresh"}
+            else "api-demo.bybit.com"
         )
         decision = self.dependency_health.record_failure(
             exc,

@@ -7,7 +7,12 @@ from threading import RLock
 from typing import Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 
-from app.bybit.demo import DemoExecutionService, DemoSafetyError, require_demo_execution
+from app.bybit.demo import (
+    DemoExecutionService,
+    DemoPreMutationDependencyError,
+    DemoSafetyError,
+    require_demo_execution,
+)
 from app.config import ExecutionMode, Settings
 from app.models import (
     Asset, CandidateLifecycleState, ClassificationStatus, ExecutionEnvironment,
@@ -354,6 +359,79 @@ class V2ExecutionCoordinator:
                 "processing_stage": "final_pre_submit_market_gate",
                 "rejected_at": rejected_at.isoformat(),
                 "handled_pre_submit_rejection": True,
+                "pre_submit_audit": audit.model_dump(mode="json"),
+                "reservation_release_result": audit.reservation_release_result,
+                "exchange_mutation_performed": False,
+                "exchange_order_submission_invoked": False,
+                "exchange_order_submitted": False,
+                "exchange_environment": "BYBIT_DEMO",
+            }
+        except DemoPreMutationDependencyError as exc:
+            durable_execution = self.repository.get_demo_execution(str(candidate.id))
+            if durable_execution is not None:
+                raise DemoSafetyError(
+                    "Demo execution exists after a pre-mutation dependency rejection"
+                ) from exc
+            released = self.portfolio.release(
+                reservation.id, activate_cooldown=False
+            )
+            rejected_at = datetime.now(timezone.utc)
+            snapshot = candidate.feature_snapshot
+            snapshot_age = Decimal(str(max(
+                0.0, (rejected_at - snapshot.timestamp).total_seconds()
+            )))
+            audit = PreSubmitRejectionAudit(
+                code="EXTERNAL_DEPENDENCY_UNAVAILABLE",
+                message=str(exc),
+                requested_notional_usdt=sizing.requested_notional_usdt,
+                minimum_notional_usdt=(
+                    self.settings.v2_min_position_notional_usdt
+                ),
+                minimum_orderbook_depth_usdt=(
+                    self.settings.v2_min_orderbook_depth_usdt
+                ),
+                slippage_limit_bps=self.settings.v2_slippage_bps,
+                snapshot_source=f"bybit_private_rest:{exc.stage}",
+                snapshot_timestamp=snapshot.timestamp,
+                source_timestamp=snapshot.timestamp,
+                snapshot_age_seconds=snapshot_age,
+                original_reference_price=entry_price,
+                reservation_id=reservation.id,
+                reservation_release_result=(
+                    "RELEASED" if released else "ALREADY_RELEASED"
+                ),
+                rejected_at=rejected_at,
+            )
+            candidate.admitted = False
+            candidate.state = "EXECUTION_REJECTED"
+            candidate.rejection_reason = audit.message
+            candidate.execution_rejected_at = rejected_at
+            candidate.pre_submit_rejection = audit
+            if candidate.sizing is not None:
+                candidate.sizing.rejection_code = audit.code.value
+                candidate.sizing.final_sizing_reason = audit.message
+            if not self.repository.save_v2_signal_candidate(candidate):
+                raise RuntimeError(
+                    "pre-mutation dependency rejection persistence failed"
+                ) from exc
+            self.last_error = audit.message
+            return {
+                "execution_attempted": False,
+                "candidate_id": str(candidate.id),
+                "signal_id": str(candidate.id),
+                "reservation_id": str(reservation.id),
+                "execution_id": None,
+                "state": candidate.state,
+                "symbol": candidate.symbol.value,
+                "strategy": candidate.strategy_name.value,
+                "rejection_code": audit.code.value,
+                "rejection_message": audit.message,
+                "processing_stage": exc.stage,
+                "rejected_at": rejected_at.isoformat(),
+                "handled_pre_submit_rejection": True,
+                "handled_external_dependency_rejection": True,
+                "dependency_host": exc.host,
+                "dependency_error_category": exc.error_category,
                 "pre_submit_audit": audit.model_dump(mode="json"),
                 "reservation_release_result": audit.reservation_release_result,
                 "exchange_mutation_performed": False,

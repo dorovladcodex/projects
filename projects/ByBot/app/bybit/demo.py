@@ -9,11 +9,13 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 import hashlib
 import hmac
 import json
+import socket
 import time
 from time import perf_counter
 from threading import RLock
 from typing import Any, Protocol
 from urllib.parse import urlencode
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 from uuid import UUID
 
@@ -61,6 +63,49 @@ CANONICAL_EXIT_ATTRIBUTIONS = {
     "forced_cleanup",
     "unattributed_external_close",
 }
+
+
+class DemoPreMutationDependencyError(RuntimeError):
+    """A transient read-only preflight failure before any exchange mutation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stage: str,
+        host: str = "api-demo.bybit.com",
+        error_category: str = "TRANSPORT",
+    ) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.host = host
+        self.error_category = error_category
+
+
+def _is_transient_preflight_dependency_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(
+            current,
+            (socket.gaierror, URLError, TimeoutError, ConnectionError, OSError),
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _preflight_dependency_category(exc: BaseException) -> str:
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).casefold()
+        if isinstance(current, socket.gaierror) or "getaddrinfo" in message:
+            return "DNS_RESOLUTION"
+        if isinstance(current, TimeoutError) or "timed out" in message:
+            return "TIMEOUT"
+        if isinstance(current, (URLError, ConnectionError, OSError)):
+            return "TRANSPORT"
+        current = current.__cause__ or current.__context__
+    return type(exc).__name__.upper()
 
 
 def canonical_exit_attribution(reason: str | None) -> str:
@@ -1235,11 +1280,20 @@ class DemoExecutionService:
         instrument_started = start("instrument_metadata")
         # The validated universe owns immutable normal-strategy rules. Canary
         # execution deliberately keeps its final just-in-time exchange refresh.
-        rules = (
-            self.client.get_instrument(candidate.symbol)
-            if canary_plan is not None or instrument_rules is None
-            else instrument_rules
-        )
+        try:
+            rules = (
+                self.client.get_instrument(candidate.symbol)
+                if canary_plan is not None or instrument_rules is None
+                else instrument_rules
+            )
+        except Exception as exc:
+            if not _is_transient_preflight_dependency_error(exc):
+                raise
+            raise DemoPreMutationDependencyError(
+                "Demo REST instrument metadata is temporarily unavailable",
+                stage="instrument_metadata",
+                error_category=_preflight_dependency_category(exc),
+            ) from exc
         complete("instrument_metadata", instrument_started)
 
         quantity_started = start("quantity_normalization")
@@ -1274,30 +1328,41 @@ class DemoExecutionService:
 
         # Independent signed GETs run concurrently. They retain every remote
         # conflict/loss check while avoiding three sequential position reads.
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="demo-entry-read") as pool:
-            reads = {
-                "position_symbol": pool.submit(
-                    measured_read,
-                    "position_symbol",
-                    lambda: self.client.get_positions(symbol=candidate.symbol),
-                ),
-                "open_orders": pool.submit(
-                    measured_read,
-                    "open_orders",
-                    lambda: self.client.get_open_orders(symbol=candidate.symbol),
-                ),
-                "position_account": pool.submit(
-                    measured_read,
-                    "position_account",
-                    lambda: self.client.get_positions(settle_coin="USDT"),
-                ),
-                "reconciliation_check": pool.submit(
-                    measured_read,
-                    "reconciliation_check",
-                    lambda: self.client.get_closed_pnl(settle_coin="USDT"),
-                ),
-            }
-            read_results = {name: future.result() for name, future in reads.items()}
+        try:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="demo-entry-read") as pool:
+                reads = {
+                    "position_symbol": pool.submit(
+                        measured_read,
+                        "position_symbol",
+                        lambda: self.client.get_positions(symbol=candidate.symbol),
+                    ),
+                    "open_orders": pool.submit(
+                        measured_read,
+                        "open_orders",
+                        lambda: self.client.get_open_orders(symbol=candidate.symbol),
+                    ),
+                    "position_account": pool.submit(
+                        measured_read,
+                        "position_account",
+                        lambda: self.client.get_positions(settle_coin="USDT"),
+                    ),
+                    "reconciliation_check": pool.submit(
+                        measured_read,
+                        "reconciliation_check",
+                        lambda: self.client.get_closed_pnl(settle_coin="USDT"),
+                    ),
+                }
+                read_results = {
+                    name: future.result() for name, future in reads.items()
+                }
+        except Exception as exc:
+            if not _is_transient_preflight_dependency_error(exc):
+                raise
+            raise DemoPreMutationDependencyError(
+                "Demo REST entry preflight is temporarily unavailable",
+                stage="entry_read_preflight",
+                error_category=_preflight_dependency_category(exc),
+            ) from exc
 
         symbol_positions, symbol_started, symbol_completed, symbol_ms = read_results["position_symbol"]
         account_positions, account_pos_started, account_pos_completed, account_pos_ms = read_results["position_account"]
