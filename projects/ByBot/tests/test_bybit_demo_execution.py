@@ -1539,9 +1539,9 @@ def test_reconciliation_uses_usdt_scope_and_keeps_unrelated_visibility() -> None
     result = demo.reconcile()
 
     assert client.open_order_scopes == [(None, "USDT")]
-    assert client.history_scopes == [(None, "USDT")]
-    assert client.execution_scopes == [(None, "USDT")]
-    assert client.closed_pnl_scopes == [(None, "USDT")]
+    assert client.history_scopes == []
+    assert client.execution_scopes == []
+    assert client.closed_pnl_scopes == []
     assert client.position_scopes == [(None, "USDT")]
     assert result["bot_owned_open_orders"] == 0
     assert result["confirmed_unrelated_orders"] == 1
@@ -1549,6 +1549,35 @@ def test_reconciliation_uses_usdt_scope_and_keeps_unrelated_visibility() -> None
     assert result["unrelated_open_orders"] == 2
     assert demo.as_status()["unrelated_open_orders"] == 2
     assert client.orders == []
+
+
+def test_terminal_only_startup_skips_unbounded_historical_exchange_scans() -> None:
+    repo, client = MemoryRepository(), FakeDemoClient()
+    demo = service(client, repo)
+    candidate, _, _, _ = candidate_bundle()
+    repo.records[str(candidate.id)] = DemoExecutionRecord(
+        candidate_id=candidate.id,
+        risk_decision_id=1,
+        run_id="historical",
+        order_link_id="historical-entry",
+        state=DemoExecutionState.DEMO_CLOSED,
+        symbol=Symbol.BTCUSDT,
+        side=Side.BUY,
+        requested_quantity=Decimal("0.001"),
+        accepted_quantity=Decimal("0.001"),
+        average_fill_price=Decimal("65000"),
+        average_close_price=Decimal("65100"),
+        closed_at=datetime.now(timezone.utc),
+    )
+
+    result = demo.reconcile()
+
+    assert result["status"] == "OK"
+    assert client.open_order_scopes == [(None, "USDT")]
+    assert client.position_scopes == [(None, "USDT")]
+    assert client.history_scopes == []
+    assert client.execution_scopes == []
+    assert client.closed_pnl_scopes == []
 
 
 def test_order_link_id_is_stable_and_purpose_specific() -> None:

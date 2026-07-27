@@ -2534,15 +2534,48 @@ class DemoExecutionService:
             self.sleep_resume_reconciliations += 1
             self._discard_ws_before_ms = int(time.time() * 1000)
         self._last_reconcile_monotonic = monotonic_now
-        remote_orders = self.client.get_open_orders(settle_coin="USDT")
-        history = self.client.get_order_history(settle_coin="USDT")
-        executions = self.client.get_executions(settle_coin="USDT")
-        closed_pnl = self.client.get_closed_pnl(settle_coin="USDT")
         local = self.repository.load_demo_executions()
+        active_local = [
+            record for record in local
+            if record.state not in TERMINAL_DEMO_STATES
+        ]
+        # Account-wide signed reads are independent. Running them concurrently
+        # keeps startup bounded as durable history grows. Historical order/fill
+        # scans are unnecessary when every durable execution is terminal:
+        # current open orders and positions remain the authoritative safety gate.
+        with ThreadPoolExecutor(
+            max_workers=5, thread_name_prefix="demo-reconcile-read"
+        ) as pool:
+            reads: dict[str, Any] = {
+                "open_orders": pool.submit(
+                    self.client.get_open_orders, settle_coin="USDT"
+                ),
+                "positions": pool.submit(
+                    self.client.get_positions, settle_coin="USDT"
+                ),
+            }
+            if active_local:
+                reads.update({
+                    "history": pool.submit(
+                        self.client.get_order_history, settle_coin="USDT"
+                    ),
+                    "executions": pool.submit(
+                        self.client.get_executions, settle_coin="USDT"
+                    ),
+                    "closed_pnl": pool.submit(
+                        self.client.get_closed_pnl, settle_coin="USDT"
+                    ),
+                })
+            snapshots = {
+                name: future.result() for name, future in reads.items()
+            }
+        remote_orders = snapshots["open_orders"]
+        positions = snapshots["positions"]
+        history = snapshots.get("history", [])
+        executions = snapshots.get("executions", [])
+        closed_pnl = snapshots.get("closed_pnl", [])
         unexpected_errors: list[Exception] = []
-        for record in list(local):
-            if record.state in TERMINAL_DEMO_STATES:
-                continue
+        for record in active_local:
             try:
                 self._reconcile_execution_rest(record)
             except DemoExchangeError as exc:
@@ -2550,8 +2583,11 @@ class DemoExecutionService:
             except Exception as exc:
                 self.last_error = _sanitized_error(exc)
                 unexpected_errors.append(exc)
+        if active_local:
+            # Per-execution reconciliation may install or refresh protection;
+            # safety decisions below must use the resulting authoritative state.
+            positions = self.client.get_positions(settle_coin="USDT")
         local = self.repository.load_demo_executions()
-        positions = self.client.get_positions(settle_coin="USDT")
         local_links = {
             link: item
             for item in local
