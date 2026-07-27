@@ -275,6 +275,7 @@ def test_exact_persisted_close_reconciles_to_demo_closed() -> None:
         "READ_ONLY_RECONCILIATION_COMPLETED",
         "EXACT_CLOSE_ATTRIBUTED",
         "FINAL_REMOTE_STATE_FLAT",
+        "PNL_ACCOUNTING_RECONCILED",
     ]
 
 

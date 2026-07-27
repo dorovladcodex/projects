@@ -333,7 +333,7 @@ class V2ExecutionCoordinator:
             candidate.execution_rejected_at = rejected_at
             candidate.pre_submit_rejection = audit
             if candidate.sizing is not None:
-                candidate.sizing.rejection_code = audit.code
+                candidate.sizing.rejection_code = audit.code.value
                 candidate.sizing.final_sizing_reason = audit.message
             if not self.repository.save_v2_signal_candidate(candidate):
                 raise RuntimeError(
@@ -349,7 +349,7 @@ class V2ExecutionCoordinator:
                 "state": candidate.state,
                 "symbol": candidate.symbol.value,
                 "strategy": candidate.strategy_name.value,
-                "rejection_code": audit.code,
+                "rejection_code": audit.code.value,
                 "rejection_message": audit.message,
                 "processing_stage": "final_pre_submit_market_gate",
                 "rejected_at": rejected_at.isoformat(),
@@ -440,7 +440,7 @@ class V2ExecutionCoordinator:
         )
         if current is None:
             raise self._pre_submit_rejection(
-                code="FINAL_MARKET_DATA_UNAVAILABLE",
+                code="PRE_SUBMIT_MARKET_DATA_UNAVAILABLE",
                 message="final pre-submit market data is unavailable",
                 candidate=candidate,
                 requested_notional=requested_notional,
@@ -451,7 +451,7 @@ class V2ExecutionCoordinator:
         )))
         if not current.fresh:
             raise self._pre_submit_rejection(
-                code="FINAL_MARKET_DATA_STALE",
+                code="PRE_SUBMIT_MARKET_DATA_STALE",
                 message="final pre-submit market data is stale",
                 candidate=candidate,
                 requested_notional=requested_notional,
@@ -463,7 +463,7 @@ class V2ExecutionCoordinator:
             self.settings.v2_max_signal_submit_age_seconds
         )):
             raise self._pre_submit_rejection(
-                code="FINAL_MARKET_DATA_STALE",
+                code="PRE_SUBMIT_MARKET_DATA_STALE",
                 message="final pre-submit market snapshot is too old",
                 candidate=candidate,
                 requested_notional=requested_notional,
@@ -531,7 +531,19 @@ class V2ExecutionCoordinator:
             )
         deviation = abs(current_entry / original_entry_price - Decimal("1")) * Decimal("10000")
         if deviation > self.settings.v2_max_price_deviation_bps:
-            raise DemoSafetyError("price moved beyond the pre-submit tolerance")
+            raise self._pre_submit_rejection(
+                code="FINAL_PRICE_MOVED_BEYOND_TOLERANCE",
+                message="price moved beyond the final pre-submit tolerance",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                current_entry=current_entry,
+                depth=depth,
+                now=now,
+                snapshot_age=snapshot_age,
+                original_entry_price=original_entry_price,
+                price_deviation_bps=deviation,
+            )
         if candidate.sizing is None or instrument is None:
             return current_entry
         try:
@@ -549,11 +561,33 @@ class V2ExecutionCoordinator:
                 hard_max_notional,
             )
         except ValueError as exc:
-            raise DemoSafetyError(str(exc)) from exc
+            if str(exc) != "minimum normalized position exceeds a hard sizing cap":
+                raise DemoSafetyError(str(exc)) from exc
+            raise self._pre_submit_rejection(
+                code="SAFE_NOTIONAL_BELOW_MINIMUM",
+                message="safe final position notional is below the configured minimum",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                current_entry=current_entry,
+                depth=depth,
+                now=now,
+                snapshot_age=snapshot_age,
+                original_entry_price=original_entry_price,
+            ) from exc
         accepted_notional = quantity * current_entry
         if accepted_notional < self.settings.v2_min_position_notional_usdt:
-            raise DemoSafetyError(
-                "final normalized notional is below the 100 USDT minimum"
+            raise self._pre_submit_rejection(
+                code="SAFE_NOTIONAL_BELOW_MINIMUM",
+                message="safe final position notional is below the configured minimum",
+                candidate=candidate,
+                requested_notional=requested_notional,
+                current=current,
+                current_entry=current_entry,
+                depth=depth,
+                now=now,
+                snapshot_age=snapshot_age,
+                original_entry_price=original_entry_price,
             )
         final_risk = accepted_notional * candidate.stop_loss_pct / Decimal("100")
         if final_risk > candidate.sizing.risk_budget_usdt:
@@ -578,6 +612,8 @@ class V2ExecutionCoordinator:
         current_entry: Decimal | None = None,
         depth: Decimal | None = None,
         snapshot_age: Decimal | None = None,
+        original_entry_price: Decimal | None = None,
+        price_deviation_bps: Decimal | None = None,
     ) -> PreSubmitMarketRejection:
         source_timestamp = (
             current.source_timestamps.get("orderbook")
@@ -607,6 +643,22 @@ class V2ExecutionCoordinator:
             snapshot_timestamp=current.timestamp if current is not None else None,
             source_timestamp=source_timestamp,
             snapshot_age_seconds=snapshot_age,
+            original_reference_price=original_entry_price,
+            final_executable_price=current_entry,
+            absolute_price_movement=(
+                abs(current_entry - original_entry_price)
+                if current_entry is not None and original_entry_price is not None
+                else None
+            ),
+            price_movement_pct=(
+                price_deviation_bps / Decimal("100")
+                if price_deviation_bps is not None else None
+            ),
+            price_movement_bps=price_deviation_bps,
+            configured_price_tolerance_bps=(
+                self.settings.v2_max_price_deviation_bps
+                if price_deviation_bps is not None else None
+            ),
             rejected_at=now,
         )
         return PreSubmitMarketRejection(audit)

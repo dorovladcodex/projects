@@ -156,6 +156,8 @@ class DemoFill(BaseModel):
     price: Decimal = Field(gt=0)
     fee: Decimal = Decimal("0")
     fee_currency: str | None = None
+    is_maker: bool | None = None
+    fee_rate: Decimal | None = None
     executed_at: datetime
     local_received_at: datetime | None = None
 
@@ -182,6 +184,14 @@ class DemoExecutionRecord(BaseModel):
     order_id: str | None = None
     fills: list[DemoFill] = Field(default_factory=list)
     exchange_fees: Decimal = Decimal("0")
+    entry_fees: Decimal = Decimal("0")
+    close_fees: Decimal = Decimal("0")
+    funding_pnl: Decimal = Decimal("0")
+    funding_transaction_ids: list[str] = Field(default_factory=list)
+    accounting_components: dict[str, Any] = Field(default_factory=dict)
+    authoritative_closed_pnl: Decimal | None = None
+    accounting_status: str = "PROVISIONAL"
+    accounting_finalized_at: datetime | None = None
     take_profit: Decimal | None = None
     stop_loss: Decimal | None = None
     stop_loss_pct: Decimal | None = Field(default=None, gt=0)

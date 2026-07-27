@@ -12,6 +12,7 @@ from app.bybit.demo_diagnostics import (
     ReadOnlyBybitDemoClient,
 )
 from app.bybit.demo import classify_exchange_close
+from app.bybit.demo_accounting import calculate_fill_level_accounting
 from app.db.persistence import PersistenceRepository
 from app.models import (
     DemoExecutionRecord,
@@ -51,6 +52,10 @@ class DemoExecutionDiagnosis:
     rejected_close_execution_ids: list[str]
     conflicting_order_ids: list[str]
     conflicting_execution_ids: list[str]
+    funding_pnl: Decimal
+    funding_transaction_ids: list[str]
+    accounting_components: dict[str, Any]
+    accounting_status: str
 
     @property
     def repairable(self) -> bool:
@@ -376,8 +381,32 @@ def diagnose_demo_execution(
         if record.close_order_id
         and str(item.get("orderId") or "") == record.close_order_id
     ]
-    if matching_closed_pnl:
-        net = _decimal(matching_closed_pnl[0].get("closedPnl"))
+    accounting = None
+    if entry_fills and close_fills and close_history:
+        try:
+            accounting = calculate_fill_level_accounting(
+                symbol=record.symbol,
+                side=record.side,
+                entry_order_id=str(entry_fills[0].get("orderId") or ""),
+                close_order_id=str(close_fills[0].get("orderId") or ""),
+                entry_fills=entry_fills,
+                close_fills=close_fills,
+                transaction_log=transaction_log,
+                closed_pnl_rows=matching_closed_pnl,
+            )
+            gross = accounting.gross_price_pnl
+            entry_fees = accounting.entry_fees
+            close_fees = accounting.close_fees
+            net = accounting.calculated_net_pnl
+            if accounting.final:
+                net = accounting.authoritative_closed_pnl or net
+            else:
+                blockers.append(
+                    "canonical fill accounting is not finalized against "
+                    "authoritative closed PnL"
+                )
+        except ValueError as exc:
+            blockers.append(f"canonical fill accounting failed: {exc}")
 
     proposed: DemoExecutionState | None = None
     if not record.order_id and not entry_history and not entry_fills:
@@ -452,6 +481,19 @@ def diagnose_demo_execution(
         rejected_close_execution_ids=rejected_close_execution_ids,
         conflicting_order_ids=conflicting_order_ids,
         conflicting_execution_ids=conflicting_execution_ids,
+        funding_pnl=(
+            accounting.funding_pnl if accounting is not None else Decimal("0")
+        ),
+        funding_transaction_ids=(
+            list(accounting.funding_transaction_ids)
+            if accounting is not None else []
+        ),
+        accounting_components=(
+            accounting.payload() if accounting is not None else {}
+        ),
+        accounting_status=(
+            accounting.status if accounting is not None else "UNAVAILABLE"
+        ),
     )
 
 
@@ -464,6 +506,9 @@ def apply_demo_execution_repair(
     if (
         diagnosis.record.state == diagnosis.proposed_state
         and diagnosis.record.cleanup_result
+        and diagnosis.record.realized_exchange_pnl
+        == diagnosis.net_realized_pnl
+        and diagnosis.record.accounting_status == "FINAL"
     ):
         return True
     record = diagnosis.record.model_copy(deep=True)
@@ -513,6 +558,17 @@ def apply_demo_execution_repair(
         record.realized_exchange_pnl = diagnosis.net_realized_pnl
         record.gross_realized_pnl = diagnosis.gross_realized_pnl
         record.exchange_fees = diagnosis.entry_fees + diagnosis.close_fees
+        record.entry_fees = diagnosis.entry_fees
+        record.close_fees = diagnosis.close_fees
+        record.funding_pnl = diagnosis.funding_pnl
+        record.funding_transaction_ids = list(
+            diagnosis.funding_transaction_ids
+        )
+        record.accounting_components = dict(diagnosis.accounting_components)
+        record.accounting_status = diagnosis.accounting_status
+        record.authoritative_closed_pnl = diagnosis.net_realized_pnl
+        record.accounting_finalized_at = datetime.now(timezone.utc)
+        record.paper_shadow_pnl = diagnosis.net_realized_pnl
         record.average_close_price = _weighted_average(diagnosis.close_executions)
         record.closed_at = max(
             _exchange_timestamp(item.get("execTime"))
@@ -546,6 +602,8 @@ def apply_demo_execution_repair(
         "rejected_close_execution_ids": diagnosis.rejected_close_execution_ids,
         "conflicting_order_ids": diagnosis.conflicting_order_ids,
         "conflicting_execution_ids": diagnosis.conflicting_execution_ids,
+        "accounting_status": diagnosis.accounting_status,
+        "accounting_components": diagnosis.accounting_components,
     }
     event_types = []
     if diagnosis.rejected_close_order_ids or diagnosis.rejected_close_execution_ids:
@@ -564,6 +622,16 @@ def apply_demo_execution_repair(
         else "EXECUTION_REPAIR_APPLIED",
         "FINAL_REMOTE_STATE_FLAT",
     ]
+    if (
+        diagnosis.accounting_status == "FINAL"
+        and diagnosis.close_executions
+        and (
+        diagnosis.record.realized_exchange_pnl
+        != diagnosis.net_realized_pnl
+        or diagnosis.record.accounting_status != "FINAL"
+        )
+    ):
+        event_types.append("PNL_ACCOUNTING_RECONCILED")
     return repository.repair_demo_execution(
         record,
         event_types=event_types,
@@ -611,6 +679,10 @@ def diagnosis_payload(diagnosis: DemoExecutionDiagnosis) -> dict[str, Any]:
         "conflicting_execution_ids": diagnosis.conflicting_execution_ids,
         "gross_realized_pnl": str(diagnosis.gross_realized_pnl),
         "net_realized_pnl": str(diagnosis.net_realized_pnl),
+        "funding_pnl": str(diagnosis.funding_pnl),
+        "funding_transaction_ids": diagnosis.funding_transaction_ids,
+        "accounting_status": diagnosis.accounting_status,
+        "accounting_components": diagnosis.accounting_components,
         "tp_sl_attempts": [event for event in diagnosis.durable_events if event["event_type"] in {"PROTECTION_PENDING", "DEMO_POSITION_OPEN"}],
         "cleanup_attempts": [event for event in diagnosis.durable_events if event["event_type"] in {"CLOSE_SUBMITTING", "CLOSE_ACK", "CLOSE_Filled"}],
         "entry_order_history": _json_safe(diagnosis.entry_order_history),

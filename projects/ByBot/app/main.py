@@ -527,12 +527,16 @@ def v2_sizing_canary(
 
 
 @app.post("/v2/canary/depth-gate/{symbol}")
-def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
-    """Deterministic no-order replay through the production final depth gate."""
+def v2_depth_gate_canary(
+    symbol: Symbol, gate: str = "depth"
+) -> dict[str, object]:
+    """Deterministic no-order replay through a production pre-submit gate."""
 
     _require_demo_canary()
     if not settings.v2_enabled:
         raise HTTPException(status_code=404, detail="V2 depth canary unavailable")
+    if gate not in {"depth", "price"}:
+        raise HTTPException(status_code=422, detail="unsupported pre-submit gate")
     feature = v2_feature_engine.snapshot(symbol)
     if feature is None or not feature.fresh:
         raise HTTPException(
@@ -563,8 +567,25 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
             - Decimal("1")
         ),
     )
-    final_feature.ask_depth_10bps_usdt = insufficient_depth
-    final_feature.ask_depth_usdt = insufficient_depth
+    if gate == "depth":
+        final_feature.ask_depth_10bps_usdt = insufficient_depth
+        final_feature.ask_depth_usdt = insufficient_depth
+    else:
+        original_spread = max(
+            Decimal("0"), feature.ask_price - feature.bid_price
+        )
+        final_feature.ask_price = feature.ask_price * (
+            Decimal("1")
+            + (
+                settings.v2_max_price_deviation_bps
+                + Decimal("1")
+            )
+            / Decimal("10000")
+        )
+        final_feature.bid_price = max(
+            Decimal("0.00000001"),
+            final_feature.ask_price - original_spread,
+        )
     final_feature.timestamp = datetime.now(timezone.utc)
     final_feature.source_timestamps["orderbook"] = final_feature.timestamp
     score = Decimal("0.64")
@@ -583,7 +604,7 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
     candidate = V2SignalCandidate(
         run_id=v2_run_id,
         strategy_name=StrategyName.VOLUME_BREAKOUT,
-        strategy_version="depth-gate-canary-v1",
+        strategy_version=f"{gate}-gate-canary-v1",
         symbol=symbol,
         side=StrategySide.LONG,
         created_at=now,
@@ -600,7 +621,7 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
         expected_fees_bps=settings.v2_taker_fee_bps * Decimal("2"),
         expected_slippage_bps=slippage,
         expected_funding_bps=Decimal("0"),
-        entry_reason="guarded V2 final executable-depth rejection canary",
+        entry_reason=f"guarded V2 final {gate} rejection canary",
         threshold=Decimal("0.62"),
         distance_to_threshold=score - Decimal("0.62"),
         score_components=ScoreComponents(
@@ -633,11 +654,19 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
     )
     failures_before = sum(v2_runtime.failure_occurrences.values())
     result = coordinator.execute(candidate, manual_canary=True)
-    if not result.get("handled_pre_submit_rejection"):
+    expected_code = (
+        "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT"
+        if gate == "depth"
+        else "FINAL_PRICE_MOVED_BEYOND_TOLERANCE"
+    )
+    if (
+        not result.get("handled_pre_submit_rejection")
+        or result.get("rejection_code") != expected_code
+    ):
         raise HTTPException(
             status_code=409,
             detail={
-                "reason": "depth canary did not reach expected rejection",
+                "reason": f"{gate} canary did not reach expected rejection",
                 "result": result,
             },
         )
@@ -653,6 +682,7 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
     )
     return {
         "stage": "A",
+        "gate": gate,
         "run_id": v2_run_id,
         "candidate_id": str(candidate.id),
         "rejection_code": result.get("rejection_code"),
@@ -662,6 +692,11 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
         ),
         "initial_available_depth_notional_usdt": str(initial_depth),
         "canary_final_available_depth_notional_usdt": str(insufficient_depth),
+        "original_reference_price": str(feature.ask_price),
+        "final_executable_price": str(final_feature.ask_price),
+        "configured_price_tolerance_bps": str(
+            settings.v2_max_price_deviation_bps
+        ),
         "pre_submit_audit": result.get("pre_submit_audit"),
         "reservation_release_result": result.get("reservation_release_result"),
         "reservation_state": reservation.state.value if reservation else None,
@@ -671,7 +706,8 @@ def v2_depth_gate_canary(symbol: Symbol) -> dict[str, object]:
         ),
         "cycle_failures_before": failures_before,
         "cycle_failures_after": failures_after,
-        "production_v2_depth_gate_used": True,
+        "production_v2_pre_submit_gate_used": True,
+        "production_v2_depth_gate_used": gate == "depth",
         "live_execution_blocked": True,
     }
 

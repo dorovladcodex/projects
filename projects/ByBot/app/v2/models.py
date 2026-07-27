@@ -39,6 +39,24 @@ class ReservationState(str, Enum):
     BLOCKED = "BLOCKED"
 
 
+class PreSubmitRejectionCode(str, Enum):
+    """Canonical expected no-mutation admission outcomes."""
+
+    FINAL_EXECUTABLE_DEPTH_INSUFFICIENT = "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT"
+    FINAL_EXECUTABLE_DEPTH_MISSING = "FINAL_EXECUTABLE_DEPTH_MISSING"
+    FINAL_PRICE_MOVED_BEYOND_TOLERANCE = "FINAL_PRICE_MOVED_BEYOND_TOLERANCE"
+    FINAL_SPREAD_TOO_WIDE = "FINAL_SPREAD_TOO_WIDE"
+    SAFE_NOTIONAL_BELOW_MINIMUM = "SAFE_NOTIONAL_BELOW_MINIMUM"
+    PRE_SUBMIT_MARKET_DATA_STALE = "PRE_SUBMIT_MARKET_DATA_STALE"
+    PRE_SUBMIT_MARKET_DATA_UNAVAILABLE = "PRE_SUBMIT_MARKET_DATA_UNAVAILABLE"
+    JIT_SIGNAL_INVALIDATED = "JIT_SIGNAL_INVALIDATED"
+    NET_EDGE_INSUFFICIENT_AFTER_COSTS = "NET_EDGE_INSUFFICIENT_AFTER_COSTS"
+    PORTFOLIO_CAPACITY_UNAVAILABLE = "PORTFOLIO_CAPACITY_UNAVAILABLE"
+    CONCURRENCY_CAP_REACHED = "CONCURRENCY_CAP_REACHED"
+    CORRELATION_CAP_REACHED = "CORRELATION_CAP_REACHED"
+    SYMBOL_UNAVAILABLE_ON_DEMO = "SYMBOL_UNAVAILABLE_ON_DEMO"
+
+
 class SourceHealth(str, Enum):
     OK = "OK"
     DEGRADED = "DEGRADED"
@@ -204,7 +222,7 @@ class V2SizingDecision(BaseModel):
 class PreSubmitRejectionAudit(BaseModel):
     """Durable evidence for an expected no-mutation entry rejection."""
 
-    code: str
+    code: PreSubmitRejectionCode
     message: str
     requested_notional_usdt: Decimal
     minimum_notional_usdt: Decimal
@@ -218,6 +236,12 @@ class PreSubmitRejectionAudit(BaseModel):
     snapshot_timestamp: datetime | None = None
     source_timestamp: datetime | None = None
     snapshot_age_seconds: Decimal | None = None
+    original_reference_price: Decimal | None = None
+    final_executable_price: Decimal | None = None
+    absolute_price_movement: Decimal | None = None
+    price_movement_pct: Decimal | None = None
+    price_movement_bps: Decimal | None = None
+    configured_price_tolerance_bps: Decimal | None = None
     reservation_id: UUID | None = None
     reservation_release_result: str | None = None
     rejected_at: datetime

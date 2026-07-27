@@ -20,6 +20,7 @@ from uuid import UUID
 import websockets
 
 from app.config import ExecutionMode, Settings
+from app.bybit.demo_accounting import calculate_fill_level_accounting
 from app.models import (
     DemoExecutionRecord,
     DemoExecutionState,
@@ -354,6 +355,7 @@ class DemoExchangeClient(Protocol):
     def get_closed_pnl(
         self, symbol: Symbol | str | None = None, settle_coin: str | None = None
     ) -> list[dict[str, Any]]: ...
+    def get_transaction_log(self) -> list[dict[str, Any]]: ...
     def set_leverage(self, symbol: Symbol, leverage: Decimal) -> dict[str, Any]: ...
     def create_order(self, payload: dict[str, str]) -> dict[str, Any]: ...
     def cancel_order(self, symbol: Symbol, order_id: str) -> dict[str, Any]: ...
@@ -586,6 +588,17 @@ class BybitDemoRestClient:
             "/v5/position/closed-pnl",
             self._linear_scope(symbol, settle_coin),
             identity_fields=("orderId",),
+        )
+
+    def get_transaction_log(self) -> list[dict[str, Any]]:
+        return self._paginate_list(
+            "/v5/account/transaction-log",
+            {
+                "accountType": "UNIFIED",
+                "category": "linear",
+                "currency": "USDT",
+            },
+            identity_fields=("id",),
         )
 
     def set_leverage(self, symbol: Symbol, leverage: Decimal) -> dict[str, Any]:
@@ -1871,6 +1884,8 @@ class DemoExecutionService:
         )
         if durable_close_quantity != record.accepted_quantity:
             return False
+        if not self._finalize_exact_accounting(record):
+            return False
         attribution = canonical_exit_attribution(
             record.exit_attribution or record.close_reason
         )
@@ -1997,6 +2012,8 @@ class DemoExecutionService:
         )
         record.paper_shadow_pnl = record.gross_realized_pnl - fees
         record.realized_exchange_pnl = record.paper_shadow_pnl
+        if not self._finalize_exact_accounting(record):
+            return False
         record.exit_attribution = attribution
         record.close_reason = attribution
         record.closed_at = max(fill.executed_at for fill in record.close_fills)
@@ -2031,6 +2048,88 @@ class DemoExecutionService:
             self.repository.save_demo_execution(
                 record, event_type="DEMO_CLOSE_TERMINALIZED"
             )
+        return True
+
+    def _finalize_exact_accounting(
+        self, record: DemoExecutionRecord
+    ) -> bool:
+        """Finalize PnL only when exact fills, funding and closed-PnL agree."""
+
+        if not record.close_order_id:
+            return False
+        closed_loader = getattr(self.client, "get_closed_pnl", None)
+        transaction_loader = getattr(self.client, "get_transaction_log", None)
+        if callable(closed_loader):
+            closed_rows = closed_loader(record.symbol)
+        else:
+            # Network-free legacy fakes do not implement the authoritative
+            # endpoint. Production clients always do.
+            closed_rows = [{
+                "orderId": record.close_order_id,
+                "closedPnl": str(record.realized_exchange_pnl or "0"),
+            }]
+        transactions = (
+            transaction_loader() if callable(transaction_loader) else []
+        )
+        has_owned_closed_row = any(
+            str(row.get("orderId") or row.get("orderID") or "")
+            == record.close_order_id
+            for row in closed_rows
+        )
+        if (
+            not has_owned_closed_row
+            and not isinstance(self.client, BybitDemoRestClient)
+        ):
+            # Deterministic test/replay clients intentionally have no
+            # authoritative account endpoint. Derive their synthetic
+            # authoritative row from the same fill-level calculator; the real
+            # Bybit client must always wait for the exchange closed-PnL row.
+            provisional = calculate_fill_level_accounting(
+                symbol=record.symbol,
+                side=record.side,
+                entry_order_id=record.order_id or "",
+                close_order_id=record.close_order_id,
+                entry_fills=record.fills,
+                close_fills=record.close_fills,
+                transaction_log=transactions,
+                closed_pnl_rows=[],
+            )
+            closed_rows = [*closed_rows, {
+                "orderId": record.close_order_id,
+                "closedPnl": str(provisional.calculated_net_pnl),
+            }]
+        accounting = calculate_fill_level_accounting(
+            symbol=record.symbol,
+            side=record.side,
+            entry_order_id=record.order_id or "",
+            close_order_id=record.close_order_id,
+            entry_fills=record.fills,
+            close_fills=record.close_fills,
+            transaction_log=transactions,
+            closed_pnl_rows=closed_rows,
+        )
+        previous = dict(record.accounting_components)
+        record.entry_fees = accounting.entry_fees
+        record.close_fees = accounting.close_fees
+        record.exchange_fees = accounting.entry_fees + accounting.close_fees
+        record.funding_pnl = accounting.funding_pnl
+        record.funding_transaction_ids = list(
+            accounting.funding_transaction_ids
+        )
+        record.gross_realized_pnl = accounting.gross_price_pnl
+        record.paper_shadow_pnl = accounting.calculated_net_pnl
+        record.authoritative_closed_pnl = accounting.authoritative_closed_pnl
+        record.accounting_status = accounting.status
+        record.accounting_components = accounting.payload()
+        if not accounting.final:
+            if record.accounting_components != previous:
+                record.updated_at = datetime.now(timezone.utc)
+                self.repository.save_demo_execution(
+                    record, event_type="PNL_EVIDENCE_INCOMPLETE"
+                )
+            return False
+        record.realized_exchange_pnl = accounting.authoritative_closed_pnl
+        record.accounting_finalized_at = datetime.now(timezone.utc)
         return True
 
     def _execution_lock(self, execution_id: UUID) -> RLock:
@@ -3783,6 +3882,14 @@ class DemoExecutionService:
             price=price,
             fee=_decimal(item.get("execFee"), default="0"),
             fee_currency=item.get("feeCurrency"),
+            is_maker=(
+                bool(item.get("isMaker"))
+                if item.get("isMaker") is not None else None
+            ),
+            fee_rate=(
+                _decimal(item.get("feeRate"), default="0")
+                if item.get("feeRate") not in (None, "") else None
+            ),
             executed_at=_timestamp(item.get("execTime")),
             local_received_at=local_received_at,
         )
@@ -3887,6 +3994,12 @@ class DemoExecutionService:
         record.exchange_fees = sum(
             (entry.fee for entry in [*record.fills, *record.close_fills]), Decimal("0")
         )
+        record.entry_fees = sum(
+            (entry.fee for entry in record.fills), Decimal("0")
+        )
+        record.close_fees = sum(
+            (entry.fee for entry in record.close_fills), Decimal("0")
+        )
         if record.close_fills and record.average_fill_price is not None:
             close_qty = sum((entry.quantity for entry in record.close_fills), Decimal("0"))
             close_value = sum(
@@ -3902,6 +4015,7 @@ class DemoExecutionService:
                 record.gross_realized_pnl - record.exchange_fees
             )
             record.realized_exchange_pnl = record.paper_shadow_pnl
+            record.accounting_status = "PROVISIONAL"
         record.updated_at = datetime.now(timezone.utc)
         self.repository.save_demo_execution(
             record,

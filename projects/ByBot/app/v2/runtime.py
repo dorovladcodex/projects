@@ -18,6 +18,11 @@ from app.models import Symbol
 from app.news.service import NewsService
 from app.v2.analytics import V2ReportGenerator
 from app.v2.drain import V2DrainController, V2RunPhase
+from app.v2.dependency_health import (
+    DependencyHealthState,
+    ExternalDependencyHealth,
+    ExternalDependencySafetyError,
+)
 from app.v2.execution import V2ExecutionCoordinator
 from app.v2.market import (
     BybitPublicWebSocketEngine, BybitRestMetricsPoller, RollingFeatureEngine,
@@ -220,6 +225,16 @@ class V2Runtime:
         self.failure_occurrences: dict[str, int] = dict(
             restored.get("failure_occurrences") or {}
         )
+        self.dependency_health = ExternalDependencyHealth(
+            run_id=run_id,
+            repository=repository,
+            initial_backoff_seconds=(
+                settings.v2_dependency_backoff_initial_seconds
+            ),
+            maximum_backoff_seconds=settings.v2_dependency_backoff_max_seconds,
+            hard_outage_seconds=settings.v2_dependency_hard_outage_seconds,
+            restored=restored.get("external_dependency_health"),
+        )
         self.news_metrics: dict[str, int] = {
             "items_received": 0, "raw_news_feed_items_received": 0,
             "unique_news_items_discovered": 0, "items_deduplicated": 0,
@@ -301,18 +316,56 @@ class V2Runtime:
         cycle_id = f"{self.run_id}:{self.cycles + 1}"
         cycle_failures_before = sum(self.failure_occurrences.values())
         now = datetime.now(timezone.utc)
-        if self._last_rest_poll_at is None or (
+        rest_poll_completed = False
+        if (
+            (self._last_rest_poll_at is None or (
             now - self._last_rest_poll_at
-        ).total_seconds() >= self.settings.v2_rest_metrics_interval_seconds:
+            ).total_seconds() >= self.settings.v2_rest_metrics_interval_seconds)
+            and self.dependency_health.should_attempt(now)
+        ):
             try:
                 await asyncio.to_thread(
                     self.rest_metrics.poll, self.universe.accepted_symbols
                 )
+                rest_poll_completed = True
                 self._last_rest_poll_at = now
-                if self.external_trends is not None:
-                    await self.external_trends.poll()
+                if (
+                    self.dependency_health.state
+                    != DependencyHealthState.HEALTHY
+                ):
+                    self.dependency_health.begin_recovery()
+                    reconciliation = await asyncio.to_thread(
+                        self.execution.demo_execution.reconcile
+                    )
+                    if reconciliation.get("status") not in {"OK", "DISABLED"}:
+                        raise ExternalDependencySafetyError(
+                            "authoritative Demo reconciliation did not recover"
+                        )
+                    active_count, protected = self._active_protection_state()
+                    self.dependency_health.record_recovered(
+                        dependency="bybit_rest",
+                        active_position_count=active_count,
+                        protection_confirmed=protected,
+                        authoritative_reconciliation_succeeded=True,
+                    )
             except Exception as exc:
-                self._record_failure(exc, stage="rest_metrics", cycle_id=cycle_id)
+                if not self._handle_dependency_failure(
+                    exc, stage="rest_metrics", cycle_id=cycle_id
+                ):
+                    self._record_failure(
+                        exc, stage="rest_metrics", cycle_id=cycle_id
+                    )
+        if (
+            rest_poll_completed
+            and self.external_trends is not None
+            and not self.entries_paused
+        ):
+            try:
+                await self.external_trends.poll()
+            except Exception as exc:
+                self._record_external_source_degradation(
+                    exc, source="external_trends"
+                )
         # News has an independent cadence and may include slow RSS/LLM work.
         # It must never serialize market admission or execution dispatch.
         news_task = asyncio.create_task(self._process_news(cycle_id))
@@ -321,12 +374,21 @@ class V2Runtime:
             await news_task
         except Exception as exc:
             self._record_failure(exc, stage="news_pipeline", cycle_id=cycle_id)
-        try:
-            self._enforce_terminalization_invariants()
-            self._sync_reservations()
-            self._monitor_positions()
-        except Exception as exc:
-            self._record_failure(exc, stage="position_monitoring", cycle_id=cycle_id)
+        self._sync_reservations()
+        if (
+            self.dependency_health.state == DependencyHealthState.HEALTHY
+            or self.dependency_health.should_attempt()
+        ):
+            try:
+                self._enforce_terminalization_invariants()
+                self._monitor_positions()
+            except Exception as exc:
+                if not self._handle_dependency_failure(
+                    exc, stage="position_monitoring", cycle_id=cycle_id
+                ):
+                    self._record_failure(
+                        exc, stage="position_monitoring", cycle_id=cycle_id
+                    )
         self.cycles += 1
         self.last_cycle_at = datetime.now(timezone.utc)
         self.last_error = (
@@ -339,13 +401,23 @@ class V2Runtime:
 
     def refresh_universe_if_due(self) -> None:
         now = datetime.now(timezone.utc)
+        if not self.dependency_health.should_attempt(now):
+            return
         if self.universe.last_refresh_at is None or (
             now - self.universe.last_refresh_at
         ).total_seconds() >= self.settings.v2_universe_refresh_seconds:
-            self.universe.refresh(now=now)
+            try:
+                self.universe.refresh(now=now)
+            except Exception as exc:
+                if not self._handle_dependency_failure(
+                    exc,
+                    stage="universe_refresh",
+                    cycle_id=f"{self.run_id}:universe-refresh",
+                ):
+                    raise
 
     async def _process_news(self, cycle_id: str) -> None:
-        if self.stop_new_entries:
+        if self.entries_paused:
             return
         executable: list[V2SignalCandidate] = []
         self._increment(
@@ -535,7 +607,7 @@ class V2Runtime:
         )
 
     async def _process_market_strategies(self, cycle_id: str) -> None:
-        if self.stop_new_entries:
+        if self.entries_paused:
             return
         executable: list[V2SignalCandidate] = []
         dispatches: list[tuple[V2SignalCandidate, asyncio.Future[Any]]] = []
@@ -846,7 +918,7 @@ class V2Runtime:
     async def _execute_concurrently(
         self, candidates: list[V2SignalCandidate], cycle_id: str
     ) -> None:
-        if not self.settings.v2_auto_demo_execution or self.stop_new_entries:
+        if not self.settings.v2_auto_demo_execution or self.entries_paused:
             return
         dispatches = [
             (candidate, future)
@@ -858,7 +930,7 @@ class V2Runtime:
     def _dispatch_now(
         self, candidate: V2SignalCandidate,
     ) -> asyncio.Future[Any] | None:
-        if not self.settings.v2_auto_demo_execution or self.stop_new_entries:
+        if not self.settings.v2_auto_demo_execution or self.entries_paused:
             return None
         candidate.execution_queue_entered_at = datetime.now(timezone.utc)
         self.repository.save_v2_signal_candidate(candidate)
@@ -1209,6 +1281,79 @@ class V2Runtime:
             },
         )
 
+    def _handle_dependency_failure(
+        self, exc: Exception, *, stage: str, cycle_id: str
+    ) -> bool:
+        active_count, protected = self._active_protection_state()
+        host = (
+            "api-demo.bybit.com"
+            if stage == "position_monitoring"
+            else "api.bybit.com"
+        )
+        decision = self.dependency_health.record_failure(
+            exc,
+            dependency="bybit_rest",
+            host=host,
+            active_position_count=active_count,
+            protection_confirmed=protected,
+        )
+        if not decision.handled:
+            return False
+        self.last_error = "external dependency is temporarily degraded"
+        if decision.hard_failure:
+            blocker = (
+                "Bybit REST outage exceeded the bounded safety window"
+                if protected
+                else "Bybit REST outage left protection unconfirmed"
+            )
+            self.stop_new_entries = True
+            self.run_valid = False
+            if blocker not in self.run_invalid_reasons:
+                self.run_invalid_reasons.append(blocker)
+            self._record_failure(
+                ExternalDependencySafetyError(blocker),
+                stage="external_dependency_hard_failure",
+                cycle_id=cycle_id,
+            )
+        return True
+
+    def _active_protection_state(self) -> tuple[int, bool]:
+        terminal = {
+            "DEMO_CLOSED", "DEMO_CLOSED_AFTER_FAILURE",
+            "DEMO_NOT_SUBMITTED", "DEMO_ORDER_CANCELLED",
+            "DEMO_CLOSED_AFTER_INTERRUPTION", "DEMO_CLOSED_EXTERNALLY",
+            "DEMO_FAILED_FLAT_VERIFIED", "DEMO_FAILED",
+        }
+        active = [
+            item for item in self.repository.load_demo_executions()
+            if item.state.value not in terminal and item.accepted_quantity > 0
+        ]
+        return len(active), all(item.protection_confirmed for item in active)
+
+    def _record_external_source_degradation(
+        self, exc: Exception, *, source: str
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        fingerprint = hashlib.sha256(
+            f"{self.run_id}:{source}:{type(exc).__name__}".encode()
+        ).hexdigest()[:24]
+        self.repository.save_v2_incident(V2Incident(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"bybot-v2-external-source:{self.run_id}:{fingerprint}",
+            ),
+            run_id=self.run_id,
+            event_type="EXTERNAL_SOURCE_DEGRADED",
+            error_category=type(exc).__name__,
+            payload={
+                "source": source,
+                "message": _sanitize_runtime_error(str(exc)),
+                "entries_paused": False,
+                "last_seen_at": now.isoformat(),
+            },
+            occurred_at=now,
+        ))
+
     def _persist_news_audit(self, event_type: str, payload: dict[str, Any]) -> None:
         identity = str(payload.get("news_id") or "unknown")
         fingerprint = hashlib.sha256(
@@ -1296,6 +1441,7 @@ class V2Runtime:
             },
             "failure_occurrences": self.failure_occurrences,
             "failure_circuit_breaker_active": self.failure_circuit_breaker_active,
+            "external_dependency_health": self.dependency_health.snapshot(),
             "news_metrics": self.news_metrics,
             "news_source_metrics": self.news_aggregator.source_metrics,
             "stale_metrics": {
@@ -1507,12 +1653,14 @@ class V2Runtime:
             "last_cycle_at": self.last_cycle_at.isoformat() if self.last_cycle_at else None,
             "last_error": self.last_error, "cycles": self.cycles,
             "stop_new_entries": self.stop_new_entries,
+            "entries_paused": self.entries_paused,
+            "external_dependency_health": self.dependency_health.snapshot(),
             "run_valid": self.run_valid,
             "run_invalid_reasons": list(self.run_invalid_reasons),
             "run_phase": drain_status.phase.value,
             "entries_allowed": bool(
                 drain_status.entries_allowed
-                and not self.stop_new_entries
+                and not self.entries_paused
                 and self.run_valid
             ),
             "nominal_end_at": (
@@ -1732,8 +1880,14 @@ class V2Runtime:
     def execution_entries_allowed(self) -> bool:
         return bool(
             self.drain.phase == V2RunPhase.RUNNING
-            and not self.stop_new_entries
+            and not self.entries_paused
             and self.run_valid
+        )
+
+    @property
+    def entries_paused(self) -> bool:
+        return bool(
+            self.stop_new_entries or self.dependency_health.entries_paused
         )
 
     def _restore_finalization_on_startup(self) -> None:

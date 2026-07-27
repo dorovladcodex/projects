@@ -1598,6 +1598,18 @@ class PersistenceRepository:
                 )
                 if candidate is not None:
                     _set_candidate_demo_state(candidate, record.state)
+                if "PNL_ACCOUNTING_RECONCILED" in event_types:
+                    portfolio_state = session.get(
+                        V2PortfolioStateRow, 1, with_for_update=True
+                    )
+                    if portfolio_state is not None:
+                        portfolio_state.payload = (
+                            _reconcile_v2_portfolio_accounting_payload(
+                                dict(portfolio_state.payload),
+                                record,
+                            )
+                        )
+                        portfolio_state.updated_at = record.updated_at
                 base_time = record.updated_at
                 for index, event_type in enumerate(event_types):
                     occurred_at = base_time + timedelta(microseconds=index)
@@ -2744,6 +2756,10 @@ def _preserve_demo_execution_monotonic_state(
         "position_confirmed_at", "protection_confirmed_at",
         "close_order_id", "close_order_link_id", "average_close_price",
         "gross_realized_pnl", "realized_exchange_pnl", "paper_shadow_pnl",
+        "entry_fees", "close_fees", "funding_pnl",
+        "funding_transaction_ids", "accounting_components",
+        "authoritative_closed_pnl", "accounting_status",
+        "accounting_finalized_at",
         "close_reason", "exit_attribution", "exit_attribution_evidence",
         "closed_at", "cleanup_result",
     ):
@@ -2784,6 +2800,72 @@ def _demo_execution_row(record: DemoExecutionRecord) -> DemoExecutionRow:
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
+
+
+def _reconcile_v2_portfolio_accounting_payload(
+    payload: dict[str, Any], record: DemoExecutionRecord,
+) -> dict[str, Any]:
+    """Replace one already-applied ledger value without applying it twice."""
+
+    if record.realized_exchange_pnl is None or record.closed_at is None:
+        raise ValueError("final accounting requires realized PnL and close time")
+    events = {
+        str(key): dict(value)
+        for key, value in dict(payload.get("realized_events") or {}).items()
+    }
+    execution_id = str(record.id)
+    if execution_id not in events:
+        raise ValueError(
+            "accounting reconciliation cannot create a missing ledger event"
+        )
+    events[execution_id] = {
+        **events[execution_id],
+        "pnl": str(record.realized_exchange_pnl),
+        "closed_at": record.closed_at.isoformat(),
+        "fees": str(record.exchange_fees),
+        "funding_pnl": str(record.funding_pnl),
+        "accounting_status": record.accounting_status,
+        "symbol": record.symbol.value,
+    }
+    now = record.updated_at
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = day_start - timedelta(days=day_start.weekday())
+    parsed: list[tuple[datetime, Decimal]] = []
+    for value in events.values():
+        try:
+            stamp = datetime.fromisoformat(
+                str(value["closed_at"]).replace("Z", "+00:00")
+            )
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            parsed.append((stamp.astimezone(timezone.utc), Decimal(value["pnl"])))
+        except (KeyError, ValueError):
+            continue
+    cumulative = sum((value for _, value in parsed), Decimal("0"))
+    daily = sum(
+        (value for stamp, value in parsed if stamp >= day_start), Decimal("0")
+    )
+    weekly = sum(
+        (value for stamp, value in parsed if stamp >= week_start), Decimal("0")
+    )
+    capital = Decimal(str(payload.get("risk_capital_usdt") or "0"))
+    unrealized = Decimal(str(payload.get("unrealized_pnl") or "0"))
+    equity = capital + cumulative + unrealized
+    peak = max(Decimal(str(payload.get("peak_equity") or capital)), equity)
+    drawdown = (
+        (peak - equity) / peak * Decimal("100")
+        if peak > 0 else Decimal("0")
+    )
+    return {
+        **payload,
+        "realized_events": events,
+        "cumulative_realized_pnl": str(cumulative),
+        "daily_pnl": str(daily),
+        "weekly_pnl": str(weekly),
+        "equity": str(equity),
+        "peak_equity": str(peak),
+        "current_drawdown_pct": str(drawdown),
+    }
 
 
 def _set_candidate_demo_state(

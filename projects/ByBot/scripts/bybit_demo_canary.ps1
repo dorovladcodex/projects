@@ -8,6 +8,7 @@ param(
     [switch]$ExerciseFlatDuringProtectionRace,
     [switch]$EnterDrainBeforeFlatRace,
     [switch]$ExerciseDepthGate,
+    [switch]$ExercisePriceGate,
     [ValidateSet(0, 100, 200)]
     [int]$V2SizingTier = 0,
     [switch]$SkipControlledRestart,
@@ -587,14 +588,20 @@ try {
         )
         Write-Host "V2 EXECUTION PREFLIGHT: PASS"
     }
-    if ($ExerciseDepthGate) {
+    if ($ExerciseDepthGate -or $ExercisePriceGate) {
         Assert-Condition ($V2SizingTier -eq 100) `
-            "Depth-gate canary requires V2SizingTier 100"
+            "Pre-submit gate canary requires V2SizingTier 100"
+        $gateQuery = if ($ExercisePriceGate) { "?gate=price" } else { "" }
         $depthGate = Invoke-Api -Method "POST" `
-            -Path "/v2/canary/depth-gate/$Symbol" -TimeoutSec 90
+            -Path "/v2/canary/depth-gate/${Symbol}${gateQuery}" -TimeoutSec 90
+        $expectedRejection = if ($ExercisePriceGate) {
+            "FINAL_PRICE_MOVED_BEYOND_TOLERANCE"
+        } else {
+            "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT"
+        }
         Assert-Condition (
-            $depthGate.rejection_code -eq "FINAL_EXECUTABLE_DEPTH_INSUFFICIENT"
-        ) "Stage A did not produce the expected final-depth rejection"
+            $depthGate.rejection_code -eq $expectedRejection
+        ) "Stage A did not produce the expected pre-submit rejection"
         Assert-Condition ($depthGate.execution_created -eq $false) `
             "Stage A created a durable Demo execution"
         Assert-Condition (
@@ -608,8 +615,8 @@ try {
             [int]$depthGate.cycle_failures_after -eq
             [int]$depthGate.cycle_failures_before
         ) "Stage A created a cycle failure"
-        Write-Host "DEPTH GATE STAGE A REJECTION: PASS"
-        Write-Host "DEPTH GATE STAGE A RESERVATION RELEASE: PASS"
+        Write-Host "PRE-SUBMIT GATE STAGE A REJECTION: PASS"
+        Write-Host "PRE-SUBMIT GATE STAGE A RESERVATION RELEASE: PASS"
     }
     $initialUnrelatedOrders = [int]$demo.unrelated_open_orders
     Write-Host "DEMO ACCOUNT VERIFIED: PASS"
@@ -933,6 +940,13 @@ try {
         Assert-Condition ([bool]$closed.close_order_id) "Close order ID is missing"
         Assert-Condition (@($closed.close_fills).Count -gt 0) "Close fill was not persisted"
         Assert-Condition ($null -ne $closed.exchange_fees) "Exchange fees are missing"
+        Assert-Condition ($closed.accounting_status -eq "FINAL") `
+            "Fill-level accounting is not final"
+        Assert-Condition (
+            [decimal]$closed.realized_exchange_pnl -eq
+            [decimal]$closed.authoritative_closed_pnl
+        ) "Durable PnL does not equal authoritative exchange PnL"
+        Write-Host "FILL-LEVEL PNL: PASS"
         Write-Host "DEMO REDUCE-ONLY CLOSE: PASS"
     }
 

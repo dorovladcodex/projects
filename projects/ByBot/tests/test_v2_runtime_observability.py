@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from urllib.error import URLError
+import socket
 
 from app.config import Settings
 from app.models import NewsItem, Symbol
@@ -285,6 +287,50 @@ def test_repeated_failures_are_fingerprinted_and_counted(tmp_path) -> None:
 
     assert len(repo.incidents) == 1
     assert next(iter(repo.incidents.values())).payload["occurrence_count"] == 2
+
+
+def test_dns_outage_pauses_entries_without_cycle_failure_and_recovers(
+    tmp_path,
+) -> None:
+    app, repo, execution = runtime(tmp_path, (Symbol.BTCUSDT,))
+    app._last_rest_poll_at = None
+    app.rest_metrics.poll = lambda symbols: (_ for _ in ()).throw(
+        URLError(socket.gaierror(11001, "getaddrinfo failed"))
+    )
+
+    asyncio.run(app.cycle())
+
+    assert app.failure_occurrences == {}
+    assert app.dependency_health.entries_paused
+    assert app.features.calls == []
+    incidents = list(repo.incidents.values())
+    assert len(incidents) == 1
+    assert incidents[0].event_type == "EXTERNAL_DEPENDENCY_OUTAGE"
+
+    app.dependency_health.next_retry_at = datetime.now(timezone.utc)
+    app.rest_metrics.poll = lambda symbols: None
+    execution.demo_execution.reconcile = lambda: {"status": "OK"}
+    asyncio.run(app.cycle())
+
+    assert not app.dependency_health.entries_paused
+    assert app.failure_occurrences == {}
+    assert app.features.calls == [Symbol.BTCUSDT]
+    assert len(repo.incidents) == 1
+
+
+def test_dns_outage_during_draining_never_regresses_phase(tmp_path) -> None:
+    app, _, _ = runtime(tmp_path, (Symbol.BTCUSDT,))
+    app.begin_draining()
+    app._last_rest_poll_at = None
+    app.rest_metrics.poll = lambda symbols: (_ for _ in ()).throw(
+        URLError(socket.gaierror(11001, "getaddrinfo failed"))
+    )
+
+    asyncio.run(app.cycle())
+
+    assert app.status()["run_phase"] in {"DRAINING", "RECONCILING", "FINISHED"}
+    assert app.status()["run_phase"] != "RUNNING"
+    assert app.failure_occurrences == {}
 
 
 def test_handled_cooldown_rejection_is_not_cycle_failure_and_preserves_context(

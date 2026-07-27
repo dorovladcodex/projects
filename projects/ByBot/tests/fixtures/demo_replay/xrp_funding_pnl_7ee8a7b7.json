@@ -1,0 +1,57 @@
+{
+  "execution_id": "7ee8a7b7-c536-4027-af3e-f4b2c200bb5c",
+  "run_id": "demo-v2-20260726T141621242Z",
+  "symbol": "XRPUSDT",
+  "side": "BUY",
+  "entry_order_id": "c321b121-14ed-4adc-90dd-407f371c0f50",
+  "close_order_id": "840f73bc-0aa2-4004-bcc8-97806af472b7",
+  "entry_fills": [
+    {
+      "execId": "11d92092-7700-47ab-9ed1-e13ae496afac",
+      "orderId": "c321b121-14ed-4adc-90dd-407f371c0f50",
+      "execQty": "181",
+      "execPrice": "1.1044",
+      "execFee": "0.10994302",
+      "feeCurrency": "USDT",
+      "execTime": "1785080229263",
+      "isMaker": false
+    }
+  ],
+  "close_fills": [
+    {
+      "execId": "49dc4b9a-3f6b-4963-b592-11a1cf35d4f0",
+      "orderId": "840f73bc-0aa2-4004-bcc8-97806af472b7",
+      "execQty": "181",
+      "execPrice": "1.1017",
+      "execFee": "0.10967424",
+      "feeCurrency": "USDT",
+      "execTime": "1785082157464",
+      "isMaker": false
+    }
+  ],
+  "transaction_log": [
+    {
+      "id": "573446978_XRPUSDT_140711760834482_0",
+      "type": "SETTLEMENT",
+      "symbol": "XRPUSDT",
+      "side": "Buy",
+      "currency": "USDT",
+      "qty": "181",
+      "size": "181",
+      "funding": "-0.00298764",
+      "transactionTime": "1785081600000"
+    }
+  ],
+  "closed_pnl": [
+    {
+      "orderId": "840f73bc-0aa2-4004-bcc8-97806af472b7",
+      "closedPnl": "-0.71130490"
+    }
+  ],
+  "gross_price_pnl": "-0.4887",
+  "entry_fee": "0.10994302",
+  "close_fee": "0.10967424",
+  "funding_pnl": "-0.00298764",
+  "expected_net_pnl": "-0.71130490",
+  "old_durable_net_pnl": "-0.70831726"
+}

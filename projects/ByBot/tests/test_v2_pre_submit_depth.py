@@ -27,6 +27,12 @@ FIXTURE = (
     / "demo_replay"
     / "wif_cycle_160_final_depth.json"
 )
+PRICE_FIXTURE = (
+    Path(__file__).parent
+    / "fixtures"
+    / "demo_replay"
+    / "eth_cycle_1166_jit_price.json"
+)
 
 
 class GuardAwareDemo(DemoStub):
@@ -147,8 +153,8 @@ def test_reservation_release_is_exactly_once_and_restart_safe() -> None:
 @pytest.mark.parametrize(
     ("snapshot_kwargs", "code"),
     [
-        ({"fresh": False}, "FINAL_MARKET_DATA_STALE"),
-        ({"age_seconds": 10}, "FINAL_MARKET_DATA_STALE"),
+        ({"fresh": False}, "PRE_SUBMIT_MARKET_DATA_STALE"),
+        ({"age_seconds": 10}, "PRE_SUBMIT_MARKET_DATA_STALE"),
         (
             {"ask_depth": "0", "full_depth": "0"},
             "FINAL_EXECUTABLE_DEPTH_MISSING",
@@ -175,7 +181,7 @@ def test_missing_snapshot_is_precise_no_order_rejection() -> None:
 
     result = service.execute(candidate)
 
-    assert result["rejection_code"] == "FINAL_MARKET_DATA_UNAVAILABLE"
+    assert result["rejection_code"] == "PRE_SUBMIT_MARKET_DATA_UNAVAILABLE"
     assert demo.exchange_mutations == 0
 
 
@@ -222,6 +228,52 @@ def test_wif_cycle_160_replay_is_expected_depth_rejection() -> None:
     assert result["exchange_order_submission_invoked"] is False
     assert result["reservation_release_result"] == "RELEASED"
     assert demo.exchange_mutations == 0
+
+
+def test_eth_cycle_1166_price_move_is_typed_no_order_rejection() -> None:
+    replay = json.loads(PRICE_FIXTURE.read_text(encoding="utf-8"))
+    service, repository, demo, candidate = _guarded_service(Symbol.ETHUSDT)
+    candidate.feature_snapshot.ask_price = Decimal(
+        replay["original_reference_price"]
+    )
+    candidate.feature_snapshot.last_price = Decimal(
+        replay["original_reference_price"]
+    )
+    snapshot = _snapshot(symbol=Symbol.ETHUSDT)
+    snapshot.ask_price = Decimal(replay["replay_final_executable_price"])
+    snapshot.last_price = snapshot.ask_price
+    service.market_snapshot_provider = lambda symbol: snapshot
+
+    result = service.execute(candidate)
+
+    assert result["rejection_code"] == replay["expected_rejection_code"]
+    audit = result["pre_submit_audit"]
+    assert audit["original_reference_price"] == replay["original_reference_price"]
+    assert audit["final_executable_price"] == replay[
+        "replay_final_executable_price"
+    ]
+    assert Decimal(audit["price_movement_bps"]) > Decimal(
+        replay["configured_tolerance_bps"]
+    )
+    assert result["exchange_order_submission_invoked"] is False
+    assert result["reservation_release_result"] == "RELEASED"
+    assert repository.load_demo_executions() == []
+    assert demo.exchange_mutations == 0
+
+
+def test_price_inside_tolerance_proceeds() -> None:
+    service, _, demo, candidate = _guarded_service(Symbol.ETHUSDT)
+    candidate.feature_snapshot.ask_price = Decimal("1920.80")
+    candidate.feature_snapshot.last_price = Decimal("1920.80")
+    snapshot = _snapshot(symbol=Symbol.ETHUSDT)
+    snapshot.ask_price = Decimal("1922.00")
+    snapshot.last_price = snapshot.ask_price
+    service.market_snapshot_provider = lambda symbol: snapshot
+
+    result = service.execute(candidate)
+
+    assert result["execution_attempted"] is True
+    assert demo.exchange_mutations == 1
 
 
 def test_runtime_records_rejection_without_cycle_or_persistence_failure(
