@@ -5,6 +5,8 @@ param(
     [Nullable[decimal]]$MaxNotionalUSDT = $null,
     [decimal]$MarketPriceBufferPct = 5,
     [switch]$ExerciseTrailingUpdate,
+    [switch]$ExerciseMarketInvalidation,
+    [switch]$InjectMonitorStatusTimeout,
     [switch]$ExerciseFlatDuringProtectionRace,
     [switch]$EnterDrainBeforeFlatRace,
     [switch]$ExerciseDepthGate,
@@ -50,6 +52,8 @@ $script:ExecutionsBeforeRestart = $null
 $script:ExecutionsAfterRestart = $null
 $script:AdmissionsBeforeRestart = $null
 $script:AdmissionsAfterRestart = $null
+$script:ProtectionInvalidation = $null
+$script:MonitorDegradation = $null
 
 function Assert-Condition {
     param([bool]$Condition, [string]$Message)
@@ -162,15 +166,90 @@ function Restore-Environment {
     }
 }
 
+function Write-ControllerEvent {
+    param(
+        [string]$Event,
+        [string]$Stage,
+        [datetimeoffset]$StartedAt,
+        [int]$TimeoutSeconds,
+        [string]$Status = $null,
+        [string]$ErrorMessage = $null
+    )
+    if (-not $script:ControllerEventsPath) { return }
+    $now = [DateTimeOffset]::UtcNow
+    $payload = [ordered]@{
+        event = $Event
+        stage = $Stage
+        occurred_at = $now.ToString("o")
+        started_at = $StartedAt.ToString("o")
+        elapsed_seconds = [Math]::Round(($now - $StartedAt).TotalSeconds, 3)
+        timeout_seconds = $TimeoutSeconds
+        status = $Status
+        error = Protect-Text $ErrorMessage
+        controller_pid = $PID
+        uvicorn_pid = if ($script:Child) { $script:Child.Id } else { $null }
+    }
+    Add-Content -LiteralPath $script:ControllerEventsPath -Value (
+        $payload | ConvertTo-Json -Compress
+    ) -Encoding UTF8
+}
+
+function Invoke-ControllerStep {
+    param(
+        [string]$Stage,
+        [int]$TimeoutSeconds,
+        [scriptblock]$Action
+    )
+    $started = [DateTimeOffset]::UtcNow
+    Write-ControllerEvent "CONTROLLER_STEP_STARTED" $Stage $started $TimeoutSeconds
+    try {
+        $result = & $Action
+        $elapsed = ([DateTimeOffset]::UtcNow - $started).TotalSeconds
+        if ($elapsed -gt $TimeoutSeconds) {
+            throw "$Stage exceeded its bounded timeout of $TimeoutSeconds seconds"
+        }
+        Write-ControllerEvent "CONTROLLER_STEP_FINISHED" $Stage $started `
+            $TimeoutSeconds "PASS"
+        return $result
+    }
+    catch {
+        Write-ControllerEvent "CONTROLLER_STEP_FINISHED" $Stage $started `
+            $TimeoutSeconds "FAIL" $_.Exception.Message
+        throw
+    }
+}
+
 function Invoke-NativeCommand {
-    param([string]$FilePath, [string[]]$Arguments, [string]$Label)
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments,
+        [string]$Label,
+        [int]$TimeoutSeconds = 120
+    )
     $stdoutPath = [IO.Path]::GetTempFileName()
     $stderrPath = [IO.Path]::GetTempFileName()
+    $process = $null
     try {
         $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments `
-            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutPath `
+            -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath
+        # Retain the real native process handle on Windows PowerShell 5.1.
+        [void]$process.Handle
+        $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $exited) {
+            & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
+            $process.WaitForExit()
+            $process.Refresh()
+            throw "$Label timed out after $TimeoutSeconds seconds"
+        }
+        # Windows PowerShell 5.1 can expose a stale/null ExitCode after a
+        # timed WaitForExit when output is redirected.
+        $process.WaitForExit()
+        $process.Refresh()
         $exitCode = $process.ExitCode
+        if ($null -eq $exitCode) {
+            throw "$Label exit code was not captured"
+        }
         $stdout = [IO.File]::ReadAllText($stdoutPath)
         $stderr = [IO.File]::ReadAllText($stderrPath)
         if ($stdout) { Write-Host (Protect-Text $stdout.TrimEnd()) }
@@ -180,6 +259,7 @@ function Invoke-NativeCommand {
         return $stdout
     }
     finally {
+        if ($process) { $process.Dispose() }
         Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
 }
@@ -230,15 +310,21 @@ if ($ValidateLotGuardOnly) {
 
 function Stop-Uvicorn {
     if ($null -eq $script:Child) { return }
+    $rootPid = $script:Child.Id
     try {
         if (-not $script:Child.HasExited) {
             $script:Child.CloseMainWindow() | Out-Null
             if (-not $script:Child.WaitForExit(5000)) {
-                $script:Child.Kill()
-                $script:Child.WaitForExit()
+                & taskkill.exe /PID $rootPid /T /F 2>$null | Out-Null
             }
         }
-        else { $script:Child.WaitForExit() }
+        if (-not $script:Child.HasExited) {
+            $script:Child.WaitForExit()
+        }
+        else {
+            $script:Child.WaitForExit()
+        }
+        $script:Child.Refresh()
     }
     finally {
         $script:Child.Dispose()
@@ -429,6 +515,8 @@ function Write-CanaryReport {
         no_candidate_created = $script:NoCandidateCreated
         no_reservation_created = $script:NoReservationCreated
         no_order_submitted = $script:NoOrderSubmitted
+        protection_invalidation = $script:ProtectionInvalidation
+        monitor_degradation = $script:MonitorDegradation
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
         execution_report = $Status
     }
@@ -522,6 +610,7 @@ try {
     $script:RunId = "demo-canary-" + [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
     $script:ArtifactDir = Join-Path (Get-Location) "artifacts\demo-canary\$script:RunId"
     New-Item -ItemType Directory -Path $script:ArtifactDir -Force | Out-Null
+    $script:ControllerEventsPath = Join-Path $script:ArtifactDir "controller-events.jsonl"
     $stdoutPath = Join-Path $script:ArtifactDir "uvicorn.stdout.log"
     $stderrPath = Join-Path $script:ArtifactDir "uvicorn.stderr.log"
 
@@ -549,39 +638,65 @@ try {
     Set-IsolatedEnvironment "MARKET_DATA_PROVIDER" "BYBIT_REST"
     Set-IsolatedEnvironment "DATABASE_URL" $databaseUrl
 
-    Invoke-NativeCommand "docker" @("version") "Docker CLI" | Out-Null
-    Invoke-NativeCommand "docker" @("compose", "version") "Docker Compose" | Out-Null
-    Invoke-NativeCommand "docker" @("compose", "up", "-d", "db") "PostgreSQL start" | Out-Null
-    $databaseHealthy = $false
-    for ($i = 0; $i -lt 60; $i++) {
-        $containerId = (docker compose ps -q db 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $containerId) {
-            $health = (docker inspect --format '{{.State.Health.Status}}' $containerId 2>$null)
-            if ($LASTEXITCODE -eq 0 -and $health -eq "healthy") {
-                $databaseHealthy = $true
-                break
+    Invoke-ControllerStep "docker_cli" 30 {
+        Invoke-NativeCommand "docker" @("version") "Docker CLI" 30 | Out-Null
+    } | Out-Null
+    Invoke-ControllerStep "docker_compose" 30 {
+        Invoke-NativeCommand "docker" @("compose", "version") "Docker Compose" 30 |
+            Out-Null
+    } | Out-Null
+    Invoke-ControllerStep "postgres_start" 120 {
+        Invoke-NativeCommand "docker" @("compose", "up", "-d", "db") `
+            "PostgreSQL start" 120 | Out-Null
+    } | Out-Null
+    Invoke-ControllerStep "postgres_health" 125 {
+        $databaseHealthy = $false
+        for ($i = 0; $i -lt 60; $i++) {
+            $containerId = (docker compose ps -q db 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $containerId) {
+                $health = (
+                    docker inspect --format '{{.State.Health.Status}}' `
+                        $containerId 2>$null
+                )
+                if ($LASTEXITCODE -eq 0 -and $health -eq "healthy") {
+                    $databaseHealthy = $true
+                    break
+                }
             }
+            Start-Sleep -Seconds 2
         }
-        Start-Sleep -Seconds 2
-    }
-    Assert-Condition $databaseHealthy "PostgreSQL did not become healthy"
-    Invoke-NativeCommand $python @("-m", "alembic", "upgrade", "head") "Alembic" | Out-Null
+        Assert-Condition $databaseHealthy "PostgreSQL did not become healthy"
+    } | Out-Null
+    Invoke-ControllerStep "alembic_upgrade" 120 {
+        Invoke-NativeCommand $python @("-m", "alembic", "upgrade", "head") `
+            "Alembic" 120 | Out-Null
+    } | Out-Null
 
     $port = Get-AvailablePort
     $script:BaseUrl = "http://127.0.0.1:$port"
-    Start-UvicornReady $python $port $stdoutPath $stderrPath `
-        $StartupTimeoutSeconds
+    Invoke-ControllerStep "uvicorn_readiness" ($StartupTimeoutSeconds + 15) {
+        Start-UvicornReady $python $port $stdoutPath $stderrPath `
+            $StartupTimeoutSeconds
+    } | Out-Null
 
     $script:FailureStage = "local_preflight"
-    $demo = Assert-DemoSafety
-    $reconcile = Invoke-DemoReconcile
+    $localPreflight = Invoke-ControllerStep "local_demo_preflight" 180 {
+        [pscustomobject]@{
+            demo = Assert-DemoSafety
+            reconcile = Invoke-DemoReconcile
+        }
+    }
+    $demo = $localPreflight.demo
+    $reconcile = $localPreflight.reconcile
     Assert-Condition ($reconcile.status -eq "OK") "Demo reconciliation failed"
     Assert-Condition ([int]$reconcile.open_orders_by_symbol.$Symbol -eq 0) `
         "$Symbol has an active order"
     Assert-Condition ([int]$reconcile.remote_positions -eq 0) `
         "Demo account must be flat before the controlled canary"
     if ($V2SizingTier) {
-        $v2Preflight = Invoke-Api -Path "/v2/preflight"
+        $v2Preflight = Invoke-ControllerStep "v2_execution_preflight" 120 {
+            Invoke-Api -Path "/v2/preflight" -TimeoutSec 90
+        }
         Assert-Condition ($v2Preflight.ok -eq $true) (
             "V2 execution preflight failed: " +
             (@($v2Preflight.blockers) -join "; ")
@@ -858,6 +973,72 @@ try {
         Assert-Condition ($race.execution.exit_attribution -eq "strategy_exit") `
             "Post-close protection canary did not use strategy_exit attribution"
         Write-Host "DEMO FLAT-DURING-PROTECTION HANDOFF: PASS"
+    }
+
+    if ($ExerciseMarketInvalidation) {
+        Assert-Condition $ExerciseTrailingUpdate `
+            "Market invalidation canary requires a prior valid trailing update"
+        $script:FailureStage = "market_invalidated_protection_update"
+        $invalidated = Invoke-Api -Method "POST" `
+            -Path "/demo/canary/$executionId/market-invalidated-protection" `
+            -TimeoutSec 90
+        Assert-Condition ($invalidated.production_verifier_used -eq $true) `
+            "Production protection verifier was not used"
+        Assert-Condition (
+            $invalidated.classification -eq
+            "PROTECTION_UPDATE_INVALIDATED_BY_MARKET"
+        ) "Market-crossed update used the wrong classification"
+        Assert-Condition ($invalidated.cycle_failure_emitted -eq $false) `
+            "Market-crossed update emitted a cycle failure"
+        Assert-Condition ($invalidated.stale_value_retried -eq $false) `
+            "Stale protection value was retried"
+        Assert-Condition (
+            $invalidated.verification.classification -eq
+            "POSITION_OPEN_EXISTING_PROTECTION_CONFIRMED"
+        ) "Existing protection was not authoritatively confirmed"
+        Assert-Condition (
+            $invalidated.verification.source -eq "REST"
+        ) "Market invalidation verification was not authoritative REST"
+        $script:ProtectionInvalidation = $invalidated
+        Write-Host "PROTECTION UPDATE INVALIDATED BY MARKET: PASS"
+        Write-Host "EXISTING PROTECTION RETAINED: PASS"
+    }
+
+    if ($InjectMonitorStatusTimeout) {
+        $script:FailureStage = "certification_monitor_degradation"
+        $monitorDir = Join-Path $script:ArtifactDir "certification-monitor"
+        New-Item -ItemType Directory -Path $monitorDir -Force | Out-Null
+        Invoke-NativeCommand $python @(
+            "scripts/demo_v2_certification_monitor.py",
+            "--run-id", $script:RunId,
+            "--runner-pid", "$PID",
+            "--uvicorn-pid", "$($script:Child.Id)",
+            "--base-url", $script:BaseUrl,
+            "--output-dir", $monitorDir,
+            "--hard-timeout-seconds", "30",
+            "--idle-poll-seconds", "1",
+            "--active-poll-seconds", "1",
+            "--drain-poll-seconds", "1",
+            "--retry-poll-seconds", "1",
+            "--inject-status-timeouts", "1",
+            "--max-polls", "2"
+        ) "Certification monitor degradation canary" 60 | Out-Null
+        $monitorResult = Get-Content -Raw (
+            Join-Path $monitorDir "monitor-result.json"
+        ) | ConvertFrom-Json
+        Assert-Condition (
+            $monitorResult.result -eq "OBSERVATION_COMPLETE"
+        ) "Certification monitor did not complete its bounded observation"
+        Assert-Condition (
+            $monitorResult.monitor_health.state -eq "HEALTHY"
+        ) "Certification monitor did not recover to HEALTHY"
+        Assert-Condition (
+            [int]$monitorResult.monitor_health.incident_count -eq 1 -and
+            [int]$monitorResult.monitor_health.recovered_count -eq 1
+        ) "Certification monitor degradation/recovery count is incorrect"
+        $script:MonitorDegradation = $monitorResult
+        Write-Host "CERTIFICATION MONITOR STATUS_DEGRADED: PASS"
+        Write-Host "CERTIFICATION MONITOR RECOVERED: PASS"
     }
 
     $script:FailureStage = "restart_reconciliation"

@@ -2181,6 +2181,335 @@ def test_targeted_canary_uses_the_canonical_production_verifier() -> None:
     ]
 
 
+_CYCLE_261 = json.loads(
+    (Path(__file__).parent / "fixtures" / "v2_cycle_261_protection_market_race.json")
+    .read_text(encoding="utf-8")
+)
+
+
+def _xrp_rules() -> InstrumentRules:
+    return InstrumentRules(
+        symbol=Symbol.XRPUSDT,
+        status="Trading",
+        qty_step=Decimal("1"),
+        min_order_qty=Decimal("1"),
+        min_notional_value=Decimal("5"),
+        tick_size=Decimal("0.0001"),
+        min_leverage=Decimal("1"),
+        max_leverage=Decimal("50"),
+        leverage_step=Decimal("0.01"),
+    )
+
+
+def _cycle_261_record(side: Side = Side.BUY) -> DemoExecutionRecord:
+    is_buy = side == Side.BUY
+    return DemoExecutionRecord(
+        candidate_id=uuid4(),
+        risk_decision_id=260,
+        run_id=_CYCLE_261["run_id"],
+        order_link_id="cycle-261-entry",
+        order_id="cycle-261-order",
+        state=DemoExecutionState.DEMO_POSITION_OPEN,
+        symbol=Symbol.XRPUSDT,
+        side=side,
+        requested_quantity=Decimal("100"),
+        accepted_quantity=Decimal("100"),
+        average_fill_price=Decimal("1.0573"),
+        take_profit=Decimal("1.0611" if is_buy else "1.0535"),
+        stop_loss=Decimal("1.0547" if is_buy else "1.0599"),
+        stop_loss_pct=Decimal("0.25"),
+        take_profit_pct=Decimal("0.5"),
+        trailing_stop_pct=Decimal("0.35"),
+        break_even_at_r=Decimal("1"),
+        protection_confirmed=True,
+        protection_position_idx=0,
+    )
+
+
+class Cycle261ProtectionClient(FakeDemoClient):
+    def __init__(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        initial_market: str,
+        market_after_mutation: str | None = None,
+        reject_market_cross: bool = False,
+        existing_protection: bool = True,
+    ) -> None:
+        super().__init__()
+        self.record = record
+        self.initial_market = initial_market
+        self.market_after_mutation = market_after_mutation or initial_market
+        self.reject_market_cross = reject_market_cross
+        self.existing_protection = existing_protection
+        self.set_stop_calls: list[tuple[Symbol, Decimal, Decimal]] = []
+        self.mutation_attempted = False
+        self.updated_stop: Decimal | None = None
+        self.updated_tp: Decimal | None = None
+
+    def get_instrument(self, symbol):
+        return _xrp_rules()
+
+    def get_positions(self, symbol=None, settle_coin=None):
+        market = (
+            self.market_after_mutation
+            if self.mutation_attempted else self.initial_market
+        )
+        stop = (
+            self.updated_stop
+            if self.updated_stop is not None
+            else self.record.stop_loss if self.existing_protection else None
+        )
+        take = (
+            self.updated_tp
+            if self.updated_tp is not None
+            else self.record.take_profit if self.existing_protection else None
+        )
+        return [{
+            "symbol": self.record.symbol.value,
+            "size": str(self.record.accepted_quantity),
+            "side": self.record.side.value.title(),
+            "avgPrice": str(self.record.average_fill_price),
+            "markPrice": market,
+            "lastPrice": market,
+            "indexPrice": market,
+            "takeProfit": str(take or ""),
+            "stopLoss": str(stop or ""),
+            "trailingStop": "0",
+            "positionIdx": 0,
+        }]
+
+    def set_trading_stop(self, symbol, take_profit, stop_loss):
+        self.set_stop_calls.append((symbol, take_profit, stop_loss))
+        self.mutation_attempted = True
+        if self.reject_market_cross:
+            raise DemoExchangeError(
+                "Bybit Demo request failed: "
+                + _CYCLE_261["bybit_message"],
+                ret_code=10001,
+                ret_msg=_CYCLE_261["bybit_message"],
+            )
+        self.updated_tp = take_profit
+        self.updated_stop = stop_loss
+        return {"retCode": 0, "retMsg": "OK"}
+
+
+def _cycle_261_service(
+    record: DemoExecutionRecord, client: Cycle261ProtectionClient
+) -> tuple[DemoExecutionService, MemoryRepository]:
+    repo = MemoryRepository()
+    repo.records[str(record.candidate_id)] = record
+    return (
+        DemoExecutionService(
+            demo_settings(
+                v2_protection_verification_attempts=2,
+                v2_protection_verification_delay_ms=0,
+            ),
+            repo,
+            client,
+            run_id=record.run_id,
+        ),
+        repo,
+    )
+
+
+def _update_cycle_261(
+    demo: DemoExecutionService,
+    record: DemoExecutionRecord,
+    stop: str,
+    market: str,
+):
+    return demo._update_and_verify_protection(
+        record,
+        rules=_xrp_rules(),
+        take_profit=record.take_profit,
+        stop_loss=Decimal(stop),
+        market_price=Decimal(market),
+        market_price_source="fixture_last_trade",
+        market_price_at=datetime.now(timezone.utc),
+        verified_at=datetime.now(timezone.utc),
+    )
+
+
+def test_cycle_261_correct_buy_stop_update_succeeds() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(record, initial_market="1.0600")
+    demo, _ = _cycle_261_service(record, client)
+    result = _update_cycle_261(demo, record, "1.0595", "1.0600")
+    assert result.classification == "VERIFIED"
+    assert client.set_stop_calls == [
+        (Symbol.XRPUSDT, Decimal("1.0611"), Decimal("1.0595"))
+    ]
+
+
+def test_cycle_261_correct_sell_stop_update_succeeds() -> None:
+    record = _cycle_261_record(Side.SELL)
+    client = Cycle261ProtectionClient(record, initial_market="1.0540")
+    demo, _ = _cycle_261_service(record, client)
+    result = _update_cycle_261(demo, record, "1.0550", "1.0540")
+    assert result.classification == "VERIFIED"
+    assert len(client.set_stop_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("side", "stop", "market"),
+    [
+        (Side.BUY, "1.0595", "1.0593"),
+        (Side.SELL, "1.0550", "1.0552"),
+    ],
+)
+def test_protection_market_cross_before_submission_is_observational(
+    side: Side, stop: str, market: str
+) -> None:
+    record = _cycle_261_record(side)
+    client = Cycle261ProtectionClient(record, initial_market=market)
+    demo, repo = _cycle_261_service(record, client)
+    result = _update_cycle_261(demo, record, stop, market)
+    assert result.classification == "PROTECTION_UPDATE_INVALIDATED_BY_MARKET"
+    assert client.set_stop_calls == []
+    assert (
+        repo.records[str(record.candidate_id)]
+        .last_protection_verification["cycle_failure_emitted"]
+        is False
+    )
+
+
+def test_cycle_261_market_cross_after_precheck_retains_original_protection() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(
+        record,
+        initial_market="1.0597",
+        market_after_mutation="1.0593",
+        reject_market_cross=True,
+    )
+    demo, repo = _cycle_261_service(record, client)
+    result = _update_cycle_261(demo, record, "1.0595", "1.0597")
+    assert result.classification == "PROTECTION_UPDATE_INVALIDATED_BY_MARKET"
+    assert len(client.set_stop_calls) == 1
+    saved = repo.records[str(record.candidate_id)]
+    assert saved.stop_loss == Decimal("1.0547")
+    assert saved.last_protection_verification["result"] == (
+        "PROTECTION_UPDATE_INVALIDATED_BY_MARKET"
+    )
+    assert saved.last_protection_verification["mutation_response"]["retCode"] == 10001
+
+
+def test_market_invalidated_update_without_existing_protection_fails_closed() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(
+        record,
+        initial_market="1.0593",
+        existing_protection=False,
+    )
+    demo, _ = _cycle_261_service(record, client)
+    with pytest.raises(DemoSafetyError, match="no confirmed existing protection"):
+        _update_cycle_261(demo, record, "1.0595", "1.0593")
+
+
+def test_cross_symbol_tick_metadata_is_detected_before_mutation() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(record, initial_market="1.0600")
+    demo, _ = _cycle_261_service(record, client)
+    with pytest.raises(DemoSafetyError, match="tick metadata symbol"):
+        demo._update_and_verify_protection(
+            record,
+            rules=instrument(),
+            take_profit=record.take_profit,
+            stop_loss=Decimal("1.0595"),
+            market_price=Decimal("1.0600"),
+            verified_at=datetime.now(timezone.utc),
+        )
+    assert client.set_stop_calls == []
+
+
+def test_cross_execution_position_quantity_is_detected_before_mutation() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(record, initial_market="1.0600")
+    client.record = record.model_copy(
+        update={"accepted_quantity": Decimal("101")}
+    )
+    demo, _ = _cycle_261_service(record, client)
+    with pytest.raises(DemoSafetyError, match="quantity differs"):
+        _update_cycle_261(demo, record, "1.0595", "1.0600")
+    assert client.set_stop_calls == []
+
+
+def test_impossible_protection_unit_scale_is_detected() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(record, initial_market="106")
+    demo, _ = _cycle_261_service(record, client)
+    with pytest.raises(DemoSafetyError, match="unit sanity bound"):
+        _update_cycle_261(demo, record, "105.95", "106")
+    assert client.set_stop_calls == []
+
+
+def test_stronger_existing_buy_stop_is_never_weakened() -> None:
+    record = _cycle_261_record().model_copy(
+        update={"stop_loss": Decimal("1.0595")}
+    )
+    client = Cycle261ProtectionClient(record, initial_market="1.0600")
+    demo, _ = _cycle_261_service(record, client)
+    with pytest.raises(DemoSafetyError, match="weakens"):
+        _update_cycle_261(demo, record, "1.0580", "1.0600")
+    assert client.set_stop_calls == []
+
+
+def test_cycle_261_replay_identifies_xrp_fixed_point_message_not_sol_price() -> None:
+    assert _CYCLE_261["reported_execution_id"] != _CYCLE_261["actual_execution_id"]
+    assert Decimal(_CYCLE_261["bybit_fixed_point_stop_loss"]) / Decimal(
+        "100000000"
+    ) == Decimal(_CYCLE_261["requested_stop_loss"])
+    assert Decimal(_CYCLE_261["bybit_fixed_point_base_price"]) / Decimal(
+        "100000000"
+    ) == Decimal(_CYCLE_261["bybit_base_price"])
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(
+        record,
+        initial_market="1.0597",
+        market_after_mutation=_CYCLE_261["bybit_base_price"],
+        reject_market_cross=True,
+    )
+    demo, repo = _cycle_261_service(record, client)
+    result = _update_cycle_261(
+        demo, record, _CYCLE_261["requested_stop_loss"], "1.0597"
+    )
+    audit = repo.records[
+        str(record.candidate_id)
+    ].last_protection_verification
+    assert result.classification == _CYCLE_261["expected_classification"]
+    assert audit["protection_decision"]["execution_symbol"] == "XRPUSDT"
+    assert audit["protection_decision"]["request_symbol"] == "XRPUSDT"
+    assert audit["protection_decision"]["bybit_ret_code"] == 10001
+
+
+def test_real_canary_market_invalidation_uses_production_no_mutation_path() -> None:
+    record = _cycle_261_record()
+    client = Cycle261ProtectionClient(record, initial_market="1.0593")
+    repo = MemoryRepository()
+    repo.records[str(record.candidate_id)] = record
+    demo = DemoExecutionService(
+        demo_settings(
+            demo_canary_enabled=True,
+            v2_protection_verification_attempts=2,
+            v2_protection_verification_delay_ms=0,
+        ),
+        repo,
+        client,
+        run_id=record.run_id,
+    )
+    result = demo.request_canary_market_invalidated_protection_update(
+        str(record.id)
+    )
+    assert result is not None
+    assert result.classification == "PROTECTION_UPDATE_INVALIDATED_BY_MARKET"
+    assert result.record.protection_confirmed is True
+    assert client.set_stop_calls == []
+    assert (
+        result.record.last_protection_verification["classification"]
+        == "POSITION_OPEN_EXISTING_PROTECTION_CONFIRMED"
+    )
+
+
 _CYCLE_99 = json.loads(
     (
         Path(__file__).parent

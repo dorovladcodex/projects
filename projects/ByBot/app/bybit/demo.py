@@ -12,7 +12,7 @@ import json
 import socket
 import time
 from time import perf_counter
-from threading import RLock
+from threading import RLock, get_ident
 from typing import Any, Protocol
 from urllib.parse import urlencode
 from urllib.error import URLError
@@ -220,6 +220,7 @@ class ProtectionVerificationOutcome:
     verified: bool
     terminalizing: bool
     attempts: int
+    classification: str = "VERIFIED"
 
 
 @dataclass(frozen=True)
@@ -3165,11 +3166,83 @@ class DemoExecutionService:
             execution_id, close_before_mutation=True
         )
 
+    def request_canary_market_invalidated_protection_update(
+        self, execution_id: str
+    ) -> ProtectionVerificationOutcome | None:
+        """Exercise the production no-mutation market-invalidation path.
+
+        The proposed StopLoss is deliberately placed at the current
+        authoritative mark, which is invalid for both BUY and SELL.  The
+        canonical verifier must retain the already-confirmed protection and
+        return without invoking ``set_trading_stop``.
+        """
+
+        if not self.settings.demo_canary_enabled:
+            raise DemoSafetyError("Demo canary endpoint is disabled")
+        record = next(
+            (
+                item
+                for item in self.repository.load_demo_executions()
+                if str(item.id) == execution_id
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        with self._execution_lock(record.id):
+            record = next(
+                (
+                    item
+                    for item in self.repository.load_demo_executions()
+                    if str(item.id) == execution_id
+                ),
+                record,
+            )
+            if (
+                record.state != DemoExecutionState.DEMO_POSITION_OPEN
+                or not record.protection_confirmed
+                or record.take_profit is None
+                or record.stop_loss is None
+            ):
+                raise DemoSafetyError(
+                    "canary protection invalidation requires an open protected "
+                    "execution"
+                )
+            positions = self.client.get_positions(symbol=record.symbol)
+            owned = _owned_position(positions, record)
+            if owned is None:
+                raise DemoSafetyError(
+                    "canary protection invalidation could not confirm ownership"
+                )
+            mark_price = _decimal(owned.get("markPrice"), default="0")
+            if mark_price <= 0:
+                raise DemoSafetyError(
+                    "canary authoritative mark price is unavailable"
+                )
+            rules = self.client.get_instrument(record.symbol)
+            proposed = normalize_price(
+                mark_price,
+                rules,
+                round_up=record.side == Side.SELL,
+            )
+            return self._update_and_verify_protection(
+                record,
+                rules=rules,
+                take_profit=record.take_profit,
+                stop_loss=proposed,
+                verified_at=datetime.now(timezone.utc),
+                market_price=mark_price,
+                market_price_source="authoritative_position_mark_canary",
+                market_price_at=datetime.now(timezone.utc),
+            )
+
     def monitor_strategy_position(
         self,
         execution_id: str,
         last_price: Decimal,
         *,
+        market_price_at: datetime | None = None,
+        market_price_source: str = "rolling_feature_last_price",
         data_fresh: bool = True,
         setup_valid: bool = True,
         stale_feature: str | None = None,
@@ -3195,6 +3268,8 @@ class DemoExecutionService:
             return self._monitor_strategy_position_locked(
                 record,
                 last_price,
+                market_price_at=market_price_at,
+                market_price_source=market_price_source,
                 data_fresh=data_fresh,
                 setup_valid=setup_valid,
                 stale_feature=stale_feature,
@@ -3208,6 +3283,8 @@ class DemoExecutionService:
         record: DemoExecutionRecord,
         last_price: Decimal,
         *,
+        market_price_at: datetime | None,
+        market_price_source: str,
         data_fresh: bool,
         setup_valid: bool,
         stale_feature: str | None,
@@ -3278,6 +3355,7 @@ class DemoExecutionService:
             and record.stop_loss is not None
             and record.protection_confirmed
             and move > Decimal("0")
+            and data_fresh
             and (
                 record.trailing_stop_updated_at is None
                 or (current - _aware(record.trailing_stop_updated_at)).total_seconds()
@@ -3344,6 +3422,9 @@ class DemoExecutionService:
                         take_profit=record.take_profit,
                         stop_loss=proposed,
                         verified_at=current,
+                        market_price=last_price,
+                        market_price_source=market_price_source,
+                        market_price_at=market_price_at,
                     )
                     record = outcome.record
                     if outcome.terminalizing:
@@ -3360,14 +3441,28 @@ class DemoExecutionService:
         take_profit: Decimal,
         stop_loss: Decimal,
         verified_at: datetime,
+        market_price: Decimal | None = None,
+        market_price_source: str = "authoritative_position_mark",
+        market_price_at: datetime | None = None,
         before_mutation_hook: Callable[[DemoExecutionRecord], None] | None = None,
     ) -> ProtectionVerificationOutcome:
         """Mutate once, then verify from bounded authoritative REST snapshots."""
         if self.client is None:
             raise DemoSafetyError("Demo exchange client is unavailable")
+        if rules.symbol != record.symbol:
+            raise DemoSafetyError(
+                "protection tick metadata symbol does not match durable execution"
+            )
         round_up = record.side == Side.SELL
         normalized_tp = normalize_price(take_profit, rules, round_up=round_up)
         normalized_sl = normalize_price(stop_loss, rules, round_up=round_up)
+        market_age_seconds = (
+            max(
+                0.0,
+                (verified_at - _aware(market_price_at)).total_seconds(),
+            )
+            if market_price_at is not None else None
+        )
         requested = {
             "take_profit": str(take_profit),
             "stop_loss": str(stop_loss),
@@ -3378,11 +3473,113 @@ class DemoExecutionService:
             "stop_loss": str(normalized_sl),
             "tick_size": str(rules.tick_size),
         }
+        decision_context: dict[str, Any] = {
+            "execution_id": str(record.id),
+            "execution_symbol": record.symbol.value,
+            "planner_symbol": rules.symbol.value,
+            "request_symbol": record.symbol.value,
+            "position_idx": record.protection_position_idx,
+            "side": record.side.value,
+            "entry_price": (
+                str(record.average_fill_price)
+                if record.average_fill_price is not None else None
+            ),
+            "existing_take_profit": (
+                str(record.take_profit) if record.take_profit is not None else None
+            ),
+            "existing_stop_loss": (
+                str(record.stop_loss) if record.stop_loss is not None else None
+            ),
+            "raw_requested_stop_loss": str(stop_loss),
+            "normalized_stop_loss": str(normalized_sl),
+            "normalized_take_profit": str(normalized_tp),
+            "tick_size": str(rules.tick_size),
+            "market_price": str(market_price) if market_price is not None else None,
+            "market_price_source": market_price_source,
+            "market_price_at": (
+                _aware(market_price_at).isoformat()
+                if market_price_at is not None else None
+            ),
+            "market_price_age_seconds": market_age_seconds,
+            "lock_owner": get_ident(),
+            "concurrent_symbol_processing": False,
+            "request_payload": {
+                "category": "linear",
+                "symbol": record.symbol.value,
+                "takeProfit": str(normalized_tp),
+                "stopLoss": str(normalized_sl),
+                "positionIdx": "0",
+                "tpslMode": "Full",
+                "tpOrderType": "Market",
+                "slOrderType": "Market",
+            },
+        }
 
         # An identical update is idempotent and must not cause a second REST
         # mutation, including when two monitoring tasks race.
         before = self.client.get_positions(record.symbol)
         owned_before = _owned_position(before, record)
+        if owned_before is None:
+            same_symbol_open = next(
+                (
+                    item
+                    for item in before
+                    if str(item.get("symbol") or "") == record.symbol.value
+                    and _decimal(item.get("size"), default="0") > 0
+                ),
+                None,
+            )
+            if same_symbol_open is not None:
+                self._validate_protection_update_context(
+                    record,
+                    rules=rules,
+                    position=same_symbol_open,
+                    normalized_stop_loss=normalized_sl,
+                    market_price=market_price,
+                    market_price_age_seconds=market_age_seconds,
+                )
+            reconciled = self._reconcile_execution_rest_locked(record)
+            if reconciled.state in TERMINAL_DEMO_STATES or reconciled.state in {
+                DemoExecutionState.DEMO_CLOSING,
+                DemoExecutionState.DEMO_RECONCILIATION_REQUIRED,
+            }:
+                return ProtectionVerificationOutcome(
+                    reconciled, False, True, 0, "POSITION_FLAT_WITH_EXACT_CLOSE"
+                )
+            raise DemoSafetyError(
+                "protection update ownership could not be confirmed before mutation"
+            )
+        self._validate_protection_update_context(
+            record,
+            rules=rules,
+            position=owned_before,
+            normalized_stop_loss=normalized_sl,
+            market_price=market_price,
+            market_price_age_seconds=market_age_seconds,
+        )
+        decision_context.update({
+            "authoritative_position_average_price": str(
+                owned_before.get("avgPrice") or ""
+            ) or None,
+            "authoritative_mark_price": str(
+                owned_before.get("markPrice") or ""
+            ) or None,
+            "authoritative_index_price": str(
+                owned_before.get("indexPrice") or ""
+            ) or None,
+            "authoritative_last_price": str(
+                owned_before.get("lastPrice") or ""
+            ) or None,
+            "authoritative_existing_take_profit": str(
+                owned_before.get("takeProfit") or ""
+            ) or None,
+            "authoritative_existing_stop_loss": str(
+                owned_before.get("stopLoss") or ""
+            ) or None,
+            "trailing_anchor": str(
+                owned_before.get("trailingStop") or ""
+            ) or None,
+        })
         if owned_before is not None and _normalized_protection_matches(
             owned_before, normalized_tp, normalized_sl, rules, record.side
         ):
@@ -3396,9 +3593,27 @@ class DemoExecutionService:
                 result="ALREADY_VERIFIED",
                 blocker=None,
                 observed_at=verified_at,
+                decision_context=decision_context,
             )
             record.stop_loss = normalized_sl
             return ProtectionVerificationOutcome(record, True, False, 0)
+
+        if self._protection_update_crossed_market(
+            record.side,
+            normalized_sl,
+            market_price=market_price,
+            position=owned_before,
+        ):
+            return self._retain_existing_protection_after_market_invalidation(
+                record,
+                rules=rules,
+                position=owned_before,
+                requested=requested,
+                normalized=normalized,
+                decision_context=decision_context,
+                mutation_response=None,
+                verified_at=verified_at,
+            )
 
         mutation_response: dict[str, Any] | None = None
         try:
@@ -3425,6 +3640,20 @@ class DemoExecutionService:
                     mutation_error=exc,
                     verified_at=verified_at,
                 )
+            elif _is_market_cross_protection_error(exc):
+                decision_context["bybit_ret_code"] = exc.ret_code
+                decision_context["bybit_ret_msg"] = (
+                    str(exc.ret_msg or "")[:240] or None
+                )
+                return self._classify_post_rejection_protection_state(
+                    record,
+                    rules=rules,
+                    requested=requested,
+                    normalized=normalized,
+                    decision_context=decision_context,
+                    mutation_error=exc,
+                    verified_at=verified_at,
+                )
             else:
                 raise
 
@@ -3446,6 +3675,7 @@ class DemoExecutionService:
                     result="VERIFIED" if matches else "REST_PROPAGATION_PENDING",
                     blocker=None if matches else "authoritative REST protection differs",
                     observed_at=datetime.now(timezone.utc),
+                    decision_context=decision_context,
                 )
                 if matches:
                     record.take_profit = normalized_tp
@@ -3468,6 +3698,7 @@ class DemoExecutionService:
                     result="POSITION_FLAT_RECONCILING",
                     blocker=None,
                     observed_at=datetime.now(timezone.utc),
+                    decision_context=decision_context,
                 )
                 reconciled = self._reconcile_execution_rest_locked(record)
                 if reconciled.state in TERMINAL_DEMO_STATES or reconciled.state in {
@@ -3501,8 +3732,244 @@ class DemoExecutionService:
             result="FAILED_OPEN_UNPROTECTED",
             blocker="open position protection did not match after bounded REST verification",
             observed_at=datetime.now(timezone.utc),
+            decision_context=decision_context,
         )
         raise DemoSafetyError("updated trailing protection could not be verified")
+
+    def _validate_protection_update_context(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        position: dict[str, Any],
+        normalized_stop_loss: Decimal,
+        market_price: Decimal | None,
+        market_price_age_seconds: float | None,
+    ) -> None:
+        """Fail closed on ownership, metadata, unit, or stale-input defects."""
+
+        if str(position.get("symbol") or "") != record.symbol.value:
+            raise DemoSafetyError(
+                "protection market-data symbol differs from durable execution"
+            )
+        if int(position.get("positionIdx") or 0) != int(
+            record.protection_position_idx or 0
+        ):
+            raise DemoSafetyError(
+                "protection positionIdx differs from durable execution"
+            )
+        if str(position.get("side") or "").upper() != record.side.value:
+            raise DemoSafetyError(
+                "protection position side differs from durable execution"
+            )
+        if _decimal(position.get("size"), default="0") != record.accepted_quantity:
+            raise DemoSafetyError(
+                "protection position quantity differs from durable execution"
+            )
+        if rules.symbol != record.symbol:
+            raise DemoSafetyError(
+                "protection tick metadata belongs to another symbol"
+            )
+        if (
+            market_price_age_seconds is not None
+            and market_price_age_seconds > self.settings.v2_market_stale_seconds
+        ):
+            raise DemoSafetyError(
+                "protection price timestamp exceeds the existing freshness limit"
+            )
+        if record.stop_loss is not None:
+            weakens = (
+                normalized_stop_loss < record.stop_loss
+                if record.side == Side.BUY
+                else normalized_stop_loss > record.stop_loss
+            )
+            if weakens:
+                raise DemoSafetyError(
+                    "requested protection weakens the durable StopLoss"
+                )
+        entry = record.average_fill_price
+        if entry is None or entry <= 0:
+            raise DemoSafetyError(
+                "protection update has no valid durable entry price"
+            )
+        configured_distances = [
+            value
+            for value in (
+                record.stop_loss_pct,
+                record.take_profit_pct,
+                record.trailing_stop_pct,
+            )
+            if value is not None and value > 0
+        ]
+        strategy_distance = max(
+            configured_distances, default=Decimal("1")
+        ) / Decimal("100")
+        defensive_distance = max(
+            strategy_distance * Decimal("20"), Decimal("0.02")
+        )
+        if abs(normalized_stop_loss / entry - Decimal("1")) > defensive_distance:
+            raise DemoSafetyError(
+                "requested StopLoss violates the strategy-derived unit sanity bound"
+            )
+        if market_price is not None and market_price <= 0:
+            raise DemoSafetyError("protection market price is invalid")
+
+    @staticmethod
+    def _protection_update_crossed_market(
+        side: Side,
+        stop_loss: Decimal,
+        *,
+        market_price: Decimal | None,
+        position: dict[str, Any],
+    ) -> bool:
+        prices = [
+            value
+            for value in (
+                market_price,
+                _optional_decimal(position.get("lastPrice")),
+                _optional_decimal(position.get("markPrice")),
+                _optional_decimal(position.get("indexPrice")),
+            )
+            if value is not None and value > 0
+        ]
+        if not prices:
+            raise DemoSafetyError(
+                "authoritative protection price is unavailable before mutation"
+            )
+        return (
+            stop_loss >= min(prices)
+            if side == Side.BUY
+            else stop_loss <= max(prices)
+        )
+
+    def _retain_existing_protection_after_market_invalidation(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        position: dict[str, Any],
+        requested: dict[str, Any],
+        normalized: dict[str, Any],
+        decision_context: dict[str, Any],
+        mutation_response: dict[str, Any] | None,
+        verified_at: datetime,
+    ) -> ProtectionVerificationOutcome:
+        """Keep exact existing protection when a fresh update becomes invalid."""
+
+        if (
+            record.take_profit is None
+            or record.stop_loss is None
+            or not _normalized_protection_matches(
+                position,
+                normalize_price(
+                    record.take_profit,
+                    rules,
+                    round_up=record.side == Side.SELL,
+                ),
+                normalize_price(
+                    record.stop_loss,
+                    rules,
+                    round_up=record.side == Side.SELL,
+                ),
+                rules,
+                record.side,
+            )
+        ):
+            self._persist_protection_verification(
+                record,
+                requested=requested,
+                normalized=normalized,
+                position=position,
+                attempt=1,
+                mutation_response=mutation_response,
+                result="REAL_PROTECTION_FAILURE",
+                blocker=(
+                    "proposed update was invalidated and existing protection "
+                    "could not be confirmed"
+                ),
+                observed_at=datetime.now(timezone.utc),
+                classification="POSITION_OPEN_PROTECTION_NOT_CONFIRMED",
+                cycle_failure_emitted=True,
+                terminalization_result=None,
+                decision_context=decision_context,
+            )
+            raise DemoSafetyError(
+                "market-invalidated protection update has no confirmed "
+                "existing protection"
+            )
+        self._persist_protection_verification(
+            record,
+            requested=requested,
+            normalized=normalized,
+            position=position,
+            attempt=1 if mutation_response is not None else 0,
+            mutation_response=mutation_response,
+            result="PROTECTION_UPDATE_INVALIDATED_BY_MARKET",
+            blocker=None,
+            observed_at=datetime.now(timezone.utc),
+            classification="POSITION_OPEN_EXISTING_PROTECTION_CONFIRMED",
+            cycle_failure_emitted=False,
+            terminalization_result=None,
+            decision_context=decision_context,
+        )
+        return ProtectionVerificationOutcome(
+            record,
+            True,
+            False,
+            1 if mutation_response is not None else 0,
+            "PROTECTION_UPDATE_INVALIDATED_BY_MARKET",
+        )
+
+    def _classify_post_rejection_protection_state(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        requested: dict[str, Any],
+        normalized: dict[str, Any],
+        decision_context: dict[str, Any],
+        mutation_error: DemoExchangeError,
+        verified_at: datetime,
+    ) -> ProtectionVerificationOutcome:
+        """Reconcile a Bybit side-price rejection without retrying stale data."""
+
+        mutation_response = {
+            "retCode": mutation_error.ret_code,
+            "retMsg": str(mutation_error.ret_msg or "")[:240] or None,
+        }
+        positions = self.client.get_positions(symbol=record.symbol)
+        symbol_positions = [
+            item
+            for item in positions
+            if str(item.get("symbol") or "") == record.symbol.value
+            and _decimal(item.get("size"), default="0") > 0
+        ]
+        owned = _owned_position(symbol_positions, record)
+        if owned is not None:
+            return self._retain_existing_protection_after_market_invalidation(
+                record,
+                rules=rules,
+                position=owned,
+                requested=requested,
+                normalized=normalized,
+                decision_context=decision_context,
+                mutation_response=mutation_response,
+                verified_at=verified_at,
+            )
+        if symbol_positions:
+            raise DemoSafetyError(
+                "protection rejection reconciled to a symbol or execution mismatch"
+            )
+        return self._handle_possible_flat_protection_failure(
+            record,
+            rules=rules,
+            requested=requested,
+            normalized=normalized,
+            take_profit=Decimal(normalized["take_profit"]),
+            stop_loss=Decimal(normalized["stop_loss"]),
+            mutation_error=mutation_error,
+            verified_at=verified_at,
+        )
 
     def _handle_possible_flat_protection_failure(
         self,
@@ -3660,6 +4127,7 @@ class DemoExecutionService:
         classification: str | None = None,
         cycle_failure_emitted: bool | None = None,
         terminalization_result: str | None = None,
+        decision_context: dict[str, Any] | None = None,
     ) -> None:
         close_quantity = sum(
             (fill.quantity for fill in record.close_fills), Decimal("0")
@@ -3689,6 +4157,7 @@ class DemoExecutionService:
             ],
             "close_quantity": str(close_quantity),
             "observed_at": observed_at.isoformat(),
+            "protection_decision": dict(decision_context or {}),
         }
         record.last_protection_verification = observation
         record.protection_verification_history = [
@@ -3704,6 +4173,13 @@ class DemoExecutionService:
         counts: dict[str, int] = {}
         for record in records:
             counts[record.state.value] = counts.get(record.state.value, 0) + 1
+        protection_update_invalidations = sum(
+            1
+            for record in records
+            for observation in record.protection_verification_history
+            if observation.get("result")
+            == "PROTECTION_UPDATE_INVALIDATED_BY_MARKET"
+        )
         active_records = [
             record for record in records if record.state not in TERMINAL_DEMO_STATES
         ]
@@ -3785,6 +4261,9 @@ class DemoExecutionService:
             "partial_fills": self.partial_fills,
             "complete_fills": self.complete_fills,
             "states": counts,
+            "protection_update_invalidations": (
+                protection_update_invalidations
+            ),
             "bot_owned_open_orders": bot_owned_open_orders,
             "bot_owned_active_orders": bot_owned_active_orders,
             "bot_owned_pending_cancel_orders": bot_owned_pending_cancel_orders,
@@ -4531,6 +5010,12 @@ def _decimal(value: object, *, default: str | None = None) -> Decimal:
         raise DemoExchangeError("invalid exchange decimal") from exc
 
 
+def _optional_decimal(value: object) -> Decimal | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return _decimal(value)
+
+
 def _format_decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
 
@@ -4763,6 +5248,24 @@ def _is_structured_flat_position_error(exc: DemoExchangeError) -> bool:
         and exc.ret_code != 0
         and "can not set tp/sl/ts for zero position"
         in str(exc.ret_msg or "").casefold()
+    )
+
+
+def _is_market_cross_protection_error(exc: DemoExchangeError) -> bool:
+    """Recognize Bybit's side-price rejection for a just-stale TP/SL update."""
+
+    message = str(exc.ret_msg or exc).casefold()
+    return bool(
+        exc.ret_code is not None
+        and exc.ret_code != 0
+        and ("stoploss" in message or "stop loss" in message)
+        and "base_price" in message
+        and (
+            "should lower than" in message
+            or "should higher than" in message
+            or "should be lower than" in message
+            or "should be higher than" in message
+        )
     )
 
 

@@ -1524,6 +1524,34 @@ def demo_canary_flat_during_protection_race(
     }
 
 
+@app.post("/demo/canary/{execution_id}/market-invalidated-protection")
+def demo_canary_market_invalidated_protection(
+    execution_id: str,
+) -> dict[str, object]:
+    _require_demo_canary()
+    try:
+        outcome = (
+            demo_execution_service
+            .request_canary_market_invalidated_protection_update(execution_id)
+        )
+    except DemoSafetyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if outcome is None:
+        raise HTTPException(status_code=404, detail="Demo canary execution not found")
+    verification = outcome.record.last_protection_verification or {}
+    return {
+        "execution": outcome.record.model_dump(mode="json"),
+        "verification": verification,
+        "classification": outcome.classification,
+        "cycle_failure_emitted": bool(
+            verification.get("cycle_failure_emitted")
+        ),
+        "production_verifier_used": True,
+        "stale_value_retried": False,
+        "live_execution_blocked": True,
+    }
+
+
 @app.post("/demo/canary/{execution_id}/failure-cleanup")
 def demo_canary_failure_cleanup(
     execution_id: str, request: DemoCanaryFailureCleanupRequest

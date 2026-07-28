@@ -1541,6 +1541,12 @@ class V2Runtime:
             self.execution.demo_execution.monitor_strategy_position(
                 str(record.id),
                 feature.last_price,
+                market_price_at=(
+                    feature.source_timestamps.get("trades")
+                    or feature.source_timestamps.get("ticker")
+                    or feature.timestamp
+                ),
+                market_price_source="v2_feature_last_trade",
                 data_fresh=feature.fresh,
                 stale_feature="; ".join(feature.stale_reasons) or None,
                 stale_age_seconds=max(
