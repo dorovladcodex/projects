@@ -25,6 +25,7 @@ _SAFE_TEST_ENV = {
     "MARKET_DATA_PROVIDER": "MOCK",
     "NEWS_CLASSIFIER_MODE": "mock",
     "NEWS_ENABLE_RSS": "false",
+    "DATABASE_URL": "sqlite://",
     "ALLOWED_SYMBOLS": '["BTCUSDT","ETHUSDT"]',
 }
 
@@ -40,4 +41,3 @@ def _clear_settings_cache() -> None:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
-

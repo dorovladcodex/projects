@@ -10,7 +10,7 @@ import socket
 import sys
 import time
 from typing import Any
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,9 +21,15 @@ from app.bybit.demo_diagnostics import (  # noqa: E402
     DemoDiagnosticsConfig,
     ReadOnlyBybitDemoClient,
 )
+from app.bybit.demo_execution_recovery import (  # noqa: E402
+    diagnose_demo_execution,
+    exact_close_reconciliation_blockers,
+)
 from app.db.persistence import PersistenceRepository  # noqa: E402
 from app.v2.certification_monitor import (  # noqa: E402
     CertificationMonitorHealth,
+    ExecutionFallbackEvidence,
+    StatusFallbackEvidence,
 )
 
 
@@ -36,6 +42,10 @@ TERMINAL_STATES = {
     "DEMO_NOT_SUBMITTED",
     "DEMO_FAILED_FLAT_VERIFIED",
 }
+
+
+class DurableTerminalizationLag(RuntimeError):
+    pass
 
 
 def main() -> int:
@@ -93,25 +103,53 @@ def main() -> int:
                 for item in execution_payload.get("executions", [])
                 if item.get("run_id") == args.run_id
             ]
+            status_active = [
+                item for item in executions
+                if str(item.get("state") or "") not in TERMINAL_STATES
+            ]
+            if (
+                status_active
+                and int(demo.get("bot_owned_open_positions") or 0) == 0
+            ):
+                raise DurableTerminalizationLag(
+                    "durable execution remains active after cached remote-flat state"
+                )
+            previous_health_state = health.state
             health.record_status_success(now=now)
+            if previous_health_state.value != "HEALTHY":
+                bounded_post(args.base_url, "/v2/supervisor/resume")
         except Exception as exc:
-            persistence_ok, active = durable_fallback(
+            persistence_ok, active, durable_runtime = durable_fallback(
                 repository, args.run_id
             )
-            authoritative_safe = None
-            if active:
-                authoritative_safe = authoritative_protection_fallback(
-                    read_client, active
-                )
-            decision = health.record_status_failure(
-                now=now,
+            fallback = collect_status_fallback_evidence(
+                config=config,
+                repository=repository,
+                client=read_client,
+                active=active,
                 runner_alive=runner_alive,
                 uvicorn_alive=uvicorn_alive,
-                port_listening=listener,
+                listener=listener,
                 persistence_ok=persistence_ok,
-                authoritative_account_safe=authoritative_safe,
+                kill_switch_active=bool(
+                    (durable_runtime.get("portfolio_risk") or {}).get(
+                        "kill_switch_active"
+                    )
+                ),
+            )
+            decision = health.record_status_failure(
+                now=now,
+                evidence=fallback,
                 error=f"{type(exc).__name__}: {exc}",
             )
+            pause_result = bounded_post(
+                args.base_url, "/v2/supervisor/pause"
+            )
+            reconciliation_result = None
+            if decision.request_reconciliation:
+                reconciliation_result = bounded_post(
+                    args.base_url, "/demo/reconcile"
+                )
             write_events(events_path, health)
             write_jsonl(samples_path, {
                 "timestamp": now.isoformat(),
@@ -122,7 +160,26 @@ def main() -> int:
                 "monitor_state": health.state.value,
                 "status_available": False,
                 "persistence_fallback_ok": persistence_ok,
-                "authoritative_account_safe": authoritative_safe,
+                "durable_active_execution_ids": [
+                    str(item.id) for item in active
+                ],
+                "remote_positions": sum(
+                    item.remote_position_open for item in fallback.executions
+                ),
+                "exact_close_evidence": sum(
+                    item.exact_close_evidence for item in fallback.executions
+                ),
+                "close_evidence_pending": sum(
+                    item.close_evidence_pending for item in fallback.executions
+                ),
+                "unrelated_positions": fallback.unrelated_positions,
+                "unrelated_orders": fallback.unrelated_orders,
+                "ownership_conflicts": fallback.ownership_conflicts,
+                "pause_result": pause_result,
+                "reconciliation_requested": decision.request_reconciliation,
+                "reconciliation_result": reconciliation_result,
+                "keep_reconciler_alive": decision.keep_reconciler_alive,
+                "shutdown_ready": decision.shutdown_ready,
             })
             polls += 1
             if decision.escalate:
@@ -145,6 +202,17 @@ def main() -> int:
             item for item in executions
             if str(item.get("state") or "") in TERMINAL_STATES
         ]
+        for item in completed:
+            started_at = item.get("terminalization_started_at")
+            completed_at = item.get("terminalization_completed_at")
+            execution_id = str(item.get("id") or "")
+            if execution_id and started_at and completed_at:
+                health.record_resolved_terminalization_evidence(
+                    now=now,
+                    execution_id=execution_id,
+                    started_at=str(started_at),
+                    completed_at=str(completed_at),
+                )
         blockers = runtime_blockers(v2, demo, completed)
         snapshot = {
             "timestamp": now.isoformat(),
@@ -248,23 +316,55 @@ def get_json(base_url: str, path: str) -> dict[str, Any]:
     return payload
 
 
+def bounded_post(base_url: str, path: str) -> dict[str, Any]:
+    try:
+        request = Request(
+            base_url.rstrip("/") + path,
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            data=b"{}",
+        )
+        with urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return {
+            "ok": True,
+            "status": int(response.status),
+            "payload": payload if isinstance(payload, dict) else {},
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {' '.join(str(exc).split())[:240]}",
+        }
+
+
 def durable_fallback(
     repository: PersistenceRepository, run_id: str
-) -> tuple[bool, list[Any]]:
+) -> tuple[bool, list[Any], dict[str, Any]]:
     if not repository.available:
-        return False, []
+        return False, [], {}
     runtime = repository.load_v2_run_runtime(run_id)
     records = [
         item
         for item in repository.load_demo_executions()
         if item.run_id == run_id and item.state.value not in TERMINAL_STATES
     ]
-    return bool(runtime), records
+    return bool(runtime), records, runtime
 
 
-def authoritative_protection_fallback(
-    client: ReadOnlyBybitDemoClient, active: list[Any]
-) -> bool:
+def collect_status_fallback_evidence(
+    *,
+    config: DemoDiagnosticsConfig,
+    repository: PersistenceRepository,
+    client: ReadOnlyBybitDemoClient,
+    active: list[Any],
+    runner_alive: bool,
+    uvicorn_alive: bool,
+    listener: bool,
+    persistence_ok: bool,
+    kill_switch_active: bool,
+) -> StatusFallbackEvidence:
+    """Collect exact durable/REST evidence without symbol-only attribution."""
     try:
         client.verify()
         positions = [
@@ -272,22 +372,209 @@ def authoritative_protection_fallback(
             for item in client.get_usdt_positions()
             if _decimal(item.get("size")) > 0
         ]
-    except Exception:
+        open_orders = client.get_open_orders()
+    except Exception as exc:
+        return StatusFallbackEvidence(
+            runner_alive=runner_alive,
+            uvicorn_alive=uvicorn_alive,
+            port_listening=listener,
+            persistence_ok=persistence_ok,
+            kill_switch_active=kill_switch_active,
+            executions=tuple(
+                ExecutionFallbackEvidence(
+                    execution_id=str(record.id),
+                    symbol=record.symbol.value,
+                    durable_state=record.state.value,
+                    remote_position_open=False,
+                    protection_confirmed=False,
+                    remote_flat=False,
+                    close_evidence_pending=True,
+                    evidence_error=(
+                        f"authoritative fallback unavailable: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
+                for record in active
+            ),
+            authoritative_check_complete=False,
+        )
+
+    owners_by_order_id: dict[str, list[str]] = {}
+    owners_by_link_id: dict[str, list[str]] = {}
+    for record in active:
+        for order_id in {
+            record.order_id,
+            record.close_order_id,
+            record.tp_order_id,
+            record.sl_order_id,
+            *(fill.order_id for fill in [*record.fills, *record.close_fills]),
+        }:
+            if order_id:
+                owners_by_order_id.setdefault(str(order_id), []).append(
+                    str(record.id)
+                )
+        for link_id in {record.order_link_id, record.close_order_link_id}:
+            if link_id:
+                owners_by_link_id.setdefault(str(link_id), []).append(
+                    str(record.id)
+                )
+    conflicts = {
+        identity
+        for identity, owners in {
+            **owners_by_order_id,
+            **owners_by_link_id,
+        }.items()
+        if len(set(owners)) > 1
+    }
+    attributed_orders: dict[str, list[dict[str, Any]]] = {
+        str(record.id): [] for record in active
+    }
+    unrelated_orders = 0
+    for order in open_orders:
+        order_id = str(order.get("orderId") or "")
+        link_id = str(order.get("orderLinkId") or "")
+        owners = set(owners_by_order_id.get(order_id, []))
+        owners.update(owners_by_link_id.get(link_id, []))
+        if len(owners) == 1:
+            attributed_orders[next(iter(owners))].append(order)
+        elif len(owners) > 1:
+            conflicts.add(order_id or link_id or "empty-order-identity")
+        else:
+            unrelated_orders += 1
+
+    active_by_symbol: dict[str, list[Any]] = {}
+    for record in active:
+        active_by_symbol.setdefault(record.symbol.value, []).append(record)
+    unrelated_positions = sum(
+        1
+        for position in positions
+        if len(active_by_symbol.get(str(position.get("symbol") or ""), [])) != 1
+    )
+
+    execution_evidence: list[ExecutionFallbackEvidence] = []
+    for record in active:
+        matching_positions = [
+            position for position in positions
+            if str(position.get("symbol") or "") == record.symbol.value
+        ]
+        record_conflict = (
+            len(active_by_symbol.get(record.symbol.value, [])) != 1
+            or len(matching_positions) > 1
+            or any(
+                str(identity) in conflicts
+                for identity in (
+                    record.order_id,
+                    record.close_order_id,
+                    record.tp_order_id,
+                    record.sl_order_id,
+                    record.order_link_id,
+                    record.close_order_link_id,
+                )
+                if identity
+            )
+        )
+        if matching_positions:
+            position = matching_positions[0]
+            position_matches = (
+                _decimal(position.get("size")) == record.accepted_quantity
+                and str(position.get("side") or "").upper() == record.side.value
+            )
+            protection_confirmed = bool(
+                position_matches
+                and _same_decimal(position.get("takeProfit"), record.take_profit)
+                and _same_decimal(position.get("stopLoss"), record.stop_loss)
+            )
+            execution_evidence.append(ExecutionFallbackEvidence(
+                execution_id=str(record.id),
+                symbol=record.symbol.value,
+                durable_state=record.state.value,
+                remote_position_open=True,
+                protection_confirmed=protection_confirmed,
+                remote_flat=False,
+                exact_owned_residual_orders=len(
+                    attributed_orders[str(record.id)]
+                ),
+                ownership_conflict=record_conflict or not position_matches,
+                evidence_error=(
+                    None if position_matches else
+                    "authoritative position side or quantity conflicts"
+                ),
+            ))
+            continue
+        try:
+            diagnosis = diagnose_demo_execution(
+                config,
+                str(record.id),
+                repository=repository,
+                client=client,
+            )
+            blockers = exact_close_reconciliation_blockers(diagnosis)
+            exact_close = not blockers
+            partial = (
+                "partial" in diagnosis.conclusion.lower()
+                or any("quantity" in item and "does not equal" in item for item in blockers)
+            )
+            conflict = bool(
+                record_conflict
+                or diagnosis.conflicting_order_ids
+                or diagnosis.conflicting_execution_ids
+            )
+            pending = bool(
+                not exact_close
+                and not partial
+                and not conflict
+                and diagnosis.conclusion
+                in {
+                    "fully filled with unresolved close state",
+                    "filled entry; close attribution unavailable; repeatedly flat",
+                }
+            )
+            execution_evidence.append(ExecutionFallbackEvidence(
+                execution_id=str(record.id),
+                symbol=record.symbol.value,
+                durable_state=record.state.value,
+                remote_position_open=False,
+                protection_confirmed=False,
+                remote_flat=True,
+                exact_close_evidence=exact_close,
+                close_evidence_pending=pending,
+                exact_owned_residual_orders=len(
+                    attributed_orders[str(record.id)]
+                ),
+                partial_close=partial,
+                ownership_conflict=conflict,
+                evidence_error=None if exact_close or pending else "; ".join(blockers),
+            ))
+        except Exception as exc:
+            execution_evidence.append(ExecutionFallbackEvidence(
+                execution_id=str(record.id),
+                symbol=record.symbol.value,
+                durable_state=record.state.value,
+                remote_position_open=False,
+                protection_confirmed=False,
+                remote_flat=True,
+                close_evidence_pending=True,
+                evidence_error=f"close evidence fetch pending: {type(exc).__name__}",
+            ))
+
+    return StatusFallbackEvidence(
+        runner_alive=runner_alive,
+        uvicorn_alive=uvicorn_alive,
+        port_listening=listener,
+        persistence_ok=persistence_ok,
+        kill_switch_active=kill_switch_active,
+        executions=tuple(execution_evidence),
+        unrelated_positions=unrelated_positions,
+        unrelated_orders=unrelated_orders,
+        ownership_conflicts=len(conflicts),
+        authoritative_check_complete=True,
+    )
+
+
+def _same_decimal(remote: Any, durable: Any) -> bool:
+    if durable is None or remote in {None, ""}:
         return False
-    expected = {item.symbol.value: item for item in active}
-    for position in positions:
-        symbol = str(position.get("symbol") or "")
-        record = expected.get(symbol)
-        if record is None:
-            return False
-        if (
-            _decimal(position.get("size")) != record.accepted_quantity
-            or str(position.get("side") or "").upper() != record.side.value
-            or not str(position.get("takeProfit") or "")
-            or not str(position.get("stopLoss") or "")
-        ):
-            return False
-    return len(positions) == len(active)
+    return _decimal(remote) == _decimal(durable)
 
 
 def runtime_blockers(

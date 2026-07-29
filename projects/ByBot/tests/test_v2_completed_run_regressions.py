@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
 from uuid import uuid4
@@ -193,6 +195,114 @@ def test_duplicate_ws_and_rest_race_persists_one_terminal_transition() -> None:
     ) == 1
     saved = repository.get_demo_execution(str(record.candidate_id))
     assert len(saved.close_fills) == 1
+
+
+def test_actual_sol_btc_two_close_fixture_terminalizes_exactly_once() -> None:
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "two_close_terminalization_20260729.json"
+        ).read_text(encoding="utf-8")
+    )
+    repository = MemoryRepository()
+    client = FakeDemoClient()
+    records: list[DemoExecutionRecord] = []
+    for item in fixture["executions"]:
+        entry_at = datetime.fromisoformat(item["entry_time"])
+        close_at = datetime.fromisoformat(item["close_time"])
+        quantity = Decimal(item["quantity"])
+        record = DemoExecutionRecord(
+            id=item["execution_id"],
+            candidate_id=item["candidate_id"],
+            run_id=fixture["run_id"],
+            order_link_id=item["entry_order_link_id"],
+            order_id=item["entry_order_id"],
+            close_order_link_id=item["close_order_link_id"],
+            close_order_id=item["close_order_id"],
+            state=DemoExecutionState(item["state"]),
+            symbol=Symbol(item["symbol"]),
+            side=Side.BUY,
+            requested_quantity=quantity,
+            accepted_quantity=quantity,
+            average_fill_price=Decimal(item["entry_price"]),
+            tp_order_id=item["tp_order_id"],
+            sl_order_id=item["sl_order_id"],
+            protection_confirmed=True,
+            close_reason="unattributed_external_close",
+            exit_attribution="unattributed_external_close",
+            fills=[DemoFill(
+                execution_id=item["entry_exec_id"],
+                order_id=item["entry_order_id"],
+                quantity=quantity,
+                price=Decimal(item["entry_price"]),
+                fee=Decimal(item["entry_fee"]),
+                fee_currency="USDT",
+                executed_at=entry_at,
+            )],
+            created_at=entry_at - timedelta(seconds=1),
+        )
+        repository.records[str(record.candidate_id)] = record
+        records.append(record)
+        close_ms = int(close_at.timestamp() * 1000)
+        client.history.append({
+            "symbol": item["symbol"],
+            "orderId": item["close_order_id"],
+            "orderLinkId": item["close_order_link_id"],
+            "orderStatus": "Filled",
+            "side": "Sell",
+            "reduceOnly": True,
+            "closeOnTrigger": False,
+            "createType": "CreateByUser",
+            "stopOrderType": "",
+            "cumExecQty": item["quantity"],
+            "qty": item["quantity"],
+            "avgPrice": item["close_price"],
+            "updatedTime": str(close_ms),
+        })
+        client.executions.append({
+            "symbol": item["symbol"],
+            "orderId": item["close_order_id"],
+            "orderLinkId": item["close_order_link_id"],
+            "execId": item["close_exec_id"],
+            "execQty": item["quantity"],
+            "execPrice": item["close_price"],
+            "execFee": item["close_fee"],
+            "feeCurrency": "USDT",
+            "feeRate": "0.00055",
+            "execTime": str(close_ms),
+            "side": "Sell",
+            "closedSize": item["quantity"],
+            "createType": "CreateByUser",
+        })
+    service = DemoExecutionService(
+        demo_settings(), repository, client, run_id=fixture["run_id"]
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reconciled = list(pool.map(service._reconcile_execution_rest, records))
+
+    assert all(
+        item.state == DemoExecutionState.DEMO_CLOSED_EXTERNALLY
+        for item in reconciled
+    )
+    assert [item.realized_exchange_pnl for item in reconciled] == [
+        Decimal(item["expected_net_pnl"]) for item in fixture["executions"]
+    ]
+    assert all(item.terminalization_started_at for item in reconciled)
+    assert all(item.evidence_acquired_at for item in reconciled)
+    assert all(item.terminalization_completed_at for item in reconciled)
+    assert all(item.terminalization_attempt_count >= 1 for item in reconciled)
+    assert all(item.execution_lock_wait_ms is not None for item in reconciled)
+    assert all(item.persistence_commit_ms is not None for item in reconciled)
+    assert repository.saved_events.count(
+        ("DEMO_CLOSE_TERMINALIZED", "DEMO_CLOSED_EXTERNALLY")
+    ) == 2
+    for item in reconciled:
+        service._reconcile_execution_rest(item)
+    assert repository.saved_events.count(
+        ("DEMO_CLOSE_TERMINALIZED", "DEMO_CLOSED_EXTERNALLY")
+    ) == 2
 
 
 def test_remote_nonflat_and_conflicting_close_remain_unresolved() -> None:

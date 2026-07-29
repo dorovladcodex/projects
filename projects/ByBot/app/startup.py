@@ -37,6 +37,19 @@ class StartupDiagnostics:
         self.state = "INITIALIZING"
         self.current_step: str | None = None
         self.steps: list[dict[str, Any]] = []
+        self.persistence_connect: dict[str, Any] = {
+            "state": "PENDING",
+            "attempt_count": 0,
+            "started_at": None,
+            "completed_at": None,
+            "elapsed_ms": 0,
+            "last_error_category": None,
+            "last_sqlstate": None,
+            "last_exception": None,
+            "repository_available": False,
+            "health_query_passed": False,
+            "cleanup_completed": True,
+        }
         self._lock = Lock()
         self._active: dict[str, dict[str, Any]] = {}
         self._write()
@@ -122,6 +135,7 @@ class StartupDiagnostics:
         except Exception as exc:
             self._finish(record, "FAILED", error_type=type(exc).__name__)
             if critical:
+                self.mark_failed(exc)
                 raise
             return None
         finally:
@@ -148,11 +162,44 @@ class StartupDiagnostics:
             self.finished_at = datetime.now(timezone.utc)
         self._write()
 
+    def update_persistence_readiness(self, payload: dict[str, Any]) -> None:
+        allowed = {
+            "PENDING": {"PENDING", "RETRYING", "PASS", "FAIL"},
+            "RETRYING": {"RETRYING", "PASS", "FAIL"},
+            "PASS": {"PASS"},
+            "FAIL": {"FAIL"},
+        }
+        with self._lock:
+            current = str(self.persistence_connect.get("state") or "PENDING")
+            incoming = str(payload.get("state") or current)
+            if incoming not in allowed[current]:
+                raise RuntimeError(
+                    f"invalid persistence readiness transition {current}->{incoming}"
+                )
+            if self.persistence_connect["started_at"] is None:
+                self.persistence_connect["started_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+            self.persistence_connect.update(payload)
+            self.persistence_connect["state"] = incoming
+            if incoming in {"PASS", "FAIL"}:
+                self.persistence_connect["completed_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+        self._write()
+
     def mark_failed(self, exc: BaseException) -> None:
         with self._lock:
             self.state = "FAILED"
             self.finished_at = datetime.now(timezone.utc)
             error_type = type(exc).__name__
+            if self.persistence_connect["state"] in {"PENDING", "RETRYING"}:
+                self.persistence_connect["state"] = "FAIL"
+                self.persistence_connect["completed_at"] = (
+                    self.finished_at.isoformat()
+                )
+                self.persistence_connect["last_error_category"] = error_type
+                self.persistence_connect["last_exception"] = error_type
         self.capture_stacks(self.current_step or "startup", reason=error_type)
         self._write()
 
@@ -177,6 +224,12 @@ class StartupDiagnostics:
                     (now - self.started_at).total_seconds(), 6
                 ),
                 "current_step": self.current_step,
+                "startup_final_result": (
+                    "PASS" if self.state == "READY"
+                    else "FAIL" if self.state == "FAILED"
+                    else self.state
+                ),
+                "persistence_connect": dict(self.persistence_connect),
                 "steps": [dict(item) for item in self.steps],
                 "diagnostic_stack_path": str(self.stack_path),
             }

@@ -90,6 +90,12 @@ class V2Runtime:
         self.last_cycle_at: datetime | None = None
         self.last_error: str | None = None
         self.stop_new_entries = False
+        self.supervisor_entries_paused = bool(
+            restored.get("supervisor_entries_paused", False)
+        )
+        self.supervisor_pause_reason: str | None = restored.get(
+            "supervisor_pause_reason"
+        )
         restored_finalization = dict(restored.get("run_finalization") or {})
         phase_order = {
             V2RunPhase.RUNNING.value: 0,
@@ -1426,6 +1432,8 @@ class V2Runtime:
         return {
             "run_valid": self.run_valid,
             "run_invalid_reasons": list(self.run_invalid_reasons),
+            "supervisor_entries_paused": self.supervisor_entries_paused,
+            "supervisor_pause_reason": self.supervisor_pause_reason,
             "terminalization_incident_ids": sorted(
                 self._terminalization_incident_ids
             ),
@@ -1677,6 +1685,8 @@ class V2Runtime:
             "last_error": self.last_error, "cycles": self.cycles,
             "stop_new_entries": self.stop_new_entries,
             "entries_paused": self.entries_paused,
+            "supervisor_entries_paused": self.supervisor_entries_paused,
+            "supervisor_pause_reason": self.supervisor_pause_reason,
             "external_dependency_health": self.dependency_health.snapshot(),
             "run_valid": self.run_valid,
             "run_invalid_reasons": list(self.run_invalid_reasons),
@@ -1900,6 +1910,22 @@ class V2Runtime:
             "existing_position_management_active": True,
         }
 
+    def set_supervisor_entries_paused(
+        self, paused: bool, *, reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Pause admission without changing the durable run phase."""
+        self.supervisor_entries_paused = bool(paused)
+        self.supervisor_pause_reason = reason if paused else None
+        self._persist_runtime_metrics()
+        self._refresh_status_snapshot()
+        return {
+            "run_id": self.run_id,
+            "run_phase": self.drain.phase.value,
+            "supervisor_entries_paused": self.supervisor_entries_paused,
+            "supervisor_pause_reason": self.supervisor_pause_reason,
+            "existing_position_management_active": True,
+        }
+
     def execution_entries_allowed(self) -> bool:
         return bool(
             self.drain.phase == V2RunPhase.RUNNING
@@ -1910,7 +1936,9 @@ class V2Runtime:
     @property
     def entries_paused(self) -> bool:
         return bool(
-            self.stop_new_entries or self.dependency_health.entries_paused
+            self.stop_new_entries
+            or self.dependency_health.entries_paused
+            or self.supervisor_entries_paused
         )
 
     def _restore_finalization_on_startup(self) -> None:

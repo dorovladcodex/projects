@@ -1287,6 +1287,8 @@ def test_controlled_canary_close_uses_one_idempotent_reduce_only_order() -> None
     assert reduce_only[0]["symbol"] == "BTCUSDT"
     assert reduce_only[0]["qty"] == "0.01"
     assert first.close_order_link_id == second.close_order_link_id
+    assert first.exit_attribution == "manual_external_close"
+    assert first.close_reason == "manual_external_close"
 
 
 def test_controlled_canary_entry_uses_production_demo_service_once(tmp_path) -> None:

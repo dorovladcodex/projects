@@ -1,0 +1,49 @@
+{
+  "run_id": "demo-v2-two-close-20260729T105656979593Z",
+  "executions": [
+    {
+      "symbol": "SOLUSDT",
+      "state": "DEMO_RECONCILIATION_REQUIRED",
+      "candidate_id": "a77b4421-dc9e-4fa0-a92e-ece187a92ecb",
+      "execution_id": "80724cb7-f7a1-415d-9d31-f85c8858b73f",
+      "entry_order_id": "6469fef0-721f-4e64-9e2e-2137db2e6a10",
+      "entry_order_link_id": "bybot-78f5c7-e-28d754fe7c81e049e58f",
+      "entry_exec_id": "f1ed0d61-cabe-4c82-9197-8fa19292306e",
+      "entry_time": "2026-07-29T10:58:04.230000+00:00",
+      "entry_price": "73.84",
+      "entry_fee": "0.0568568",
+      "close_order_id": "393b6c9d-30c1-4944-b40d-1ad3130979ce",
+      "close_order_link_id": "bybot-78f5c7-e-a16dbd6341554be83d76",
+      "close_exec_id": "64afae85-9a92-4fc8-87a7-276382dda7b9",
+      "close_time": "2026-07-29T10:58:49.304000+00:00",
+      "close_price": "73.85",
+      "close_fee": "0.0568645",
+      "quantity": "1.4",
+      "tp_order_id": "c0a5c1e0-1bae-4115-8fd4-9c7c2a245c6d",
+      "sl_order_id": "4ae7ddab-26de-47c9-9888-9f514ef2cf4b",
+      "expected_net_pnl": "-0.0997213"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "state": "DEMO_CLOSING",
+      "candidate_id": "a9f54e7a-6c3b-4f29-a9e9-9f8ebfc9971c",
+      "execution_id": "d64fd340-c050-4bda-86d4-251a88ea657c",
+      "entry_order_id": "f8a0b63d-7c7e-4a11-90c2-adb805b66b61",
+      "entry_order_link_id": "bybot-78f5c7-e-36de72d260d2243d6320",
+      "entry_exec_id": "723bc86d-f902-4309-b355-68cc631ef513",
+      "entry_time": "2026-07-29T10:58:29.451000+00:00",
+      "entry_price": "64441.2",
+      "entry_fee": "0.07088532",
+      "close_order_id": "8789d3c5-2eca-402e-8afc-d6d5c181bbe2",
+      "close_order_link_id": "bybot-78f5c7-e-a3b8c36a565d5e649eec",
+      "close_exec_id": "77ad7e5e-77a6-40f6-a81a-8e23b9d203d1",
+      "close_time": "2026-07-29T10:58:49.509000+00:00",
+      "close_price": "64442.9",
+      "close_fee": "0.07088719",
+      "quantity": "0.002",
+      "tp_order_id": "65a478bf-2238-41af-821b-b30235a7572c",
+      "sl_order_id": "2d55bb86-ff09-451b-803e-c45284b7a529",
+      "expected_net_pnl": "-0.13837251"
+    }
+  ]
+}

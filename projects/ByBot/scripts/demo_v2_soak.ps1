@@ -310,7 +310,27 @@ function Wait-UvicornReady {
         if ($Process.HasExited) {
             $Process.WaitForExit()
             $Process.Refresh()
-            throw ('FastAPI exited before readiness: ' + $Process.ExitCode)
+            $startupPath = Join-Path $script:artifactDir 'startup\startup-diagnostics.json'
+            if (Test-Path -LiteralPath $startupPath) {
+                try {
+                    $startup = Get-Content -Raw -LiteralPath $startupPath |
+                        ConvertFrom-Json
+                    if ($startup.persistence_connect.state -eq 'FAIL') {
+                        throw (
+                            'BOUNDED PERSISTENCE STARTUP FAILURE: attempts=' +
+                            $startup.persistence_connect.attempt_count +
+                            '; category=' +
+                            $startup.persistence_connect.last_error_category +
+                            '; exit_code=' + $Process.ExitCode
+                        )
+                    }
+                } catch {
+                    if ($_.Exception.Message -like 'BOUNDED PERSISTENCE*') {
+                        throw
+                    }
+                }
+            }
+            throw ('UVICORN CRASH BEFORE READINESS: exit_code=' + $Process.ExitCode)
         }
         try {
             $null = Invoke-RestMethod ($BaseUrl + '/health') -TimeoutSec 2
@@ -320,7 +340,27 @@ function Wait-UvicornReady {
             Start-Sleep -Seconds 1
         }
     }
-    throw ('FastAPI did not become ready within ' + $TimeoutSeconds + ' seconds.')
+    throw (
+        'APPLICATION READINESS TIMEOUT: FastAPI did not become ready within ' +
+        $TimeoutSeconds + ' seconds.'
+    )
+}
+
+function Assert-StartupPersistenceReady {
+    param([string]$BaseUrl)
+    $startup = Invoke-RestMethod ($BaseUrl + '/startup/status') -TimeoutSec 10
+    if ($startup.state -ne 'READY' -or
+        $startup.startup_final_result -ne 'PASS' -or
+        $startup.persistence_connect.state -ne 'PASS' -or
+        $startup.persistence_connect.repository_available -ne $true -or
+        $startup.persistence_connect.health_query_passed -ne $true) {
+        throw 'STARTUP STATUS VALIDATION failed: persistence is not authoritatively ready.'
+    }
+    Write-Host (
+        'PERSISTENCE READINESS: PASS attempts=' +
+        $startup.persistence_connect.attempt_count +
+        ' elapsed_ms=' + $startup.persistence_connect.elapsed_ms
+    )
 }
 
 function Assert-AuthoritativeOrderOwnership {
@@ -433,6 +473,7 @@ try {
 
         $base = 'http://127.0.0.1:8137'
         Wait-UvicornReady -Process $script:process -BaseUrl $base
+        Assert-StartupPersistenceReady -BaseUrl $base
         $status = Invoke-RestMethod "$base/v2/status" -TimeoutSec 5
         if (-not $status.preflight_ok) { throw ('V2 runtime preflight failed: ' + ($status.preflight_blockers -join '; ')) }
         Write-Host ('V2 STARTED: PASS run_id=' + $runId)

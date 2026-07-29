@@ -16,6 +16,7 @@ from app.models import (
     Side,
     Symbol,
 )
+from app.db.persistence import _reconcile_v2_portfolio_accounting_payload
 from tests.test_bybit_demo_execution import candidate_bundle
 
 
@@ -137,6 +138,45 @@ def test_remote_flat_with_attributable_external_close() -> None:
     assert diagnosis.close_source == "manual_external_close"
     assert diagnosis.net_realized_pnl == Decimal("-0.02")
     assert exact_close_reconciliation_blockers(diagnosis) == []
+
+
+def test_historical_nonterminal_recovery_can_create_one_missing_ledger_event() -> None:
+    item = record().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSED,
+        "realized_exchange_pnl": Decimal("-0.0685796"),
+        "exchange_fees": Decimal("0.2105796"),
+        "funding_pnl": Decimal("0"),
+        "accounting_status": "FINAL",
+        "closed_at": datetime(2026, 7, 28, 23, 38, 23, tzinfo=timezone.utc),
+        "updated_at": datetime(2026, 7, 29, 0, 0, tzinfo=timezone.utc),
+    })
+    result = _reconcile_v2_portfolio_accounting_payload(
+        {
+            "risk_capital_usdt": "1000",
+            "realized_events": {},
+            "unrealized_pnl": "0",
+            "peak_equity": "1000",
+        },
+        item,
+        allow_missing=True,
+    )
+    assert result["realized_events"][str(item.id)]["pnl"] == "-0.0685796"
+    assert result["cumulative_realized_pnl"] == "-0.0685796"
+    assert result["equity"] == "999.9314204"
+
+
+def test_terminal_recovery_refuses_to_create_missing_ledger_event_twice() -> None:
+    item = record().model_copy(update={
+        "state": DemoExecutionState.DEMO_CLOSED,
+        "realized_exchange_pnl": Decimal("0.1"),
+        "closed_at": datetime(2026, 7, 28, 23, 38, 23, tzinfo=timezone.utc),
+    })
+    try:
+        _reconcile_v2_portfolio_accounting_payload({}, item)
+    except ValueError as exc:
+        assert "cannot create a missing ledger event" in str(exc)
+    else:
+        raise AssertionError("missing ledger creation was not refused")
 
 
 def test_take_profit_can_terminalize_directly_from_position_open() -> None:

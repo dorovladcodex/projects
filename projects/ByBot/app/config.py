@@ -134,6 +134,8 @@ class Settings(BaseSettings):
     startup_hard_timeout_seconds: int = Field(default=60, ge=30, le=120)
     startup_step_timeout_seconds: int = Field(default=30, ge=5, le=60)
     startup_diagnostic_threshold_seconds: int = Field(default=10, ge=1, le=30)
+    persistence_startup_timeout_seconds: int = Field(default=35, ge=10, le=45)
+    persistence_connect_timeout_seconds: int = Field(default=4, ge=1, le=5)
     v2_startup_universe_workers: int = Field(default=8, ge=1, le=17)
     v2_startup_private_workers: int = Field(default=4, ge=1, le=12)
     v2_universe_symbols: tuple[str, ...] = (

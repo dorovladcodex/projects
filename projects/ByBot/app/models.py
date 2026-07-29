@@ -236,6 +236,13 @@ class DemoExecutionRecord(BaseModel):
     terminalization_warning_at: datetime | None = None
     terminalization_hard_failure_at: datetime | None = None
     terminalization_blockers: list[str] = Field(default_factory=list)
+    terminalization_started_at: datetime | None = None
+    evidence_acquired_at: datetime | None = None
+    terminalization_completed_at: datetime | None = None
+    terminalization_attempt_count: int = Field(default=0, ge=0)
+    terminalization_last_blocker: str | None = None
+    execution_lock_wait_ms: float | None = Field(default=None, ge=0)
+    persistence_commit_ms: float | None = Field(default=None, ge=0)
     last_error: str | None = None
     signal_created_at: datetime | None = None
     candidate_persisted_at: datetime | None = None

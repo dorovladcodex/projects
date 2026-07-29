@@ -413,13 +413,23 @@ class V2RunRow(Base):
 class PersistenceRepository:
     """Small synchronous repository. Failures degrade persistence, never trading safety."""
 
-    def __init__(self, database_url: str, *, create_schema: bool = True) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        create_schema: bool = True,
+        connect_timeout_seconds: int = 2,
+    ) -> None:
         self.database_url = database_url
         sqlalchemy_url = normalize_database_url(database_url)
-        connect_args = {"connect_timeout": 2} if sqlalchemy_url.startswith("postgresql") else {}
+        connect_args = (
+            {"connect_timeout": max(1, int(connect_timeout_seconds))}
+            if sqlalchemy_url.startswith("postgresql") else {}
+        )
         self.available = False
         self.last_error: str | None = None
         self.last_error_code: str | None = None
+        self.last_sqlstate: str | None = None
         self.news_restore_valid_count = 0
         self.news_restore_repaired_count = 0
         self.news_restore_quarantined_count = 0
@@ -435,6 +445,41 @@ class PersistenceRepository:
             self.available = True
         except (SQLAlchemyError, ImportError) as exc:
             self.last_error = type(exc).__name__
+            self.last_error_code = (
+                _database_error_code(exc)
+                if isinstance(exc, SQLAlchemyError) else "DB_DRIVER_UNAVAILABLE"
+            )
+            self.last_sqlstate = _sqlstate(exc)
+
+    def health_check(self) -> bool:
+        """Prove both the connection and migration schema are readable."""
+        if not self.available:
+            return False
+        try:
+            with self.engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1").scalar_one()
+                if self.engine.dialect.name == "postgresql":
+                    revision = connection.exec_driver_sql(
+                        "SELECT version_num FROM alembic_version LIMIT 1"
+                    ).scalar_one_or_none()
+                    if not revision:
+                        raise RuntimeError("Alembic schema revision is unavailable")
+            return True
+        except (SQLAlchemyError, RuntimeError) as exc:
+            self.available = False
+            self.last_error = type(exc).__name__
+            self.last_error_code = (
+                _database_error_code(exc)
+                if isinstance(exc, SQLAlchemyError)
+                else "DB_SCHEMA_UNAVAILABLE"
+            )
+            self.last_sqlstate = _sqlstate(exc)
+            return False
+
+    def dispose(self) -> None:
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.dispose()
 
     def save_news(self, item: NewsItem) -> bool:
         if not self.available:
@@ -1586,6 +1631,11 @@ class PersistenceRepository:
                 existing = session.get(DemoExecutionRow, str(record.id))
                 if existing is None:
                     return False
+                existing_was_terminal = DemoExecutionState(existing.state) in {
+                    DemoExecutionState.DEMO_CLOSED,
+                    DemoExecutionState.DEMO_CLOSED_AFTER_FAILURE,
+                    DemoExecutionState.DEMO_CLOSED_EXTERNALLY,
+                }
                 row = _demo_execution_row(record)
                 for column in (
                     "state", "accepted_quantity", "average_fill_price",
@@ -1602,14 +1652,40 @@ class PersistenceRepository:
                     portfolio_state = session.get(
                         V2PortfolioStateRow, 1, with_for_update=True
                     )
-                    if portfolio_state is not None:
-                        portfolio_state.payload = (
-                            _reconcile_v2_portfolio_accounting_payload(
-                                dict(portfolio_state.payload),
-                                record,
-                            )
+                    if portfolio_state is None:
+                        raise ValueError(
+                            "V2 portfolio state is missing for accounting repair"
                         )
-                        portfolio_state.updated_at = record.updated_at
+                    portfolio_state.payload = (
+                        _reconcile_v2_portfolio_accounting_payload(
+                            dict(portfolio_state.payload),
+                            record,
+                            allow_missing=not existing_was_terminal,
+                        )
+                    )
+                    portfolio_state.updated_at = record.updated_at
+                    reservation = session.scalar(
+                        select(V2PortfolioReservationRow)
+                        .where(
+                            V2PortfolioReservationRow.execution_id
+                            == str(record.id)
+                        )
+                        .with_for_update()
+                    )
+                    if reservation is not None:
+                        reservation_payload = dict(reservation.payload)
+                        reservation_payload["state"] = (
+                            ReservationState.RELEASED.value
+                        )
+                        reservation_payload["released_at"] = (
+                            record.closed_at or record.updated_at
+                        ).isoformat()
+                        reservation.state = ReservationState.RELEASED.value
+                        reservation.active_symbol = None
+                        reservation.released_at = (
+                            record.closed_at or record.updated_at
+                        )
+                        reservation.payload = reservation_payload
                 base_time = record.updated_at
                 for index, event_type in enumerate(event_types):
                     occurred_at = base_time + timedelta(microseconds=index)
@@ -2697,6 +2773,7 @@ class PersistenceRepository:
         self.available = False
         self.last_error = type(exc).__name__
         self.last_error_code = _database_error_code(exc)
+        self.last_sqlstate = _sqlstate(exc)
         LOGGER.error(
             "database operation failed: type=%s message=%s",
             type(exc).__name__,
@@ -2803,9 +2880,12 @@ def _demo_execution_row(record: DemoExecutionRecord) -> DemoExecutionRow:
 
 
 def _reconcile_v2_portfolio_accounting_payload(
-    payload: dict[str, Any], record: DemoExecutionRecord,
+    payload: dict[str, Any],
+    record: DemoExecutionRecord,
+    *,
+    allow_missing: bool = False,
 ) -> dict[str, Any]:
-    """Replace one already-applied ledger value without applying it twice."""
+    """Create or replace one exact ledger value without applying it twice."""
 
     if record.realized_exchange_pnl is None or record.closed_at is None:
         raise ValueError("final accounting requires realized PnL and close time")
@@ -2814,12 +2894,12 @@ def _reconcile_v2_portfolio_accounting_payload(
         for key, value in dict(payload.get("realized_events") or {}).items()
     }
     execution_id = str(record.id)
-    if execution_id not in events:
+    if execution_id not in events and not allow_missing:
         raise ValueError(
             "accounting reconciliation cannot create a missing ledger event"
         )
     events[execution_id] = {
-        **events[execution_id],
+        **events.get(execution_id, {}),
         "pnl": str(record.realized_exchange_pnl),
         "closed_at": record.closed_at.isoformat(),
         "fees": str(record.exchange_fees),
@@ -2945,3 +3025,15 @@ def _sanitize_database_error(message: str) -> str:
     )
     sanitized = re.sub(r"(?i)(password\s*[=:]\s*)[^\s,;]+", r"\1***", sanitized)
     return sanitized[:1000]
+
+
+def _sqlstate(exc: BaseException) -> str | None:
+    current: BaseException | None = exc
+    while current is not None:
+        value = getattr(current, "sqlstate", None) or getattr(
+            current, "pgcode", None
+        )
+        if value:
+            return str(value)[:10]
+        current = current.__cause__ or current.__context__
+    return None

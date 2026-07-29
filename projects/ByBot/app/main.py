@@ -57,6 +57,7 @@ from app.risk import RiskManager, RiskRules
 from app.runtime import build_status
 from app.signals import SignalCandidateService
 from app.db import PersistenceRepository
+from app.db.readiness import wait_for_persistence
 from app.v2.execution import V2ExecutionCoordinator
 from app.v2.market import RollingFeatureEngine
 from app.v2.news import (
@@ -86,11 +87,21 @@ startup_diagnostics = StartupDiagnostics(
     ),
     diagnostic_threshold_seconds=settings.startup_diagnostic_threshold_seconds,
 )
-persistence = startup_diagnostics.run_sync(
+persistence_readiness = startup_diagnostics.run_sync(
     "persistence_connect",
-    lambda: PersistenceRepository(settings.database_url, create_schema=False),
-    timeout_seconds=min(10, settings.startup_step_timeout_seconds),
+    lambda: wait_for_persistence(
+        settings.database_url,
+        timeout_seconds=settings.persistence_startup_timeout_seconds,
+        connection_timeout_seconds=settings.persistence_connect_timeout_seconds,
+        create_schema=settings.app_env.lower() == "test",
+        status_callback=startup_diagnostics.update_persistence_readiness,
+    ),
+    timeout_seconds=min(
+        settings.startup_hard_timeout_seconds - 10,
+        settings.persistence_startup_timeout_seconds + 5,
+    ),
 )
+persistence = persistence_readiness.repository
 market_data_service = build_market_data_service(settings)
 account_service = build_account_service(settings)
 demo_client = (
@@ -222,7 +233,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.startup_diagnostics = startup_diagnostics
     background_tasks: list[asyncio.Task[object]] = []
     try:
-        async with asyncio.timeout(settings.startup_hard_timeout_seconds):
+        elapsed_startup = (
+            datetime.now(timezone.utc) - startup_diagnostics.started_at
+        ).total_seconds()
+        remaining_startup = (
+            float(settings.startup_hard_timeout_seconds) - elapsed_startup
+        )
+        if remaining_startup <= 0:
+            raise TimeoutError(
+                "application startup hard limit elapsed before lifespan"
+            )
+        async with asyncio.timeout(remaining_startup):
             if settings.v2_enabled:
                 # Public validation precedes private preflight, while each
                 # symbol is inspected concurrently with bounded HTTP calls.
@@ -344,6 +365,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     "shutdown", reason="background_task_cleanup_timeout"
                 )
         startup_diagnostics.mark_stopped()
+        dispose_persistence = getattr(persistence, "dispose", None)
+        if callable(dispose_persistence):
+            dispose_persistence()
 
 
 app = FastAPI(title="ByBot", version="0.1.0", lifespan=lifespan)
@@ -416,6 +440,22 @@ def v2_stop_new_entries() -> dict[str, object]:
     if settings.app_env.lower() != "demo" or not settings.v2_enabled:
         raise HTTPException(status_code=404, detail="V2 Demo runtime is disabled")
     return v2_runtime.begin_draining()
+
+
+@app.post("/v2/supervisor/pause")
+def v2_supervisor_pause() -> dict[str, object]:
+    if settings.app_env.lower() != "demo" or not settings.v2_enabled:
+        raise HTTPException(status_code=404, detail="V2 Demo runtime is disabled")
+    return v2_runtime.set_supervisor_entries_paused(
+        True, reason="external supervisor status fallback"
+    )
+
+
+@app.post("/v2/supervisor/resume")
+def v2_supervisor_resume() -> dict[str, object]:
+    if settings.app_env.lower() != "demo" or not settings.v2_enabled:
+        raise HTTPException(status_code=404, detail="V2 Demo runtime is disabled")
+    return v2_runtime.set_supervisor_entries_paused(False)
 
 
 @app.post("/v2/canary/sizing/{symbol}/{notional_tier}")
@@ -1583,7 +1623,26 @@ def demo_reconcile() -> dict[str, object]:
         raise HTTPException(status_code=404, detail="Demo execution is disabled")
     demo_execution_service.reconciliation_in_progress = True
     try:
-        return demo_execution_service.reconcile()
+        reconciliation = demo_execution_service.reconcile()
+        signal_candidate_service.sync_demo_states()
+        terminalization: dict[str, object] = {
+            "requested": False,
+            "completed": False,
+        }
+        if settings.v2_enabled:
+            v2_runtime.sync_terminal_executions()
+            terminalization = {
+                "requested": True,
+                "completed": True,
+                "run_phase": v2_runtime.status().get("run_phase"),
+                "active_execution_ids": (
+                    v2_runtime.status().get("drain_active_execution_ids") or []
+                ),
+            }
+        return {
+            **reconciliation,
+            "terminalization": terminalization,
+        }
     finally:
         demo_execution_service.reconciliation_in_progress = False
 
@@ -1634,13 +1693,32 @@ async def demo_private_stream_loop() -> None:
 
 
 async def demo_reconciliation_loop() -> None:
-    while True:
-        await asyncio.sleep(settings.demo_reconciliation_interval_seconds)
-        demo_execution_service.reconciliation_in_progress = True
-        try:
-            await asyncio.to_thread(demo_execution_service.reconcile)
-        finally:
-            demo_execution_service.reconciliation_in_progress = False
-        signal_candidate_service.sync_demo_states()
-        if settings.v2_enabled:
-            await asyncio.to_thread(v2_runtime.sync_terminal_executions)
+    demo_execution_service.reconciler_task_alive = True
+    try:
+        while True:
+            await asyncio.sleep(settings.demo_reconciliation_interval_seconds)
+            demo_execution_service.reconciliation_in_progress = True
+            try:
+                await asyncio.to_thread(demo_execution_service.reconcile)
+                demo_execution_service.reconciler_last_error = None
+                signal_candidate_service.sync_demo_states()
+                if settings.v2_enabled:
+                    await asyncio.to_thread(v2_runtime.sync_terminal_executions)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Keep the sole canonical reconciler alive. The failure stays
+                # visible to status/supervision and is retried on the next
+                # bounded cycle; no exchange mutation is retried here.
+                demo_execution_service.reconciler_failure_count += 1
+                demo_execution_service.reconciler_last_error = (
+                    f"{type(exc).__name__}: "
+                    f"{' '.join(str(exc).split())[:300]}"
+                )
+                demo_execution_service.last_error = (
+                    demo_execution_service.reconciler_last_error
+                )
+            finally:
+                demo_execution_service.reconciliation_in_progress = False
+    finally:
+        demo_execution_service.reconciler_task_alive = False

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 from app.bybit.demo import DemoExecutionService
 from app.bybit.demo_diagnostics import DemoDiagnosticsConfig
@@ -98,6 +101,83 @@ def test_runtime_hard_failure_stops_entries_and_persists_once(tmp_path: Path) ->
     ]
     assert len(incidents) == 1
     assert incidents[0].payload["reconciliation_continues"] is True
+
+
+def test_supervisor_pause_preserves_phase_and_position_management(
+    tmp_path: Path,
+) -> None:
+    app, _, _ = runtime(tmp_path, ())
+    phase = app.status()["run_phase"]
+
+    paused = app.set_supervisor_entries_paused(
+        True, reason="bounded status fallback"
+    )
+    assert paused["run_phase"] == phase
+    assert paused["existing_position_management_active"] is True
+    assert app.entries_paused is True
+    assert app.stop_new_entries is False
+
+    resumed = app.set_supervisor_entries_paused(False)
+    assert resumed["run_phase"] == phase
+    assert app.entries_paused is False
+
+
+def test_supervisor_terminal_sync_runs_reconcile_ledger_and_capacity_once(
+    tmp_path: Path,
+) -> None:
+    app, _, _ = runtime(tmp_path, ())
+    calls = {"invariants": 0, "reservations": 0}
+    app._enforce_terminalization_invariants = lambda: calls.__setitem__(
+        "invariants", calls["invariants"] + 1
+    )
+    app._sync_reservations = lambda: calls.__setitem__(
+        "reservations", calls["reservations"] + 1
+    )
+
+    app.sync_terminal_executions()
+
+    assert calls == {"invariants": 1, "reservations": 1}
+
+
+def test_reconciliation_loop_survives_one_unexpected_failure(monkeypatch) -> None:
+    import app.main as main_app
+
+    calls = {"sleep": 0, "reconcile": 0, "sync": 0}
+
+    async def controlled_sleep(seconds: float) -> None:
+        calls["sleep"] += 1
+        if calls["sleep"] >= 3:
+            raise asyncio.CancelledError
+
+    def reconcile() -> None:
+        calls["reconcile"] += 1
+        if calls["reconcile"] == 1:
+            raise RuntimeError("one reconciliation defect")
+
+    monkeypatch.setattr(main_app.asyncio, "sleep", controlled_sleep)
+    monkeypatch.setattr(
+        main_app.demo_execution_service, "reconcile", reconcile
+    )
+    monkeypatch.setattr(
+        main_app.signal_candidate_service,
+        "sync_demo_states",
+        lambda: calls.__setitem__("sync", calls["sync"] + 1),
+    )
+    monkeypatch.setattr(
+        main_app.v2_runtime,
+        "sync_terminal_executions",
+        lambda: calls.__setitem__("sync", calls["sync"] + 1),
+    )
+    main_app.demo_execution_service.reconciler_failure_count = 0
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(main_app.demo_reconciliation_loop())
+
+    assert calls["reconcile"] == 2
+    assert calls["sync"] >= 1
+    assert main_app.demo_execution_service.reconciler_failure_count == 1
+    assert main_app.demo_execution_service.reconciler_last_error is None
+    assert main_app.demo_execution_service.reconciler_task_alive is False
 
 
 def test_analyzer_zero_unresolved_is_read_only(tmp_path: Path) -> None:

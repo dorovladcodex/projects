@@ -1,0 +1,29 @@
+{
+  "run_id": "demo-v2-20260728T190814687Z",
+  "status_timeout_at": "2026-07-28T23:38:08.449355Z",
+  "supervisor_termination_at": "2026-07-28T23:38:25.763000Z",
+  "executions": [
+    {
+      "execution_id": "36f3abbd-e7e1-41ab-b5df-ecd0ee9a7a5c",
+      "symbol": "SUIUSDT",
+      "durable_state": "DEMO_CLOSING",
+      "entry_order_id": "cf964fa0-be21-42ae-9138-79b43069791d",
+      "close_order_id": "550b3a5c-0b57-4e30-bf59-c59bd0c3a3f6",
+      "close_fill_at": "2026-07-28T23:38:22.062000Z",
+      "remote_position_size": "0",
+      "remote_open_orders": 0
+    },
+    {
+      "execution_id": "c0eb0cd0-9d0f-4a2d-ae70-63c97dd37455",
+      "symbol": "ETHUSDT",
+      "durable_state": "DEMO_CLOSING",
+      "entry_order_id": "fed4c089-da1a-4825-8789-9913c24f4edb",
+      "entry_execution_ids": ["8defca4f-a655-4ffc-8dc4-05c4c7a0deba"],
+      "close_order_id": "6ccd01fd-a358-44d1-a9eb-3d484db2219f",
+      "close_execution_ids": ["45ea8afe-e151-4440-9db7-8d91c9118629"],
+      "close_fill_at": "2026-07-28T23:38:23.648000Z",
+      "remote_position_size": "0",
+      "remote_open_orders": 0
+    }
+  ]
+}

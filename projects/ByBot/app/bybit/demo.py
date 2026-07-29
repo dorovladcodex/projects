@@ -119,6 +119,7 @@ def canonical_exit_attribution(reason: str | None) -> str:
         "exchange_generated_tp": "take_profit",
         "exchange_generated_sl": "stop_loss",
         "external_close": "manual_external_close",
+        "canary_close": "manual_external_close",
     }
     value = aliases.get(normalized, normalized)
     return value if value in CANONICAL_EXIT_ATTRIBUTIONS else "unattributed_external_close"
@@ -942,6 +943,9 @@ class DemoExecutionService:
         self.account_margin_mode: str | None = None
         self.last_reconciliation_at: datetime | None = None
         self.reconciliation_in_progress = False
+        self.reconciler_task_alive = False
+        self.reconciler_last_error: str | None = None
+        self.reconciler_failure_count = 0
         self._last_reconcile_monotonic: float | None = None
         self._discard_ws_before_ms: int | None = None
         self.sleep_resume_reconciliations = 0
@@ -1636,7 +1640,10 @@ class DemoExecutionService:
     def _reconcile_execution_rest(
         self, record: DemoExecutionRecord
     ) -> DemoExecutionRecord:
-        with self._execution_lock(record.id):
+        lock = self._execution_lock(record.id)
+        lock_started = perf_counter()
+        with lock:
+            lock_wait_ms = max(0.0, (perf_counter() - lock_started) * 1000)
             loader = getattr(self.repository, "get_demo_execution", None)
             latest = loader(str(record.candidate_id)) if callable(loader) else None
             if latest is not None:
@@ -1644,6 +1651,7 @@ class DemoExecutionService:
                     return latest
                 if _aware(latest.updated_at) >= _aware(record.updated_at):
                     record = latest
+            record.execution_lock_wait_ms = lock_wait_ms
             return self._reconcile_execution_rest_locked(record)
 
     def _reconcile_execution_rest_locked(
@@ -1719,6 +1727,12 @@ class DemoExecutionService:
                     record, event_type="DEMO_FULLY_FILLED"
                 )
                 self._install_protection(record)
+        if (
+            record.state in EXACT_CLOSE_TERMINALIZABLE_STATES
+            and position is None
+            and close_started
+        ):
+            self._begin_terminalization_attempt(record)
         finalized = self._finalize_attributed_flat_close(
             record,
             realtime=realtime,
@@ -1949,9 +1963,17 @@ class DemoExecutionService:
             (fill.quantity for fill in record.close_fills), Decimal("0")
         )
         if durable_close_quantity != record.accepted_quantity:
+            record.terminalization_last_blocker = (
+                "exact close quantity does not equal owned entry quantity"
+            )
             return False
         if not self._finalize_exact_accounting(record):
+            record.terminalization_last_blocker = (
+                "authoritative accounting evidence is incomplete"
+            )
             return False
+        record.evidence_acquired_at = datetime.now(timezone.utc)
+        record.terminalization_last_blocker = None
         attribution = canonical_exit_attribution(
             record.exit_attribution or record.close_reason
         )
@@ -1978,19 +2000,7 @@ class DemoExecutionService:
         record.last_error = None
         record.closed_at = max(fill.executed_at for fill in record.close_fills)
         record.updated_at = datetime.now(timezone.utc)
-        terminalizer = getattr(
-            self.repository, "terminalize_demo_execution", None
-        )
-        if callable(terminalizer):
-            result = terminalizer(
-                record, event_type="DEMO_CLOSE_TERMINALIZED"
-            )
-            if result == "FAILED":
-                raise RuntimeError("durable Demo terminalization failed")
-        else:
-            self.repository.save_demo_execution(
-                record, event_type="DEMO_CLOSE_TERMINALIZED"
-            )
+        self._persist_terminalization(record)
         return True
 
     def _finalize_durable_exact_flat_close(
@@ -2032,6 +2042,9 @@ class DemoExecutionService:
             # sufficient ownership evidence for the existing cleanup path.
             attribution = "forced_cleanup"
         if attribution == "unattributed_external_close":
+            record.terminalization_last_blocker = (
+                "exact close has no canonical durable attribution"
+            )
             return False
         entry_time_ms = _record_entry_time_ms(record)
         if (
@@ -2079,7 +2092,12 @@ class DemoExecutionService:
         record.paper_shadow_pnl = record.gross_realized_pnl - fees
         record.realized_exchange_pnl = record.paper_shadow_pnl
         if not self._finalize_exact_accounting(record):
+            record.terminalization_last_blocker = (
+                "authoritative accounting evidence is incomplete"
+            )
             return False
+        record.evidence_acquired_at = datetime.now(timezone.utc)
+        record.terminalization_last_blocker = None
         record.exit_attribution = attribution
         record.close_reason = attribution
         record.closed_at = max(fill.executed_at for fill in record.close_fills)
@@ -2103,18 +2121,49 @@ class DemoExecutionService:
         )
         record.last_error = None
         record.updated_at = datetime.now(timezone.utc)
-        terminalizer = getattr(self.repository, "terminalize_demo_execution", None)
+        self._persist_terminalization(record)
+        return True
+
+    def _begin_terminalization_attempt(self, record: DemoExecutionRecord) -> None:
+        now = datetime.now(timezone.utc)
+        first_attempt = record.terminalization_started_at is None
+        if record.terminalization_started_at is None:
+            record.terminalization_started_at = now
+        record.terminalization_attempt_count += 1
+        if first_attempt:
+            record.updated_at = now
+            self.repository.save_demo_execution(
+                record, event_type="TERMINALIZATION_STARTED"
+            )
+
+    def _persist_terminalization(self, record: DemoExecutionRecord) -> None:
+        """Persist one exact terminal transition and publish measured timing."""
+        record.terminalization_completed_at = datetime.now(timezone.utc)
+        record.terminalization_last_blocker = None
+        terminalizer = getattr(
+            self.repository, "terminalize_demo_execution", None
+        )
+        started = perf_counter()
         if callable(terminalizer):
             result = terminalizer(
                 record, event_type="DEMO_CLOSE_TERMINALIZED"
             )
+            elapsed_ms = max(0.0, (perf_counter() - started) * 1000)
             if result == "FAILED":
+                record.terminalization_completed_at = None
+                record.terminalization_last_blocker = (
+                    "atomic terminal persistence failed"
+                )
                 raise RuntimeError("durable Demo terminalization failed")
         else:
             self.repository.save_demo_execution(
                 record, event_type="DEMO_CLOSE_TERMINALIZED"
             )
-        return True
+            elapsed_ms = max(0.0, (perf_counter() - started) * 1000)
+        record.persistence_commit_ms = elapsed_ms
+        self.repository.save_demo_execution(
+            record, event_type="TERMINALIZATION_METRICS"
+        )
 
     def _finalize_exact_accounting(
         self, record: DemoExecutionRecord
@@ -2286,6 +2335,7 @@ class DemoExecutionService:
         if not blockers:
             blockers.append("atomic terminal persistence did not complete")
         record.terminalization_blockers = list(dict.fromkeys(blockers))
+        record.terminalization_last_blocker = record.terminalization_blockers[0]
         event_type = None
         if record.terminalization_warning_at is None:
             record.terminalization_warning_at = current
@@ -2904,6 +2954,7 @@ class DemoExecutionService:
                 if (self.last_reconciliation_at or record.last_reconciliation_at) else None
             ),
             "reconciliation_in_progress": self.reconciliation_in_progress,
+            "reconciler_task_alive": self.reconciler_task_alive,
             "remote_position": None,
             "durable_cached_state": True,
         }
@@ -4288,6 +4339,9 @@ class DemoExecutionService:
             "remote_state_authoritative": remote_state_authoritative,
             "remote_state_snapshot_state": remote_state_snapshot_state,
             "reconciliation_in_progress": self.reconciliation_in_progress,
+            "reconciler_task_alive": self.reconciler_task_alive,
+            "reconciler_last_error": self.reconciler_last_error,
+            "reconciler_failure_count": self.reconciler_failure_count,
             "active_execution_remote_watermark": (
                 latest_active_remote_watermark.isoformat()
                 if latest_active_remote_watermark else None
