@@ -9,10 +9,24 @@ from typing import Any
 class CertificationMonitorState(StrEnum):
     HEALTHY = "HEALTHY"
     STATUS_DEGRADED = "STATUS_DEGRADED"
+    EXACT_ENTRY_ATTRIBUTION_PENDING = "EXACT_ENTRY_ATTRIBUTION_PENDING"
+    PROTECTION_PENDING = "PROTECTION_PENDING"
     PROTECTED_POSITION_DEGRADED = "PROTECTED_POSITION_DEGRADED"
     TERMINALIZATION_PENDING = "TERMINALIZATION_PENDING"
     SAFETY_AMBIGUOUS = "SAFETY_AMBIGUOUS"
     FAIL_FAST = "FAIL_FAST"
+
+
+class ProtectionEstablishmentState(StrEnum):
+    EXACT_ENTRY_ATTRIBUTION_PENDING = "EXACT_ENTRY_ATTRIBUTION_PENDING"
+    ENTRY_ACKNOWLEDGED = "ENTRY_ACKNOWLEDGED"
+    ENTRY_PARTIALLY_FILLED = "ENTRY_PARTIALLY_FILLED"
+    PROTECTION_PENDING = "PROTECTION_PENDING"
+    PROTECTED = "PROTECTED"
+    PROTECTION_INVALIDATED_BY_MARKET = "PROTECTION_INVALIDATED_BY_MARKET"
+    UNPROTECTED_CONFIRMED = "UNPROTECTED_CONFIRMED"
+    TERMINALIZATION_PENDING = "TERMINALIZATION_PENDING"
+    SAFETY_AMBIGUOUS = "SAFETY_AMBIGUOUS"
 
 
 @dataclass(frozen=True)
@@ -29,6 +43,32 @@ class ExecutionFallbackEvidence:
     partial_close: bool = False
     ownership_conflict: bool = False
     evidence_error: str | None = None
+    entry_owned: bool = False
+    protection_state: ProtectionEstablishmentState | None = None
+    fill_at: str | None = None
+    protection_started_at: str | None = None
+    protection_requested_at: str | None = None
+    protection_rest_confirmed_at: str | None = None
+    protection_elapsed_ms: float | None = None
+    protection_remaining_deadline_ms: float | None = None
+    protection_attachment_started: bool = False
+    authoritative_position_size: str | None = None
+    authoritative_take_profit: str | None = None
+    authoritative_stop_loss: str | None = None
+    protection_order_ids: tuple[str, ...] = ()
+    invalid_protection_reason: str | None = None
+    entry_attribution_source: str | None = None
+    entry_attribution_lookup_attempts: int = 0
+    realtime_order_id: str | None = None
+    realtime_order_link_id: str | None = None
+    realtime_order_status: str | None = None
+    realtime_order_quantity: str | None = None
+    realtime_cumulative_quantity: str | None = None
+    realtime_order_created_at: str | None = None
+    realtime_order_updated_at: str | None = None
+    realtime_identity_match: bool | None = None
+    first_exact_attribution_at: str | None = None
+    fill_history_observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,9 +122,81 @@ def classify_status_fallback(
             return _fail_fast(
                 f"exchange ownership conflict execution={execution.execution_id}"
             )
-        if execution.remote_position_open and not execution.protection_confirmed:
+        if (
+            execution.remote_position_open
+            and execution.protection_state
+            == ProtectionEstablishmentState.PROTECTION_INVALIDATED_BY_MARKET
+        ):
+            return _fail_fast(
+                f"authoritative TP/SL is invalid or contradictory "
+                f"execution={execution.execution_id}: "
+                f"{execution.invalid_protection_reason or 'unknown reason'}"
+            )
+        if (
+            execution.remote_position_open
+            and execution.protection_state
+            == ProtectionEstablishmentState.UNPROTECTED_CONFIRMED
+        ):
             return _fail_fast(
                 f"open position is not authoritatively protected "
+                f"execution={execution.execution_id}"
+            )
+        if (
+            execution.remote_position_open
+            and execution.protection_state
+            == ProtectionEstablishmentState.SAFETY_AMBIGUOUS
+        ):
+            return MonitorDecision(
+                CertificationMonitorState.SAFETY_AMBIGUOUS,
+                False,
+                execution.evidence_error
+                or (
+                    "exact entry/protection evidence is still being acquired "
+                    f"execution={execution.execution_id}"
+                ),
+                request_reconciliation=True,
+                keep_reconciler_alive=True,
+            )
+        if (
+            execution.remote_position_open
+            and execution.protection_state
+            == ProtectionEstablishmentState.EXACT_ENTRY_ATTRIBUTION_PENDING
+        ):
+            if (
+                execution.protection_remaining_deadline_ms is None
+                or execution.protection_remaining_deadline_ms <= 0
+            ):
+                return MonitorDecision(
+                    CertificationMonitorState.SAFETY_AMBIGUOUS,
+                    False,
+                    (
+                        "exact entry attribution was not established inside "
+                        f"the bounded window execution={execution.execution_id}"
+                    ),
+                    request_reconciliation=True,
+                    keep_reconciler_alive=True,
+                )
+            return MonitorDecision(
+                CertificationMonitorState.EXACT_ENTRY_ATTRIBUTION_PENDING,
+                False,
+                (
+                    "exact realtime entry attribution is still propagating "
+                    f"execution={execution.execution_id}"
+                ),
+                request_reconciliation=True,
+                keep_reconciler_alive=True,
+            )
+        if (
+            execution.remote_position_open
+            and not execution.protection_confirmed
+            and execution.protection_state not in {
+                ProtectionEstablishmentState.ENTRY_ACKNOWLEDGED,
+                ProtectionEstablishmentState.ENTRY_PARTIALLY_FILLED,
+                ProtectionEstablishmentState.PROTECTION_PENDING,
+            }
+        ):
+            return _fail_fast(
+                f"open position protection state is not safely attributable "
                 f"execution={execution.execution_id}"
             )
         if execution.partial_close:
@@ -95,6 +207,39 @@ def classify_status_fallback(
                 request_reconciliation=True,
                 keep_reconciler_alive=True,
             )
+
+    protection_pending = [
+        item for item in evidence.executions
+        if not item.remote_flat
+        and not item.protection_confirmed
+        and item.entry_owned
+        and item.protection_state in {
+            ProtectionEstablishmentState.ENTRY_ACKNOWLEDGED,
+            ProtectionEstablishmentState.ENTRY_PARTIALLY_FILLED,
+            ProtectionEstablishmentState.PROTECTION_PENDING,
+        }
+    ]
+    if protection_pending:
+        expired = [
+            item for item in protection_pending
+            if item.protection_remaining_deadline_ms is None
+            or item.protection_remaining_deadline_ms <= 0
+        ]
+        if expired:
+            return _fail_fast(
+                "bounded protection-establishment deadline expired "
+                + ", ".join(
+                    f"execution={item.execution_id}"
+                    for item in expired
+                )
+            )
+        return MonitorDecision(
+            CertificationMonitorState.PROTECTION_PENDING,
+            False,
+            "exact owned entry is inside bounded protection-establishment window",
+            request_reconciliation=True,
+            keep_reconciler_alive=True,
+        )
 
     flat_nonterminal = [
         item for item in evidence.executions if item.remote_flat
@@ -125,7 +270,11 @@ def classify_status_fallback(
 
     protected = [
         item for item in evidence.executions
-        if item.remote_position_open and item.protection_confirmed
+        if item.remote_position_open
+        and (
+            item.protection_confirmed
+            or item.protection_state == ProtectionEstablishmentState.PROTECTED
+        )
     ]
     if protected and len(protected) == len(evidence.executions):
         return MonitorDecision(
@@ -158,6 +307,7 @@ class CertificationMonitorHealth:
 
     hard_timeout_seconds: float = 90.0
     terminalization_timeout_seconds: float = 120.0
+    protection_timeout_seconds: float = 30.0
     state: CertificationMonitorState = CertificationMonitorState.HEALTHY
     degraded_since: datetime | None = None
     state_since: datetime | None = None
@@ -165,6 +315,8 @@ class CertificationMonitorHealth:
     incident_count: int = 0
     recovered_count: int = 0
     terminalization_pending_count: int = 0
+    entry_attribution_pending_count: int = 0
+    protection_pending_count: int = 0
     terminalization_bound_exceeded_at: datetime | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
     observed_terminalization_ids: set[str] = field(default_factory=set)
@@ -254,6 +406,13 @@ class CertificationMonitorHealth:
             self.state_since = now
             if decision.state == CertificationMonitorState.TERMINALIZATION_PENDING:
                 self.terminalization_pending_count += 1
+            if (
+                decision.state
+                == CertificationMonitorState.EXACT_ENTRY_ATTRIBUTION_PENDING
+            ):
+                self.entry_attribution_pending_count += 1
+            if decision.state == CertificationMonitorState.PROTECTION_PENDING:
+                self.protection_pending_count += 1
             self.events.append({
                 "event": f"MONITOR_{decision.state.value}",
                 "occurred_at": now.isoformat(),
@@ -261,6 +420,10 @@ class CertificationMonitorHealth:
                 "error": _sanitize(error),
                 "execution_ids": [
                     item.execution_id for item in evidence.executions
+                ],
+                "execution_evidence": [
+                    _execution_evidence_summary(item)
+                    for item in evidence.executions
                 ],
             })
 
@@ -351,12 +514,17 @@ class CertificationMonitorHealth:
             "incident_count": self.incident_count,
             "recovered_count": self.recovered_count,
             "terminalization_pending_count": self.terminalization_pending_count,
+            "entry_attribution_pending_count": (
+                self.entry_attribution_pending_count
+            ),
+            "protection_pending_count": self.protection_pending_count,
             "terminalization_bound_exceeded_at": (
                 self.terminalization_bound_exceeded_at.isoformat()
                 if self.terminalization_bound_exceeded_at else None
             ),
             "hard_timeout_seconds": self.hard_timeout_seconds,
             "terminalization_timeout_seconds": self.terminalization_timeout_seconds,
+            "protection_timeout_seconds": self.protection_timeout_seconds,
         }
 
     def _record_fail_fast(
@@ -399,3 +567,41 @@ def _aware(value: datetime) -> datetime:
 def _sanitize(value: str) -> str:
     text = str(value).replace("\r", " ").replace("\n", " ")
     return text[:240]
+
+
+def _execution_evidence_summary(
+    item: ExecutionFallbackEvidence,
+) -> dict[str, Any]:
+    return {
+        "execution_id": item.execution_id,
+        "symbol": item.symbol,
+        "durable_state": item.durable_state,
+        "protection_state": (
+            item.protection_state.value if item.protection_state else None
+        ),
+        "entry_owned": item.entry_owned,
+        "fill_at": item.fill_at,
+        "protection_started_at": item.protection_started_at,
+        "protection_requested_at": item.protection_requested_at,
+        "protection_rest_confirmed_at": item.protection_rest_confirmed_at,
+        "elapsed_ms": item.protection_elapsed_ms,
+        "remaining_deadline_ms": item.protection_remaining_deadline_ms,
+        "authoritative_position_size": item.authoritative_position_size,
+        "take_profit": item.authoritative_take_profit,
+        "stop_loss": item.authoritative_stop_loss,
+        "protection_order_ids": list(item.protection_order_ids),
+        "entry_attribution_source": item.entry_attribution_source,
+        "entry_attribution_lookup_attempts": (
+            item.entry_attribution_lookup_attempts
+        ),
+        "realtime_order_id": item.realtime_order_id,
+        "realtime_order_link_id": item.realtime_order_link_id,
+        "realtime_order_status": item.realtime_order_status,
+        "realtime_order_quantity": item.realtime_order_quantity,
+        "realtime_cumulative_quantity": item.realtime_cumulative_quantity,
+        "realtime_order_created_at": item.realtime_order_created_at,
+        "realtime_order_updated_at": item.realtime_order_updated_at,
+        "realtime_identity_match": item.realtime_identity_match,
+        "first_exact_attribution_at": item.first_exact_attribution_at,
+        "fill_history_observed_at": item.fill_history_observed_at,
+    }

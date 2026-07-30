@@ -168,6 +168,68 @@ def test_read_only_client_has_no_exchange_mutation_methods() -> None:
         assert not hasattr(client, method)
 
 
+def test_exact_realtime_order_lookup_uses_order_id_and_symbol() -> None:
+    calls = []
+
+    def fake_get(url, params, headers, timeout):
+        del headers, timeout
+        calls.append((url, dict(params)))
+        return {"retCode": 0, "result": {"list": [{
+            "orderId": "entry-id",
+            "orderLinkId": "entry-link",
+        }]}}
+
+    client = ReadOnlyBybitDemoClient("key", "secret", http_get=fake_get)
+    rows = client.get_realtime_order(
+        Symbol.BTCUSDT,
+        order_id="entry-id",
+        order_link_id="entry-link",
+    )
+    assert rows[0]["orderId"] == "entry-id"
+    assert calls == [(
+        f"{DEMO_READ_ONLY_REST_URL}/v5/order/realtime",
+        {
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "orderId": "entry-id",
+        },
+    )]
+
+
+def test_exact_realtime_order_lookup_uses_link_when_order_id_missing() -> None:
+    calls = []
+
+    def fake_get(url, params, headers, timeout):
+        del url, headers, timeout
+        calls.append(dict(params))
+        return {"retCode": 0, "result": {"list": []}}
+
+    client = ReadOnlyBybitDemoClient("key", "secret", http_get=fake_get)
+    assert client.get_realtime_order(
+        Symbol.BTCUSDT, order_link_id="entry-link"
+    ) == []
+    assert calls == [{
+        "category": "linear",
+        "symbol": "BTCUSDT",
+        "orderLinkId": "entry-link",
+    }]
+
+
+def test_exact_realtime_order_lookup_forbids_symbol_only() -> None:
+    client = ReadOnlyBybitDemoClient(
+        "key",
+        "secret",
+        http_get=lambda *args: {
+            "retCode": 0,
+            "result": {"list": []},
+        },
+    )
+    with pytest.raises(
+        Exception, match="requires orderId or orderLinkId"
+    ):
+        client.get_realtime_order(Symbol.BTCUSDT)
+
+
 def test_read_only_client_syncs_clock_after_timestamp_rejection(
     monkeypatch,
 ) -> None:

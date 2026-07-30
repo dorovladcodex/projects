@@ -558,6 +558,7 @@ def wait_for_market_feature_readiness(
     freshness_seconds: int,
     max_new_entries_per_5_minutes: int = 5,
     max_trades_per_day: int = 100,
+    required_count: int = 2,
 ) -> dict[str, Any]:
     ordered = select_canary_symbols(accepted_symbols, requested_symbols)
     repository = PersistenceRepository(
@@ -602,14 +603,15 @@ def wait_for_market_feature_readiness(
                         max_new_entries_per_5_minutes
                     ),
                     max_trades_per_day=max_trades_per_day,
+                    required_slots=required_count,
                 )
                 evaluation["portfolio_eligible"] = not portfolio_reasons
                 evaluation["portfolio_reasons"] = portfolio_reasons
                 attempted[symbol] = evaluation
                 if evaluation["ready"] and not portfolio_reasons:
                     ready.append(symbol)
-            if len(ready) >= 2:
-                selected = ready[:2]
+            if len(ready) >= required_count:
+                selected = ready[:required_count]
                 elapsed_ms = round((time.monotonic() - started) * 1000)
                 return {
                     "state": "PASS",
@@ -636,7 +638,8 @@ def wait_for_market_feature_readiness(
     }
     raise ControllerFailure(
         "CANARY_MARKET_FEATURE_READY",
-        "two fresh production feature snapshots were not available within "
+        f"{required_count} fresh production feature snapshot(s) "
+        "were not available within "
         f"{timeout_seconds} seconds: {json.dumps(compact, sort_keys=True)}",
     )
 

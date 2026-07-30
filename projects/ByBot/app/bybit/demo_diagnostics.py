@@ -126,6 +126,35 @@ class ReadOnlyBybitDemoClient:
             "orderId",
         )
 
+    def get_realtime_order(
+        self,
+        symbol: Symbol,
+        *,
+        order_id: str | None = None,
+        order_link_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read one exact entry identity from Bybit's realtime order cache."""
+        exact_order_id = str(order_id or "").strip()
+        exact_link_id = str(order_link_id or "").strip()
+        if not exact_order_id and not exact_link_id:
+            raise DemoDiagnosticsError(
+                "exact realtime order lookup requires orderId or orderLinkId"
+            )
+        params = {
+            "category": "linear",
+            "symbol": symbol.value,
+        }
+        if exact_order_id:
+            params["orderId"] = exact_order_id
+        else:
+            params["orderLinkId"] = exact_link_id
+        payload = self._get("/v5/order/realtime", params)
+        result = payload.get("result") or {}
+        return [
+            item for item in (result.get("list") or [])
+            if isinstance(item, dict)
+        ]
+
     def get_positions(self, symbol: Symbol) -> list[dict[str, Any]]:
         return self._paginate(
             "/v5/position/list",

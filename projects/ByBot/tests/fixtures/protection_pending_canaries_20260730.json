@@ -1,0 +1,38 @@
+[
+  {
+    "run_id": "demo-v2-protection-pending-20260730T102440513968Z",
+    "execution_id": "07e8b5ae-cd51-4e46-8070-e9924d760d49",
+    "symbol": "BTCUSDT",
+    "side": "BUY",
+    "order_id": "bc7c744f-aab6-4ab0-8172-53920240fe73",
+    "order_link_id": "bybot-8d1ff7-e-bcc6291ee6fc97266a55",
+    "quantity": "0.002",
+    "fill_at": "2026-07-30T10:25:52.386000+00:00",
+    "protection_confirmed_at": "2026-07-30T10:25:59.608232+00:00",
+    "protection_latency_ms": 7222.232
+  },
+  {
+    "run_id": "demo-v2-protection-pending-20260730T102940947151Z",
+    "execution_id": "5b5773e1-bfb8-452f-823d-1b9e1e30a534",
+    "symbol": "XRPUSDT",
+    "side": "BUY",
+    "order_id": "96af3e84-0d6e-4e9c-8107-adc5f2747d75",
+    "order_link_id": "bybot-3e149e-e-9c1e6a9516918eb1fad0",
+    "quantity": "92.6",
+    "fill_at": "2026-07-30T10:30:50.210000+00:00",
+    "protection_confirmed_at": "2026-07-30T10:31:06.981031+00:00",
+    "protection_latency_ms": 16771.031
+  },
+  {
+    "run_id": "demo-v2-protection-pending-20260730T103402346547Z",
+    "execution_id": "9df754aa-85ca-4b26-bab4-0036527de4f0",
+    "symbol": "BTCUSDT",
+    "side": "BUY",
+    "order_id": "fbe7d6dc-0761-4fe3-860d-959c506a4c99",
+    "order_link_id": "bybot-abbe92-e-7ba14b74b4b199b8f80d",
+    "quantity": "0.002",
+    "fill_at": "2026-07-30T10:35:12.880000+00:00",
+    "protection_confirmed_at": "2026-07-30T10:35:26.899480+00:00",
+    "protection_latency_ms": 14019.48
+  }
+]
