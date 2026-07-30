@@ -1,0 +1,23 @@
+{
+  "run_id": "demo-v2-20260730T121727561Z",
+  "cycle_id": "demo-v2-20260730T121727561Z:311",
+  "incident_at": "2026-07-30T15:52:53.916988Z",
+  "execution_id": "43b5b657-a95d-4571-8a94-237f5f5382ff",
+  "symbol": "ADAUSDT",
+  "strategy": "OIFundingSqueezeStrategy",
+  "side": "SELL",
+  "quantity": "580",
+  "entry_order_id": "b5b7a205-8a25-4f1e-ba1b-9e961daf23b6",
+  "take_profit_order_id": "ba32bd3c-4be5-485e-825c-ec2579010e90",
+  "stop_loss_order_id": "9fb4fa0c-1cd3-4766-ae09-9451b428e990",
+  "take_profit": "0.1712",
+  "stop_loss": "0.1733",
+  "last_known_feature_snapshot_at": "2026-07-30T15:52:28.327950Z",
+  "last_known_trade_timestamp": "2026-07-30T15:52:24.797000Z",
+  "calculated_age_at_incident_seconds": 29.119988,
+  "freshness_limit_seconds": 15,
+  "existing_protection_rest_confirmed": true,
+  "exchange_mutation_attempted": false,
+  "expected_state": "PROTECTION_UPDATE_DEFERRED_STALE_PRICE",
+  "expected_cycle_failure": false
+}

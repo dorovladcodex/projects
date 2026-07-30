@@ -32,6 +32,7 @@ from app.models import (
     NewsClassification,
     NewsSignalAction,
     NewsSignalCandidate,
+    ProtectionDataState,
     Side,
     SignalRiskPreview,
     Symbol,
@@ -3208,6 +3209,71 @@ class DemoExecutionService:
             )
             return outcome.record
 
+    def request_canary_stale_management_update(
+        self, execution_id: str
+    ) -> DemoExecutionRecord | None:
+        """Exercise the production stale-management no-mutation path."""
+        if not self.enabled or self.client is None or not self.settings.demo_canary_enabled:
+            return None
+        require_demo_execution(self.settings)
+        record = next(
+            (
+                item
+                for item in self.repository.load_demo_executions()
+                if str(item.id) == execution_id and item.run_id == self.run_id
+            ),
+            None,
+        )
+        if record is None:
+            return None
+        with self._execution_lock(record.id):
+            record = next(
+                (
+                    item
+                    for item in self.repository.load_demo_executions()
+                    if str(item.id) == execution_id
+                    and item.run_id == self.run_id
+                ),
+                record,
+            )
+            if (
+                record.state != DemoExecutionState.DEMO_POSITION_OPEN
+                or not record.protection_confirmed
+            ):
+                raise DemoSafetyError(
+                    "stale-management canary requires an open protected execution"
+                )
+            rules = self.client.get_instrument(record.symbol)
+            position = _owned_position(
+                self.client.get_positions(symbol=record.symbol), record
+            )
+            if position is None:
+                raise DemoSafetyError(
+                    "stale-management canary position ownership is unavailable"
+                )
+            mark_price = _decimal(position.get("markPrice"), default="0")
+            current_tp = _decimal(position.get("takeProfit"), default="0")
+            current_sl = _decimal(position.get("stopLoss"), default="0")
+            if mark_price <= 0 or current_tp <= 0 or current_sl <= 0:
+                raise DemoSafetyError(
+                    "stale-management canary protection or mark price is unavailable"
+                )
+            observed_at = datetime.now(timezone.utc)
+            outcome = self._update_and_verify_protection(
+                record,
+                rules=rules,
+                take_profit=current_tp,
+                stop_loss=current_sl,
+                verified_at=observed_at,
+                market_price=mark_price,
+                market_price_at=observed_at
+                - timedelta(seconds=self.settings.v2_market_stale_seconds + 1),
+                market_price_received_at=observed_at,
+                market_price_source="v2_feature_ticker_last_price",
+                requested_update_type="trailing",
+            )
+            return outcome.record
+
     def request_canary_flat_during_protection_race(
         self, execution_id: str
     ) -> DemoExecutionRecord | None:
@@ -3293,6 +3359,7 @@ class DemoExecutionService:
         last_price: Decimal,
         *,
         market_price_at: datetime | None = None,
+        market_price_received_at: datetime | None = None,
         market_price_source: str = "rolling_feature_last_price",
         data_fresh: bool = True,
         setup_valid: bool = True,
@@ -3320,6 +3387,7 @@ class DemoExecutionService:
                 record,
                 last_price,
                 market_price_at=market_price_at,
+                market_price_received_at=market_price_received_at,
                 market_price_source=market_price_source,
                 data_fresh=data_fresh,
                 setup_valid=setup_valid,
@@ -3335,6 +3403,7 @@ class DemoExecutionService:
         last_price: Decimal,
         *,
         market_price_at: datetime | None,
+        market_price_received_at: datetime | None,
         market_price_source: str,
         data_fresh: bool,
         setup_valid: bool,
@@ -3348,10 +3417,78 @@ class DemoExecutionService:
             return record
         if record.average_fill_price is None or record.accepted_quantity <= 0:
             return record
+        timestamp_required = bool(
+            market_price_at is not None
+            or market_price_received_at is not None
+            or market_price_source.startswith("v2_")
+        )
+        market_price_age_seconds: float | None = None
+        if market_price_at is not None:
+            try:
+                market_price_age_seconds = (
+                    current - _aware(market_price_at)
+                ).total_seconds()
+            except (AttributeError, TypeError, ValueError) as exc:
+                self._persist_protection_data_state(
+                    record,
+                    state=ProtectionDataState.PROTECTION_DATA_CONFLICT,
+                    event_type="PROTECTION_DATA_CONFLICT",
+                    observed_at=current,
+                    evidence={
+                        "defer_reason": "malformed management price timestamp",
+                        "market_price_source": market_price_source,
+                        "market_price_at": str(market_price_at),
+                        "cycle_failure_emitted": True,
+                    },
+                )
+                raise DemoSafetyError(
+                    "protection management price timestamp is malformed"
+                ) from exc
+            if market_price_age_seconds < -0.01:
+                self._persist_protection_data_state(
+                    record,
+                    state=ProtectionDataState.PROTECTION_DATA_CONFLICT,
+                    event_type="PROTECTION_DATA_CLOCK_INCONSISTENCY",
+                    observed_at=current,
+                    evidence={
+                        "defer_reason": "management price timestamp is in the future",
+                        "market_price_source": market_price_source,
+                        "market_price_at": _aware(market_price_at).isoformat(),
+                        "market_price_age_seconds": market_price_age_seconds,
+                        "freshness_threshold_seconds": (
+                            self.settings.v2_market_stale_seconds
+                        ),
+                        "cycle_failure_emitted": True,
+                    },
+                )
+                raise DemoSafetyError(
+                    "protection management price clock inconsistency"
+                )
+        management_data_fresh = bool(
+            data_fresh
+            and (
+                not timestamp_required
+                or (
+                    market_price_age_seconds is not None
+                    and market_price_age_seconds >= -0.01
+                    and market_price_age_seconds
+                    <= self.settings.v2_market_stale_seconds
+                )
+            )
+        )
         direction = Decimal("1") if record.side == Side.BUY else Decimal("-1")
-        move = direction * (last_price / record.average_fill_price - Decimal("1"))
-        record.maximum_favorable_excursion = max(record.maximum_favorable_excursion, move)
-        record.maximum_adverse_excursion = min(record.maximum_adverse_excursion, move)
+        move = (
+            direction
+            * (last_price / record.average_fill_price - Decimal("1"))
+            if management_data_fresh else Decimal("0")
+        )
+        if management_data_fresh:
+            record.maximum_favorable_excursion = max(
+                record.maximum_favorable_excursion, move
+            )
+            record.maximum_adverse_excursion = min(
+                record.maximum_adverse_excursion, move
+            )
         close_reason: str | None = None
         opened_at = (
             record.first_fill_at
@@ -3363,15 +3500,25 @@ class DemoExecutionService:
             current - _aware(opened_at)
         ).total_seconds() >= record.maximum_holding_seconds:
             close_reason = "maximum_holding_time"
-        elif not data_fresh:
+        elif not management_data_fresh:
             threshold = stale_exit_threshold_seconds or float(
                 self.settings.v2_position_data_stale_exit_seconds
+            )
+            effective_stale_age = max(
+                (
+                    value
+                    for value in (stale_age_seconds,)
+                    if value is not None
+                ),
+                default=None,
             )
             first_observation = record.position_data_stale_since is None
             if first_observation:
                 record.position_data_stale_since = current
-            record.position_data_stale_feature = stale_feature or "mandatory_market_data"
-            record.position_data_stale_age_seconds = stale_age_seconds
+            record.position_data_stale_feature = (
+                stale_feature or "protection_management_price"
+            )
+            record.position_data_stale_age_seconds = effective_stale_age
             record.position_data_stale_threshold_seconds = threshold
             record.position_data_stale_protection_confirmed = record.protection_confirmed
             stale_duration = (
@@ -3385,7 +3532,10 @@ class DemoExecutionService:
             if (
                 not record.protection_confirmed
                 or stale_duration >= threshold
-                or (stale_age_seconds is not None and stale_age_seconds >= threshold)
+                or (
+                    effective_stale_age is not None
+                    and effective_stale_age >= threshold
+                )
             ):
                 close_reason = "stale_signal"
         elif record.position_data_stale_since is not None:
@@ -3396,9 +3546,76 @@ class DemoExecutionService:
             )
         elif not setup_valid:
             close_reason = "invalidated_setup"
+        if (
+            not management_data_fresh
+            and not record.protection_confirmed
+            and self.client is not None
+        ):
+            return self._defer_stale_management_update(
+                record,
+                observed_at=current,
+                market_price_source=market_price_source,
+                market_price_at=market_price_at,
+                market_price_received_at=market_price_received_at,
+                market_price_age_seconds=market_price_age_seconds,
+                requested_update_type="protection_safety_check",
+                defer_reason=(
+                    stale_feature
+                    or "open position has no confirmed protection"
+                ),
+            )
         if close_reason:
             self._submit_reduce_only_close(record, record.accepted_quantity, close_reason)
             return record
+        management_update_due = bool(
+            self.client is not None
+            and record.trailing_stop_pct is not None
+            and record.take_profit is not None
+            and record.stop_loss is not None
+            and (
+                record.trailing_stop_updated_at is None
+                or (
+                    current - _aware(record.trailing_stop_updated_at)
+                ).total_seconds()
+                >= self.settings.v2_trailing_update_interval_seconds
+            )
+        )
+        if management_update_due and not management_data_fresh:
+            return self._defer_stale_management_update(
+                record,
+                observed_at=current,
+                market_price_source=market_price_source,
+                market_price_at=market_price_at,
+                market_price_received_at=market_price_received_at,
+                market_price_age_seconds=market_price_age_seconds,
+                requested_update_type="trailing",
+                defer_reason=(
+                    stale_feature
+                    or "protection management price is stale or unavailable"
+                ),
+            )
+        if (
+            management_data_fresh
+            and record.protection_data_state
+            == ProtectionDataState.PROTECTION_UPDATE_DEFERRED_STALE_PRICE
+        ):
+            self._persist_protection_data_state(
+                record,
+                state=ProtectionDataState.PROTECTION_DATA_FRESH,
+                event_type="PROTECTION_DATA_FRESH_RECOVERED",
+                observed_at=current,
+                evidence={
+                    **record.protection_data_evidence,
+                    "fresh_data_recovered_at": current.isoformat(),
+                    "market_price_source": market_price_source,
+                    "market_price_at": (
+                        _aware(market_price_at).isoformat()
+                        if market_price_at is not None else None
+                    ),
+                    "market_price_age_seconds": market_price_age_seconds,
+                    "management_action_skipped": False,
+                },
+            )
         if (
             self.client is not None
             and record.trailing_stop_pct is not None
@@ -3406,7 +3623,7 @@ class DemoExecutionService:
             and record.stop_loss is not None
             and record.protection_confirmed
             and move > Decimal("0")
-            and data_fresh
+            and management_data_fresh
             and (
                 record.trailing_stop_updated_at is None
                 or (current - _aware(record.trailing_stop_updated_at)).total_seconds()
@@ -3476,12 +3693,224 @@ class DemoExecutionService:
                         market_price=last_price,
                         market_price_source=market_price_source,
                         market_price_at=market_price_at,
+                        market_price_received_at=market_price_received_at,
+                        requested_update_type="trailing",
                     )
                     record = outcome.record
                     if outcome.terminalizing:
                         return record
         record.updated_at = current
         self.repository.save_demo_execution(record, event_type="V2_POSITION_METRICS_UPDATED")
+        return record
+
+    def _persist_protection_data_state(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        state: ProtectionDataState,
+        event_type: str,
+        observed_at: datetime,
+        evidence: dict[str, Any],
+    ) -> None:
+        previous = record.protection_data_state
+        record.protection_data_state = state
+        record.protection_data_evidence = dict(evidence)
+        if state in {
+            ProtectionDataState.PROTECTION_UPDATE_DEFERRED_STALE_PRICE,
+            ProtectionDataState.PROTECTION_PENDING_FRESHNESS_WAIT,
+        }:
+            record.protection_data_deferred_at = (
+                record.protection_data_deferred_at or observed_at
+            )
+        elif state == ProtectionDataState.PROTECTION_DATA_FRESH:
+            record.protection_fresh_data_recovered_at = observed_at
+        record.updated_at = observed_at
+        persisted_event = (
+            event_type
+            if previous != state
+            else "V2_PROTECTION_DATA_STATE_OBSERVED"
+        )
+        if self.repository.save_demo_execution(
+            record, event_type=persisted_event
+        ) is False:
+            raise DemoSafetyError("protection data state persistence failed")
+
+    def _defer_stale_management_update(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        observed_at: datetime,
+        market_price_source: str,
+        market_price_at: datetime | None,
+        market_price_received_at: datetime | None,
+        market_price_age_seconds: float | None,
+        requested_update_type: str,
+        defer_reason: str,
+        position: dict[str, Any] | None = None,
+        rules: InstrumentRules | None = None,
+        requested: dict[str, Any] | None = None,
+        normalized: dict[str, Any] | None = None,
+    ) -> DemoExecutionRecord:
+        if self.client is None:
+            raise DemoSafetyError("Demo exchange client is unavailable")
+        current_rules = rules or self.client.get_instrument(record.symbol)
+        authoritative = position or _owned_position(
+            self.client.get_positions(record.symbol), record
+        )
+        if authoritative is None:
+            self._persist_protection_data_state(
+                record,
+                state=ProtectionDataState.PROTECTION_DATA_CONFLICT,
+                event_type="PROTECTION_DATA_CONFLICT",
+                observed_at=observed_at,
+                evidence={
+                    "defer_reason": "exact owned position unavailable",
+                    "requested_update_type": requested_update_type,
+                    "cycle_failure_emitted": True,
+                },
+            )
+            raise DemoSafetyError(
+                "stale protection update ownership could not be confirmed"
+            )
+        self._validate_protection_position_identity(
+            record, rules=current_rules, position=authoritative
+        )
+        remote_matches = bool(
+            record.take_profit is not None
+            and record.stop_loss is not None
+            and _normalized_protection_matches(
+                authoritative,
+                record.take_profit,
+                record.stop_loss,
+                current_rules,
+                record.side,
+            )
+        )
+        existing_matches = bool(record.protection_confirmed and remote_matches)
+        if (
+            record.state == DemoExecutionState.DEMO_PROTECTION_PENDING
+            and remote_matches
+        ):
+            record.protection_confirmed = True
+            record.protection_data_state = ProtectionDataState.PROTECTION_DATA_FRESH
+            record.protection_fresh_data_recovered_at = observed_at
+            record.updated_at = observed_at
+            if self.repository.save_demo_execution(
+                record,
+                event_type="PROTECTION_CONFIRMED_DURING_FRESHNESS_WAIT",
+            ) is False:
+                raise DemoSafetyError("protection data state persistence failed")
+            return record
+        evidence = {
+            "protection_data_state": (
+                ProtectionDataState.PROTECTED_WITH_STALE_MANAGEMENT_DATA.value
+                if existing_matches
+                else ProtectionDataState.UNPROTECTED_CONFIRMED.value
+            ),
+            "execution_id": str(record.id),
+            "symbol": record.symbol.value,
+            "existing_take_profit": str(record.take_profit or ""),
+            "existing_stop_loss": str(record.stop_loss or ""),
+            "tp_order_id": record.tp_order_id,
+            "sl_order_id": record.sl_order_id,
+            "protection_confirmed": record.protection_confirmed,
+            "requested_update_type": requested_update_type,
+            "requested": dict(requested or {}),
+            "normalized_requested": dict(normalized or {}),
+            "required_data_source": market_price_source,
+            "market_price_source": market_price_source,
+            "market_price_at": (
+                _aware(market_price_at).isoformat()
+                if market_price_at is not None else None
+            ),
+            "market_price_received_at": (
+                _aware(market_price_received_at).isoformat()
+                if market_price_received_at is not None else None
+            ),
+            "market_price_age_seconds": market_price_age_seconds,
+            "freshness_threshold_seconds": self.settings.v2_market_stale_seconds,
+            "refresh_attempts": int(
+                record.protection_data_evidence.get("refresh_attempts") or 0
+            )
+            + 1,
+            "defer_reason": defer_reason,
+            "deferred_at": (
+                record.protection_data_deferred_at or observed_at
+            ).isoformat(),
+            "management_action_skipped": True,
+            "exchange_mutation_attempted": False,
+            "existing_exchange_protection_remained_valid": existing_matches,
+            "authoritative_source": "REST",
+            "cycle_failure_emitted": False if existing_matches else True,
+        }
+        if not existing_matches:
+            if record.state == DemoExecutionState.DEMO_PROTECTION_PENDING:
+                started = record.protection_data_deferred_at or observed_at
+                elapsed = (observed_at - _aware(started)).total_seconds()
+                bounded_seconds = max(
+                    0.001,
+                    (
+                        self.settings.v2_protection_verification_attempts
+                        * max(
+                            1,
+                            self.settings.v2_protection_verification_delay_ms,
+                        )
+                    )
+                    / 1000,
+                )
+                if elapsed < bounded_seconds:
+                    evidence["protection_data_state"] = (
+                        ProtectionDataState.PROTECTION_PENDING_FRESHNESS_WAIT.value
+                    )
+                    evidence["bounded_deadline_seconds"] = bounded_seconds
+                    evidence["bounded_elapsed_seconds"] = elapsed
+                    self._persist_protection_data_state(
+                        record,
+                        state=ProtectionDataState.PROTECTION_PENDING_FRESHNESS_WAIT,
+                        event_type="PROTECTION_PENDING_FRESHNESS_WAIT",
+                        observed_at=observed_at,
+                        evidence=evidence,
+                    )
+                    return record
+            self._persist_protection_data_state(
+                record,
+                state=ProtectionDataState.UNPROTECTED_CONFIRMED,
+                event_type="UNPROTECTED_CONFIRMED",
+                observed_at=observed_at,
+                evidence=evidence,
+            )
+            raise DemoSafetyError(
+                "stale management data cannot defer an unprotected position"
+            )
+        self._persist_protection_data_state(
+            record,
+            state=ProtectionDataState.PROTECTION_UPDATE_DEFERRED_STALE_PRICE,
+            event_type="PROTECTION_UPDATE_DEFERRED_STALE_PRICE",
+            observed_at=observed_at,
+            evidence=evidence,
+        )
+        self._persist_protection_verification(
+            record,
+            requested=dict(requested or {
+                "take_profit": str(record.take_profit),
+                "stop_loss": None,
+                "active_price": None,
+            }),
+            normalized=dict(normalized or {
+                "take_profit": str(record.take_profit),
+                "stop_loss": None,
+                "tick_size": str(current_rules.tick_size),
+            }),
+            position=authoritative,
+            attempt=0,
+            mutation_response=None,
+            result="PROTECTION_UPDATE_DEFERRED_STALE_PRICE",
+            classification="PROTECTED_WITH_STALE_MANAGEMENT_DATA",
+            blocker=defer_reason,
+            cycle_failure_emitted=False,
+            observed_at=observed_at,
+            decision_context=evidence,
+        )
         return record
 
     def _update_and_verify_protection(
@@ -3495,6 +3924,8 @@ class DemoExecutionService:
         market_price: Decimal | None = None,
         market_price_source: str = "authoritative_position_mark",
         market_price_at: datetime | None = None,
+        market_price_received_at: datetime | None = None,
+        requested_update_type: str = "trailing",
         before_mutation_hook: Callable[[DemoExecutionRecord], None] | None = None,
     ) -> ProtectionVerificationOutcome:
         """Mutate once, then verify from bounded authoritative REST snapshots."""
@@ -3507,13 +3938,27 @@ class DemoExecutionService:
         round_up = record.side == Side.SELL
         normalized_tp = normalize_price(take_profit, rules, round_up=round_up)
         normalized_sl = normalize_price(stop_loss, rules, round_up=round_up)
-        market_age_seconds = (
-            max(
-                0.0,
-                (verified_at - _aware(market_price_at)).total_seconds(),
+        try:
+            market_age_seconds = (
+                (verified_at - _aware(market_price_at)).total_seconds()
+                if market_price_at is not None else None
             )
-            if market_price_at is not None else None
-        )
+        except (AttributeError, TypeError, ValueError) as exc:
+            self._persist_protection_data_state(
+                record,
+                state=ProtectionDataState.PROTECTION_DATA_CONFLICT,
+                event_type="PROTECTION_DATA_CONFLICT",
+                observed_at=verified_at,
+                evidence={
+                    "defer_reason": "malformed management price timestamp",
+                    "market_price_source": market_price_source,
+                    "market_price_at": str(market_price_at),
+                    "cycle_failure_emitted": True,
+                },
+            )
+            raise DemoSafetyError(
+                "protection management price timestamp is malformed"
+            ) from exc
         requested = {
             "take_profit": str(take_profit),
             "stop_loss": str(stop_loss),
@@ -3551,7 +3996,13 @@ class DemoExecutionService:
                 _aware(market_price_at).isoformat()
                 if market_price_at is not None else None
             ),
+            "market_price_received_at": (
+                _aware(market_price_received_at).isoformat()
+                if market_price_received_at is not None else None
+            ),
             "market_price_age_seconds": market_age_seconds,
+            "freshness_threshold_seconds": self.settings.v2_market_stale_seconds,
+            "requested_update_type": requested_update_type,
             "lock_owner": get_ident(),
             "concurrent_symbol_processing": False,
             "request_payload": {
@@ -3600,6 +4051,81 @@ class DemoExecutionService:
             raise DemoSafetyError(
                 "protection update ownership could not be confirmed before mutation"
             )
+        self._validate_protection_position_identity(
+            record, rules=rules, position=owned_before
+        )
+        if market_age_seconds is not None and market_age_seconds < -0.01:
+            self._persist_protection_data_state(
+                record,
+                state=ProtectionDataState.PROTECTION_DATA_CONFLICT,
+                event_type="PROTECTION_DATA_CLOCK_INCONSISTENCY",
+                observed_at=verified_at,
+                evidence={
+                    **decision_context,
+                    "defer_reason": "management price timestamp is in the future",
+                    "cycle_failure_emitted": True,
+                },
+            )
+            raise DemoSafetyError(
+                "protection management price clock inconsistency"
+            )
+        timestamp_required = bool(
+            market_price_source.startswith("v2_")
+            or market_price_received_at is not None
+        )
+        if market_price is not None and (
+            (timestamp_required and market_price_at is None)
+            or (
+                market_age_seconds is not None
+                and market_age_seconds > self.settings.v2_market_stale_seconds
+            )
+        ):
+            deferred = self._defer_stale_management_update(
+                record,
+                observed_at=verified_at,
+                market_price_source=market_price_source,
+                market_price_at=market_price_at,
+                market_price_received_at=market_price_received_at,
+                market_price_age_seconds=market_age_seconds,
+                requested_update_type=requested_update_type,
+                defer_reason=(
+                    "protection management price is unavailable"
+                    if market_price_at is None
+                    else "protection management price exceeds freshness limit"
+                ),
+                position=owned_before,
+                rules=rules,
+                requested=requested,
+                normalized=normalized,
+            )
+            return ProtectionVerificationOutcome(
+                deferred,
+                deferred.protection_confirmed,
+                False,
+                0,
+                deferred.protection_data_state.value,
+            )
+        if (
+            record.protection_data_state
+            == ProtectionDataState.PROTECTION_UPDATE_DEFERRED_STALE_PRICE
+        ):
+            self._persist_protection_data_state(
+                record,
+                state=ProtectionDataState.PROTECTION_DATA_FRESH,
+                event_type="PROTECTION_DATA_FRESH_RECOVERED",
+                observed_at=verified_at,
+                evidence={
+                    **record.protection_data_evidence,
+                    "fresh_data_recovered_at": verified_at.isoformat(),
+                    "market_price_source": market_price_source,
+                    "market_price_at": (
+                        _aware(market_price_at).isoformat()
+                        if market_price_at is not None else None
+                    ),
+                    "market_price_age_seconds": market_age_seconds,
+                    "management_action_skipped": False,
+                },
+            )
         self._validate_protection_update_context(
             record,
             rules=rules,
@@ -3647,6 +4173,18 @@ class DemoExecutionService:
                 decision_context=decision_context,
             )
             record.stop_loss = normalized_sl
+            record.protection_data_state = ProtectionDataState.PROTECTION_DATA_FRESH
+            record.protection_update_applied_at = verified_at
+            record.protection_data_evidence = {
+                **record.protection_data_evidence,
+                "update_applied_at": verified_at.isoformat(),
+                "requested_update_type": requested_update_type,
+                "update_result": "ALREADY_VERIFIED",
+                "management_action_skipped": False,
+            }
+            self.repository.save_demo_execution(
+                record, event_type="PROTECTION_MANAGEMENT_UPDATE_CONFIRMED"
+            )
             return ProtectionVerificationOutcome(record, True, False, 0)
 
         if self._protection_update_crossed_market(
@@ -3733,6 +4271,17 @@ class DemoExecutionService:
                     record.stop_loss = normalized_sl
                     record.trailing_stop_updated_at = verified_at
                     record.trailing_stop_update_count += 1
+                    record.protection_data_state = (
+                        ProtectionDataState.PROTECTION_DATA_FRESH
+                    )
+                    record.protection_update_applied_at = verified_at
+                    record.protection_data_evidence = {
+                        **record.protection_data_evidence,
+                        "update_applied_at": verified_at.isoformat(),
+                        "requested_update_type": requested_update_type,
+                        "update_result": "VERIFIED",
+                        "management_action_skipped": False,
+                    }
                     record.updated_at = verified_at
                     self.repository.save_demo_execution(
                         record, event_type="V2_TRAILING_STOP_UPDATED"
@@ -3799,35 +4348,9 @@ class DemoExecutionService:
     ) -> None:
         """Fail closed on ownership, metadata, unit, or stale-input defects."""
 
-        if str(position.get("symbol") or "") != record.symbol.value:
-            raise DemoSafetyError(
-                "protection market-data symbol differs from durable execution"
-            )
-        if int(position.get("positionIdx") or 0) != int(
-            record.protection_position_idx or 0
-        ):
-            raise DemoSafetyError(
-                "protection positionIdx differs from durable execution"
-            )
-        if str(position.get("side") or "").upper() != record.side.value:
-            raise DemoSafetyError(
-                "protection position side differs from durable execution"
-            )
-        if _decimal(position.get("size"), default="0") != record.accepted_quantity:
-            raise DemoSafetyError(
-                "protection position quantity differs from durable execution"
-            )
-        if rules.symbol != record.symbol:
-            raise DemoSafetyError(
-                "protection tick metadata belongs to another symbol"
-            )
-        if (
-            market_price_age_seconds is not None
-            and market_price_age_seconds > self.settings.v2_market_stale_seconds
-        ):
-            raise DemoSafetyError(
-                "protection price timestamp exceeds the existing freshness limit"
-            )
+        self._validate_protection_position_identity(
+            record, rules=rules, position=position
+        )
         if record.stop_loss is not None:
             weakens = (
                 normalized_stop_loss < record.stop_loss
@@ -3864,6 +4387,36 @@ class DemoExecutionService:
             )
         if market_price is not None and market_price <= 0:
             raise DemoSafetyError("protection market price is invalid")
+
+    @staticmethod
+    def _validate_protection_position_identity(
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        position: dict[str, Any],
+    ) -> None:
+        if str(position.get("symbol") or "") != record.symbol.value:
+            raise DemoSafetyError(
+                "protection market-data symbol differs from durable execution"
+            )
+        if int(position.get("positionIdx") or 0) != int(
+            record.protection_position_idx or 0
+        ):
+            raise DemoSafetyError(
+                "protection positionIdx differs from durable execution"
+            )
+        if str(position.get("side") or "").upper() != record.side.value:
+            raise DemoSafetyError(
+                "protection position side differs from durable execution"
+            )
+        if _decimal(position.get("size"), default="0") != record.accepted_quantity:
+            raise DemoSafetyError(
+                "protection position quantity differs from durable execution"
+            )
+        if rules.symbol != record.symbol:
+            raise DemoSafetyError(
+                "protection tick metadata belongs to another symbol"
+            )
 
     @staticmethod
     def _protection_update_crossed_market(
@@ -4219,6 +4772,70 @@ class DemoExecutionService:
             record, event_type="V2_PROTECTION_VERIFICATION_ATTEMPT"
         )
 
+    def protection_data_metrics(
+        self, records: list[DemoExecutionRecord] | None = None
+    ) -> dict[str, Any]:
+        scoped = [
+            record
+            for record in (
+                records
+                if records is not None
+                else self.repository.load_demo_executions()
+            )
+            if record.run_id == self.run_id
+        ]
+        deferred = [
+            observation
+            for record in scoped
+            for observation in record.protection_verification_history
+            if observation.get("result")
+            == "PROTECTION_UPDATE_DEFERRED_STALE_PRICE"
+        ]
+        by_update_type: dict[str, int] = {}
+        for observation in deferred:
+            update_type = str(
+                (observation.get("protection_decision") or {}).get(
+                    "requested_update_type"
+                )
+                or "adaptive_exit"
+            )
+            by_update_type[update_type] = by_update_type.get(update_type, 0) + 1
+        hard_failure_states = {
+            ProtectionDataState.UNPROTECTED_CONFIRMED,
+            ProtectionDataState.PROTECTION_DATA_CONFLICT,
+        }
+        return {
+            "state_counts": {
+                state.value: sum(
+                    record.protection_data_state == state for record in scoped
+                )
+                for state in ProtectionDataState
+            },
+            "deferred_trailing_updates": by_update_type.get("trailing", 0),
+            "deferred_break_even_updates": by_update_type.get("break_even", 0),
+            "deferred_adaptive_exits": by_update_type.get("adaptive_exit", 0),
+            "freshness_recoveries": sum(
+                record.protection_fresh_data_recovered_at is not None
+                for record in scoped
+            ),
+            "protection_freshness_hard_failures": sum(
+                record.protection_data_state in hard_failure_states
+                for record in scoped
+            ),
+            "active_deferred_executions": [
+                {
+                    "execution_id": str(record.id),
+                    "symbol": record.symbol.value,
+                    "protection_data_state": record.protection_data_state.value,
+                    "evidence": dict(record.protection_data_evidence),
+                }
+                for record in scoped
+                if record.protection_data_state
+                == ProtectionDataState.PROTECTION_UPDATE_DEFERRED_STALE_PRICE
+                and record.state not in TERMINAL_DEMO_STATES
+            ],
+        }
+
     def as_status(self) -> dict[str, Any]:
         records = self.repository.load_demo_executions() if self.repository else []
         counts: dict[str, int] = {}
@@ -4315,6 +4932,7 @@ class DemoExecutionService:
             "protection_update_invalidations": (
                 protection_update_invalidations
             ),
+            "protection_data_metrics": self.protection_data_metrics(records),
             "bot_owned_open_orders": bot_owned_open_orders,
             "bot_owned_active_orders": bot_owned_active_orders,
             "bot_owned_pending_cancel_orders": bot_owned_pending_cancel_orders,

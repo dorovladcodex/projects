@@ -460,7 +460,9 @@ def v2_supervisor_resume() -> dict[str, object]:
 
 @app.post("/v2/canary/sizing/{symbol}/{notional_tier}")
 def v2_sizing_canary(
-    symbol: Symbol, notional_tier: int
+    symbol: Symbol,
+    notional_tier: int,
+    max_notional_usdt: Decimal | None = None,
 ) -> dict[str, object]:
     """Guarded deterministic candidate exercising production V2 sizing."""
 
@@ -540,7 +542,9 @@ def v2_sizing_canary(
         maximum_holding_seconds=1800,
     )
     result = v2_execution_coordinator.execute(
-        candidate, manual_canary=True
+        candidate,
+        manual_canary=True,
+        explicit_max_notional_usdt=max_notional_usdt,
     )
     if not result.get("execution_attempted"):
         raise HTTPException(
@@ -1531,6 +1535,39 @@ def demo_canary_trailing_update(execution_id: str) -> dict[str, object]:
     return {
         "execution": record.model_dump(mode="json"),
         "verification": record.last_protection_verification,
+        "production_verifier_used": True,
+        "live_execution_blocked": True,
+    }
+
+
+@app.post("/demo/canary/{execution_id}/stale-management-update")
+def demo_canary_stale_management_update(
+    execution_id: str,
+) -> dict[str, object]:
+    _require_demo_canary()
+    try:
+        record = (
+            demo_execution_service.request_canary_stale_management_update(
+                execution_id
+            )
+        )
+    except DemoSafetyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if record is None:
+        raise HTTPException(status_code=404, detail="Demo canary execution not found")
+    verification = record.last_protection_verification or {}
+    return {
+        "execution": record.model_dump(mode="json"),
+        "verification": verification,
+        "classification": verification.get("result"),
+        "cycle_failure_emitted": bool(
+            verification.get("cycle_failure_emitted")
+        ),
+        "exchange_mutation_attempted": bool(
+            (verification.get("protection_decision") or {}).get(
+                "exchange_mutation_attempted"
+            )
+        ),
         "production_verifier_used": True,
         "live_execution_blocked": True,
     }

@@ -37,6 +37,18 @@ from app.v2.strategies import MemeTrendContext, NewsStrategyContext, build_v2_st
 from app.v2.universe import SymbolUniverseService
 
 
+def protection_management_price_input(
+    feature: Any,
+) -> tuple[Decimal, datetime | None, datetime, str]:
+    """Return a price and exchange timestamp from the same source."""
+    return (
+        feature.last_price,
+        feature.source_timestamps.get("ticker"),
+        feature.timestamp,
+        "v2_feature_ticker_last_price",
+    )
+
+
 class V2Runtime:
     def __init__(
         self, settings: Settings, repository: Any,
@@ -1474,6 +1486,7 @@ class V2Runtime:
                 "critical_stale_data_incidents": self.features.stale_incidents,
                 "data_age_seconds_by_source": self._data_age_metrics(),
             },
+            "protection_data_metrics": self._protection_data_metrics(),
             "liquidation_metrics": self._liquidation_metrics_at(
                 datetime.now(timezone.utc)
             ),
@@ -1528,6 +1541,12 @@ class V2Runtime:
             feature = self.features.snapshot(record.symbol)
             if feature is None:
                 continue
+            (
+                management_price,
+                management_price_at,
+                management_price_received_at,
+                management_price_source,
+            ) = protection_management_price_input(feature)
             prices[record.symbol] = feature.last_price
             if not feature.fresh:
                 self.stale_metrics["position_stale_observations"] += 1
@@ -1548,13 +1567,10 @@ class V2Runtime:
                 ))
             self.execution.demo_execution.monitor_strategy_position(
                 str(record.id),
-                feature.last_price,
-                market_price_at=(
-                    feature.source_timestamps.get("trades")
-                    or feature.source_timestamps.get("ticker")
-                    or feature.timestamp
-                ),
-                market_price_source="v2_feature_last_trade",
+                management_price,
+                market_price_at=management_price_at,
+                market_price_received_at=management_price_received_at,
+                market_price_source=management_price_source,
                 data_fresh=feature.fresh,
                 stale_feature="; ".join(feature.stale_reasons) or None,
                 stale_age_seconds=max(
@@ -1786,6 +1802,7 @@ class V2Runtime:
             "stale_rejections_by_symbol": self.stale_metrics["stale_rejections_by_symbol"],
             "stale_rejections_by_strategy": self.stale_metrics["stale_rejections_by_strategy"],
             "data_age_seconds_by_source": self._data_age_metrics(),
+            "protection_data_metrics": self._protection_data_metrics(),
             "liquidation_strategy_metrics": self._liquidation_metrics_at(
                 datetime.now(timezone.utc)
             ),
@@ -1840,6 +1857,20 @@ class V2Runtime:
     def _data_age_metrics(self) -> dict[str, Any]:
         loader = getattr(self.features, "data_age_metrics", None)
         return loader() if callable(loader) else {}
+
+    def _protection_data_metrics(self) -> dict[str, Any]:
+        loader = getattr(
+            self.execution.demo_execution, "protection_data_metrics", None
+        )
+        return loader() if callable(loader) else {
+            "state_counts": {},
+            "deferred_trailing_updates": 0,
+            "deferred_break_even_updates": 0,
+            "deferred_adaptive_exits": 0,
+            "freshness_recoveries": 0,
+            "protection_freshness_hard_failures": 0,
+            "active_deferred_executions": [],
+        }
 
     def _record_signal_metric(
         self, name: str, candidate: V2SignalCandidate,

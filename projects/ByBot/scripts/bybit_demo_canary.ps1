@@ -1,10 +1,12 @@
 param(
     [switch]$AllowDemoOrders,
+    [string]$RunId = "",
     [ValidateSet("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")]
     [string]$Symbol = "BTCUSDT",
     [Nullable[decimal]]$MaxNotionalUSDT = $null,
     [decimal]$MarketPriceBufferPct = 5,
     [switch]$ExerciseTrailingUpdate,
+    [switch]$ExerciseStaleProtectionFreshness,
     [switch]$ExerciseMarketInvalidation,
     [switch]$InjectMonitorStatusTimeout,
     [switch]$ExerciseFlatDuringProtectionRace,
@@ -53,6 +55,7 @@ $script:ExecutionsAfterRestart = $null
 $script:AdmissionsBeforeRestart = $null
 $script:AdmissionsAfterRestart = $null
 $script:ProtectionInvalidation = $null
+$script:ProtectionFreshness = $null
 $script:MonitorDegradation = $null
 
 function Assert-Condition {
@@ -516,6 +519,7 @@ function Write-CanaryReport {
         no_reservation_created = $script:NoReservationCreated
         no_order_submitted = $script:NoOrderSubmitted
         protection_invalidation = $script:ProtectionInvalidation
+        protection_freshness = $script:ProtectionFreshness
         monitor_degradation = $script:MonitorDegradation
         generated_at = [DateTimeOffset]::UtcNow.ToString("o")
         execution_report = $Status
@@ -607,7 +611,14 @@ try {
     $databaseUrl = $databaseUrl -replace "@db:", "@127.0.0.1:"
     $databaseUrl = $databaseUrl -replace "@localhost:", "@127.0.0.1:"
 
-    $script:RunId = "demo-canary-" + [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    $script:RunId = if ($RunId) {
+        Assert-Condition ($RunId -match '^demo-canary-[A-Za-z0-9_-]+$') `
+            "RunId must use the demo-canary-* safe identifier format"
+        $RunId
+    }
+    else {
+        "demo-canary-" + [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+    }
     $script:ArtifactDir = Join-Path (Get-Location) "artifacts\demo-canary\$script:RunId"
     New-Item -ItemType Directory -Path $script:ArtifactDir -Force | Out-Null
     $script:ControllerEventsPath = Join-Path $script:ArtifactDir "controller-events.jsonl"
@@ -789,7 +800,8 @@ try {
     }
     if ($AuthorizeCalculatedMinimumQuantity) {
         Assert-Condition (
-            ($ExerciseTrailingUpdate -or $ExerciseFlatDuringProtectionRace -or
+            ($ExerciseTrailingUpdate -or $ExerciseStaleProtectionFreshness -or
+             $ExerciseFlatDuringProtectionRace -or
              $V2SizingTier) -and
             $AllowDemoOrders
         ) "Non-interactive quantity authorization is restricted to a guarded protection canary"
@@ -814,7 +826,13 @@ try {
     $script:NoOrderSubmitted = "unknown"
     if ($V2SizingTier) {
         $v2Result = Invoke-Api -Method "POST" `
-            -Path "/v2/canary/sizing/$Symbol/$V2SizingTier" -TimeoutSec 90
+            -Path (
+                "/v2/canary/sizing/$Symbol/$V2SizingTier" +
+                "?max_notional_usdt=" +
+                $MaxNotionalUSDT.ToString(
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+            ) -TimeoutSec 90
         Assert-Condition ($v2Result.production_v2_sizing_used -eq $true) `
             "Production V2 sizing was not used"
         Assert-Condition ($null -ne $v2Result.sizing) "V2 sizing audit is missing"
@@ -930,7 +948,56 @@ try {
     Assert-Condition ([decimal]$opened.stop_loss -gt 0) "Stop loss is missing"
     Write-Host "DEMO TP/SL VERIFIED: PASS"
 
-    if ($ExerciseTrailingUpdate) {
+    if ($ExerciseStaleProtectionFreshness) {
+        $script:FailureStage = "stale_management_protection_update"
+        $deferred = Invoke-Api -Method "POST" `
+            -Path "/demo/canary/$executionId/stale-management-update"
+        Assert-Condition ($deferred.production_verifier_used -eq $true) `
+            "Production stale-management verifier was not used"
+        Assert-Condition (
+            $deferred.classification -eq
+            "PROTECTION_UPDATE_DEFERRED_STALE_PRICE"
+        ) "Stale management update was not safely deferred"
+        Assert-Condition ($deferred.cycle_failure_emitted -eq $false) `
+            "Safe stale-management deferral emitted a cycle failure"
+        Assert-Condition ($deferred.exchange_mutation_attempted -eq $false) `
+            "Stale management data caused an exchange mutation"
+        Assert-Condition (
+            $deferred.execution.protection_data_state -eq
+            "PROTECTION_UPDATE_DEFERRED_STALE_PRICE"
+        ) "Durable protection-data state did not record the deferral"
+        Assert-Condition (
+            $deferred.verification.classification -eq
+            "PROTECTED_WITH_STALE_MANAGEMENT_DATA"
+        ) "Existing protection was not authoritatively retained"
+        Write-Host "STALE PROTECTION UPDATE DEFERRED: PASS"
+
+        $script:FailureStage = "fresh_management_recovery"
+        $recovered = Invoke-Api -Method "POST" `
+            -Path "/demo/canary/$executionId/trailing-update"
+        Assert-Condition ($recovered.production_verifier_used -eq $true) `
+            "Production trailing verifier was not used after recovery"
+        Assert-Condition ($recovered.verification.result -in @(
+            "VERIFIED", "ALREADY_VERIFIED"
+        )) "Fresh management update was not verified"
+        Assert-Condition (
+            $recovered.execution.protection_data_state -eq
+            "PROTECTION_DATA_FRESH"
+        ) "Protection-data state did not recover to fresh"
+        Assert-Condition (
+            [bool]$recovered.execution.protection_fresh_data_recovered_at
+        ) "Fresh-data recovery timestamp is missing"
+        Assert-Condition (
+            [bool]$recovered.execution.protection_update_applied_at
+        ) "Protection update application timestamp is missing"
+        $script:ProtectionFreshness = [ordered]@{
+            deferred = $deferred
+            recovered = $recovered
+            synthetic_unsafe_stage = "validated_by_local_fault_injection"
+        }
+        Write-Host "FRESH PROTECTION MANAGEMENT RECOVERED: PASS"
+    }
+    elseif ($ExerciseTrailingUpdate) {
         $script:FailureStage = "trailing_protection_update"
         $trailing = Invoke-Api -Method "POST" `
             -Path "/demo/canary/$executionId/trailing-update"

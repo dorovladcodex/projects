@@ -149,6 +149,19 @@ class DemoExecutionState(str, Enum):
     DEMO_FAILED_FLAT_VERIFIED = "DEMO_FAILED_FLAT_VERIFIED"
 
 
+class ProtectionDataState(str, Enum):
+    PROTECTION_DATA_FRESH = "PROTECTION_DATA_FRESH"
+    PROTECTION_UPDATE_DEFERRED_STALE_PRICE = (
+        "PROTECTION_UPDATE_DEFERRED_STALE_PRICE"
+    )
+    PROTECTION_PENDING_FRESHNESS_WAIT = "PROTECTION_PENDING_FRESHNESS_WAIT"
+    PROTECTED_WITH_STALE_MANAGEMENT_DATA = (
+        "PROTECTED_WITH_STALE_MANAGEMENT_DATA"
+    )
+    UNPROTECTED_CONFIRMED = "UNPROTECTED_CONFIRMED"
+    PROTECTION_DATA_CONFLICT = "PROTECTION_DATA_CONFLICT"
+
+
 class DemoFill(BaseModel):
     execution_id: str
     order_id: str
@@ -221,6 +234,13 @@ class DemoExecutionRecord(BaseModel):
     maximum_adverse_excursion: Decimal = Decimal("0")
     trailing_stop_updated_at: datetime | None = None
     trailing_stop_update_count: int = Field(default=0, ge=0)
+    protection_data_state: ProtectionDataState = (
+        ProtectionDataState.PROTECTION_DATA_FRESH
+    )
+    protection_data_evidence: dict[str, Any] = Field(default_factory=dict)
+    protection_data_deferred_at: datetime | None = None
+    protection_fresh_data_recovered_at: datetime | None = None
+    protection_update_applied_at: datetime | None = None
     last_protection_verification: dict[str, Any] = Field(default_factory=dict)
     protection_verification_history: list[dict[str, Any]] = Field(default_factory=list)
     entry_slippage: Decimal | None = None

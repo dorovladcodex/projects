@@ -148,15 +148,31 @@ class V2ExecutionCoordinator:
         return list(dict.fromkeys(reasons))
 
     def execute(
-        self, candidate: V2SignalCandidate, *, manual_canary: bool = False
+        self,
+        candidate: V2SignalCandidate,
+        *,
+        manual_canary: bool = False,
+        explicit_max_notional_usdt: Decimal | None = None,
     ) -> dict[str, Any]:
+        if explicit_max_notional_usdt is not None and not manual_canary:
+            raise ValueError(
+                "explicit canary notional cap requires manual_canary"
+            )
         candidate.execution_task_received_at = datetime.now(timezone.utc)
         symbol_lock = self._locks.setdefault(candidate.symbol, RLock())
         with symbol_lock, self.portfolio.symbol_lock(candidate.symbol):
-            return self._execute_locked(candidate, manual_canary=manual_canary)
+            return self._execute_locked(
+                candidate,
+                manual_canary=manual_canary,
+                explicit_max_notional_usdt=explicit_max_notional_usdt,
+            )
 
     def _execute_locked(
-        self, candidate: V2SignalCandidate, *, manual_canary: bool = False
+        self,
+        candidate: V2SignalCandidate,
+        *,
+        manual_canary: bool = False,
+        explicit_max_notional_usdt: Decimal | None = None,
     ) -> dict[str, Any]:
         if not candidate.admitted or candidate.state != "READY":
             return self._blocked(candidate, "candidate is not admitted and READY")
@@ -238,6 +254,19 @@ class V2ExecutionCoordinator:
         candidate.sizing.requested_quantity = max_for_position / entry_price
         candidate.sizing.normalized_accepted_quantity = quantity
         candidate.sizing.normalized_accepted_notional_usdt = notional
+        if (
+            explicit_max_notional_usdt is not None
+            and notional > explicit_max_notional_usdt
+        ):
+            candidate.sizing.rejection_code = "CANARY_MAX_NOTIONAL_EXCEEDED"
+            candidate.sizing.final_sizing_reason = (
+                "normalized canary notional exceeds explicit MaxNotionalUSDT"
+            )
+            return self._blocked(
+                candidate,
+                candidate.sizing.final_sizing_reason,
+                rejection_code=candidate.sizing.rejection_code,
+            )
         if notional < self.settings.v2_min_position_notional_usdt:
             candidate.sizing.rejection_code = "NORMALIZED_NOTIONAL_BELOW_MINIMUM"
             candidate.sizing.final_sizing_reason = (

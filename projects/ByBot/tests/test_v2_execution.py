@@ -149,6 +149,31 @@ def test_two_symbols_can_execute_independently() -> None:
     assert {call[0].symbol for call in demo.calls} == {Symbol.BTCUSDT, Symbol.ETHUSDT}
 
 
+def test_manual_canary_explicit_budget_blocks_before_reservation_or_mutation() -> None:
+    service, repository, demo = coordinator()
+    candidate = _admitted_candidate(service, repository, Symbol.BTCUSDT)
+    result = service.execute(
+        candidate,
+        manual_canary=True,
+        explicit_max_notional_usdt=Decimal("99"),
+    )
+    assert result["execution_attempted"] is False
+    assert result["rejection_code"] == "CANARY_MAX_NOTIONAL_EXCEEDED"
+    assert demo.calls == []
+    assert service.portfolio.reservations == []
+    assert repository.load_demo_executions() == []
+
+
+def test_explicit_canary_budget_cannot_affect_normal_execution() -> None:
+    service, repository, _ = coordinator()
+    candidate = _admitted_candidate(service, repository, Symbol.BTCUSDT)
+    with pytest.raises(ValueError, match="requires manual_canary"):
+        service.execute(
+            candidate,
+            explicit_max_notional_usdt=Decimal("125"),
+        )
+
+
 def test_historical_synthetic_news_hash_does_not_block_new_candidate() -> None:
     service, repository, demo = coordinator()
     candidate = _admitted_candidate(service, repository, Symbol.NEARUSDT)

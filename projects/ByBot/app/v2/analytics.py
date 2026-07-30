@@ -352,6 +352,9 @@ class V2ReportGenerator:
             "data_age_seconds_by_source": (
                 runtime.get("stale_metrics") or {}
             ).get("data_age_seconds_by_source") or {},
+            "protection_data_metrics": (
+                runtime.get("protection_data_metrics") or {}
+            ),
             "liquidation_eligibility": liquidation_metrics,
             "top_rejection_reasons": Counter(str(item.get("rejection_reason") or item.get("reason") or "unknown") for item in rejections).most_common(10),
         }

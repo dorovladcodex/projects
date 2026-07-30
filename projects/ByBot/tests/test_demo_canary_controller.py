@@ -136,7 +136,7 @@ def test_candidate_creation_occurs_only_after_all_preflight_gates() -> None:
         'Path "/demo/canary/preview"'
     )
     assert source.index('"v2_execution_preflight"') < source.index(
-        'Path "/v2/canary/sizing/$Symbol/$V2SizingTier"'
+        '"/v2/canary/sizing/$Symbol/$V2SizingTier"'
     )
 
 
@@ -151,10 +151,10 @@ def test_preflight_timeout_has_no_exchange_mutation_path() -> None:
 
 def test_one_authorization_has_one_real_entry_attempt() -> None:
     source = SCRIPT.read_text(encoding="utf-8")
-    assert source.count('Path "/v2/canary/sizing/$Symbol/$V2SizingTier"') == 1
+    assert source.count('"/v2/canary/sizing/$Symbol/$V2SizingTier"') == 1
     assert source.count('Path "/demo/canary/execute"') == 1
     assert "for ($attempt" not in source[
-        source.index('Path "/v2/canary/sizing/$Symbol/$V2SizingTier"'):
+        source.index('"/v2/canary/sizing/$Symbol/$V2SizingTier"'):
         source.index("$script:ExecutionId = [string]$entry.execution.id")
     ]
 
