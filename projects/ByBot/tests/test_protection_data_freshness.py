@@ -21,6 +21,7 @@ from tests.test_bybit_demo_execution import (
 )
 from app.bybit.demo import DemoExecutionService
 from app.v2.runtime import protection_management_price_input
+from app.v2.outcomes import SafeDegradedOutcome
 
 
 FIXTURE = json.loads(
@@ -63,6 +64,42 @@ def test_protected_position_with_fresh_management_data_updates() -> None:
     result = _run_trailing_update(service, record)
     assert result.protection_data_state == ProtectionDataState.PROTECTION_DATA_FRESH
     assert len(client.set_stop_calls) == 1
+
+
+def test_missing_optional_replace_target_skips_mutation_safely() -> None:
+    class MissingProtectionOrders(ProtectionReplayClient):
+        def get_open_orders(self, symbol=None, settle_coin=None):
+            return []
+
+    client = MissingProtectionOrders(["0.15553"])
+    service, repo, record = _trailing_service(client)
+    with pytest.raises(
+        SafeDegradedOutcome,
+        match="existing exact protection retained",
+    ):
+        _run_trailing_update(service, record)
+    assert client.set_stop_calls == []
+    assert (
+        "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+        "DEMO_POSITION_OPEN",
+    ) in repo.saved_events
+
+
+def test_conflicting_current_protection_order_remains_safety_critical() -> None:
+    class ConflictingProtectionOrder(ProtectionReplayClient):
+        def get_open_orders(self, symbol=None, settle_coin=None):
+            rows = super().get_open_orders(symbol, settle_coin)
+            rows[0]["symbol"] = "BTCUSDT"
+            return rows
+
+    client = ConflictingProtectionOrder(["0.15553"])
+    service, _, record = _trailing_service(client)
+    with pytest.raises(
+        DemoSafetyError,
+        match="protection order ownership conflicts",
+    ):
+        _run_trailing_update(service, record)
+    assert client.set_stop_calls == []
 
 
 def test_protected_position_with_stale_data_defers_update() -> None:
@@ -360,6 +397,40 @@ def test_true_unprotected_replay_still_fails() -> None:
     assert repo.records[str(record.candidate_id)].protection_data_state == (
         ProtectionDataState.UNPROTECTED_CONFIRMED
     )
+
+
+def test_cycle_743_remote_flat_optional_update_is_safe_degraded() -> None:
+    class FlatClient(ProtectionReplayClient):
+        def get_positions(self, symbol=None, settle_coin=None):
+            return []
+
+    client = FlatClient([None])
+    service, _, record = _trailing_service(client)
+    service._reconcile_execution_rest_locked = lambda current: (
+        current.model_copy(
+            update={"state": DemoExecutionState.DEMO_CLOSING}
+        )
+    )
+    with pytest.raises(
+        SafeDegradedOutcome,
+        match="authoritatively flat",
+    ) as captured:
+        service._defer_stale_management_update(
+            record,
+            observed_at=datetime.now(timezone.utc),
+            market_price_source="v2_feature_last_trade",
+            market_price_at=datetime.now(timezone.utc)
+            - timedelta(seconds=16),
+            market_price_received_at=datetime.now(timezone.utc),
+            market_price_age_seconds=16,
+            requested_update_type="trailing",
+            defer_reason="fixture stale price",
+        )
+    assert captured.value.details.code == (
+        "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED"
+    )
+    assert captured.value.details.exchange_mutation_attempted is False
+    assert client.set_stop_calls == []
 
 
 class _PendingClient(ProtectionReplayClient):

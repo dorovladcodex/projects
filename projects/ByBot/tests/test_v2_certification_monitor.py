@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from app.v2.certification_monitor import (
     CertificationMonitorHealth,
     CertificationMonitorState,
@@ -16,6 +18,7 @@ from app.v2.certification_monitor import (
 )
 from scripts.demo_v2_certification_monitor import (
     collect_status_fallback_evidence,
+    runtime_blockers,
 )
 from scripts.demo_v2_protection_pending_canary import decimal_duration_ms
 
@@ -108,6 +111,55 @@ def record(
         evidence=fallback,
         error="TimeoutError: /v2/status timed out",
     )
+
+
+def test_safe_degradation_is_not_a_monitor_blocker() -> None:
+    v2 = {
+        "safety_critical_failures": 0,
+        "data_integrity_failures": 0,
+        "unexpected_cycle_failures": 0,
+        "total_cycle_failures": 0,
+        "safe_degraded_events": 4,
+        "persistence_status": "OK",
+        "kill_switch_active": False,
+    }
+    demo = {
+        "kill_switch_active": False,
+        "confirmed_unrelated_orders": 0,
+        "ownership_conflicts": 0,
+    }
+    assert runtime_blockers(v2, demo, []) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("safety_critical_failures", "safety-critical failure"),
+        ("data_integrity_failures", "data-integrity-critical failure"),
+        ("unexpected_cycle_failures", "unexpected cycle failure"),
+    ],
+)
+def test_explicit_critical_counters_remain_monitor_blockers(
+    field: str, message: str
+) -> None:
+    v2 = {
+        "safety_critical_failures": 0,
+        "data_integrity_failures": 0,
+        "unexpected_cycle_failures": 0,
+        "persistence_status": "OK",
+        "kill_switch_active": False,
+    }
+    v2[field] = 1
+    blockers = runtime_blockers(
+        v2,
+        {
+            "kill_switch_active": False,
+            "confirmed_unrelated_orders": 0,
+            "ownership_conflicts": 0,
+        },
+        [],
+    )
+    assert message in blockers
 
 
 def test_status_timeout_without_exposure_is_degraded_not_failed() -> None:

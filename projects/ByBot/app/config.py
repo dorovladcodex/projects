@@ -208,6 +208,7 @@ class Settings(BaseSettings):
         "DOGEUSDT", "PEPEUSDT", "SHIBUSDT", "WIFUSDT", "BONKUSDT", "FLOKIUSDT",
     )
     v2_cycle_failure_repeat_limit: int = Field(default=3, ge=1, le=100)
+    v2_certification_mode: str = "STRICT"
     v2_max_entries_per_cycle: int = Field(default=2, ge=1, le=20)
     v2_max_signal_submit_age_seconds: int = Field(default=5, ge=1, le=60)
     v2_max_price_deviation_bps: Decimal = Field(default=Decimal("10"), gt=0, le=1000)
@@ -392,6 +393,16 @@ class Settings(BaseSettings):
         if value is not None and value.tzinfo is None:
             raise ValueError("DEMO_RUN_STARTED_AT must include a timezone")
         return value
+
+    @field_validator("v2_certification_mode", mode="before")
+    @classmethod
+    def validate_v2_certification_mode(cls, value: object) -> str:
+        normalized = str(value or "STRICT").strip().upper()
+        if normalized not in {"DISCOVERY", "STRICT"}:
+            raise ValueError(
+                "V2_CERTIFICATION_MODE must be DISCOVERY or STRICT"
+            )
+        return normalized
 
     @model_validator(mode="after")
     def enforce_demo_execution_guard(self) -> "Settings":

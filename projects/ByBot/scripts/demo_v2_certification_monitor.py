@@ -312,6 +312,27 @@ def main() -> int:
                 demo.get("confirmed_unrelated_orders") or 0
             ),
             "cycle_failures": int(v2.get("total_cycle_failures") or 0),
+            "safety_critical_failures": int(
+                v2.get("safety_critical_failures") or 0
+            ),
+            "data_integrity_failures": int(
+                v2.get("data_integrity_failures") or 0
+            ),
+            "unexpected_cycle_failures": int(
+                v2.get("unexpected_cycle_failures") or 0
+            ),
+            "safe_degraded_events": int(
+                v2.get("safe_degraded_events") or 0
+            ),
+            "expected_rejections": int(
+                v2.get("expected_rejections") or 0
+            ),
+            "observability_warnings": int(
+                v2.get("observability_warnings") or 0
+            ),
+            "certification_mode": str(
+                v2.get("certification_mode") or "STRICT"
+            ),
             "persistence_status": v2.get("persistence_status"),
             "kill_switch_active": bool(v2.get("kill_switch_active")),
             "submitted": int(
@@ -344,6 +365,16 @@ def main() -> int:
             "remote_positions": snapshot["remote_positions"],
             "remote_orders": snapshot["remote_orders"],
             "cycle_failures": snapshot["cycle_failures"],
+            "safety_critical_failures": snapshot[
+                "safety_critical_failures"
+            ],
+            "data_integrity_failures": snapshot[
+                "data_integrity_failures"
+            ],
+            "unexpected_cycle_failures": snapshot[
+                "unexpected_cycle_failures"
+            ],
+            "safe_degraded_events": snapshot["safe_degraded_events"],
             "persistence_status": snapshot["persistence_status"],
             "durable_pnl": snapshot["durable_pnl"],
             "authoritative_pnl": snapshot["authoritative_pnl"],
@@ -375,8 +406,15 @@ def main() -> int:
             })
             return 0
         if last_phase == "FINISHED" and not runner_alive:
+            warnings = (
+                snapshot["safe_degraded_events"]
+                + snapshot["observability_warnings"]
+            )
             write_json(result_path, {
-                "result": "FINISHED",
+                "result": (
+                    "PASS_WITH_WARNINGS" if warnings else "PASS"
+                ),
+                "run_phase": "FINISHED",
                 "polls": polls,
                 "deep_events": deep_events,
                 "final": snapshot,
@@ -1168,8 +1206,27 @@ def runtime_blockers(
     completed: list[dict[str, Any]],
 ) -> list[str]:
     blockers: list[str] = []
-    if int(v2.get("total_cycle_failures") or 0):
-        blockers.append("cycle failure")
+    explicit = any(
+        key in v2
+        for key in (
+            "safety_critical_failures",
+            "data_integrity_failures",
+            "unexpected_cycle_failures",
+        )
+    )
+    if int(v2.get("safety_critical_failures") or 0):
+        blockers.append("safety-critical failure")
+    if int(v2.get("data_integrity_failures") or 0):
+        blockers.append("data-integrity-critical failure")
+    if int(v2.get("unexpected_cycle_failures") or 0):
+        blockers.append("unexpected cycle failure")
+    if not explicit and int(v2.get("total_cycle_failures") or 0):
+        blockers.append("legacy unclassified cycle failure")
+    if (
+        str(v2.get("run_phase") or "") == "FINISHED"
+        and int(v2.get("unresolved_safe_degradations") or 0)
+    ):
+        blockers.append("safe degradation remained unresolved at shutdown")
     if v2.get("persistence_status") != "OK":
         blockers.append("persistence status is not OK")
     if bool(v2.get("kill_switch_active")) or bool(demo.get("kill_switch_active")):

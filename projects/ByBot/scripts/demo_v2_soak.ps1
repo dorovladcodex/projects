@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidateRange(0.25, 168)][double]$Hours = 24,
+    [ValidateSet('DISCOVERY', 'STRICT')][string]$CertificationMode = 'STRICT',
     [switch]$AllowDemoOrders,
     [switch]$OptionalGracefulShutdown,
     [switch]$OptionalForceDemoCleanup
@@ -430,6 +431,7 @@ try {
     Set-ChildEnvironment 'DEMO_ORDER_EXECUTION_AUTHORIZED' 'true'
     Set-ChildEnvironment 'V2_ENABLED' 'true'
     Set-ChildEnvironment 'V2_AUTO_DEMO_EXECUTION' 'true'
+    Set-ChildEnvironment 'V2_CERTIFICATION_MODE' $CertificationMode
     Set-ChildEnvironment 'DEMO_CANARY_ENABLED' 'false'
     Set-ChildEnvironment 'DEMO_RUN_ID' $runId
     Set-ChildEnvironment 'DEMO_RUN_STARTED_AT' ([DateTime]::UtcNow.ToString('o'))
@@ -463,6 +465,7 @@ try {
 
         $deadline = [DateTime]::UtcNow.AddHours($Hours)
         Set-ChildEnvironment 'V2_RUN_NOMINAL_END_AT' $deadline.ToString('o')
+        Write-Host ('CERTIFICATION MODE: ' + $CertificationMode)
         Write-Host 'UVICORN: START'
         Assert-SingleUvicornOwner
         $stdout = Join-Path $artifactDir 'uvicorn.stdout.log'
@@ -565,7 +568,11 @@ try {
         }
         $report = Invoke-RestMethod "$base/v2/report" -Method Post -TimeoutSec 30
         Invoke-FinalValidation
-        $cycleFailuresZero = [int]$status.total_cycle_failures -eq 0
+        $cycleFailuresZero = (
+            [int]$status.safety_critical_failures -eq 0 -and
+            [int]$status.data_integrity_failures -eq 0 -and
+            [int]$status.unexpected_cycle_failures -eq 0
+        )
         $runFinished = [string]$status.run_phase -eq 'FINISHED'
         $safetyResult = $(if (
             -not $drainTimedOut -and $script:finalDiagnosticsPass -and `
@@ -593,7 +600,7 @@ try {
         Write-Host ('FUNCTIONAL RESULT: ' + $functionalResult)
         Write-Host ('SAFETY RESULT: ' + $safetyResult)
         Write-Host ('ARTIFACTS: ' + $artifactDir)
-        if ($functionalResult -ne 'PASS') {
+        if ($functionalResult -notin @('PASS', 'PASS_WITH_WARNINGS')) {
             throw ('V2 functional validation failed: ' + ($report.functional_blockers -join '; '))
         }
         if ($safetyResult -ne 'PASS') {

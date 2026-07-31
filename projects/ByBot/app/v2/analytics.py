@@ -111,10 +111,43 @@ class V2ReportGenerator:
         order_strategy = Counter(str(item.get("strategy_name") or "unknown") for item in executions)
         order_symbol = Counter(str(item.get("symbol") or "unknown") for item in executions)
         exit_reasons = Counter(_canonical_attribution(item) for item in trades)
-        failures = [item for item in incidents if item.get("event_type") == "V2_CYCLE_FAILURE"]
-        total_failures = sum(
+        failures = [
+            item for item in incidents
+            if item.get("event_type") == "V2_CYCLE_FAILURE"
+        ]
+        legacy_total_failures = sum(
             int((item.get("payload") or {}).get("occurrence_count") or 1)
             for item in failures
+        )
+        explicit_failure_counts = any(
+            key in runtime
+            for key in (
+                "safety_critical_failures",
+                "data_integrity_failures",
+                "unexpected_cycle_failures",
+            )
+        )
+        safety_critical_failures = int(
+            runtime.get("safety_critical_failures") or 0
+        )
+        data_integrity_failures = int(
+            runtime.get("data_integrity_failures") or 0
+        )
+        unexpected_cycle_failures = int(
+            runtime.get("unexpected_cycle_failures") or 0
+        )
+        total_failures = (
+            safety_critical_failures
+            + data_integrity_failures
+            + unexpected_cycle_failures
+            if explicit_failure_counts
+            else legacy_total_failures
+        )
+        safe_degraded_events = int(
+            runtime.get("safe_degraded_events") or 0
+        )
+        observability_warning_count = int(
+            runtime.get("observability_warnings") or 0
         )
         fingerprints = {
             str((item.get("payload") or {}).get("traceback_fingerprint") or item.get("id"))
@@ -141,8 +174,16 @@ class V2ReportGenerator:
             strategy for strategy in enabled if int(evaluations.get(strategy, 0)) == 0
         )
         blockers: list[str] = []
-        if total_failures:
-            blockers.append("unhandled V2_CYCLE_FAILURE exists")
+        if safety_critical_failures:
+            blockers.append("safety-critical runtime failure exists")
+        if data_integrity_failures:
+            blockers.append("data-integrity-critical runtime failure exists")
+        if unexpected_cycle_failures:
+            blockers.append("unexpected cycle failure exists")
+        if not explicit_failure_counts and total_failures:
+            blockers.append("unhandled legacy V2_CYCLE_FAILURE exists")
+        if int(runtime.get("unresolved_safe_degradations") or 0):
+            blockers.append("safe degradation remained unresolved at shutdown")
         repeat_limit = int(runtime.get("cycle_failure_repeat_limit") or 3)
         if any(
             int((item.get("payload") or {}).get("occurrence_count") or 1) > repeat_limit
@@ -199,6 +240,14 @@ class V2ReportGenerator:
             ["completed trades lack canonical exit attribution"] if unattributed else []
         )
         analytics_warnings: list[str] = []
+        if safe_degraded_events:
+            analytics_warnings.append(
+                f"{safe_degraded_events} typed safe-degradation events occurred"
+            )
+        if observability_warning_count:
+            analytics_warnings.append(
+                f"{observability_warning_count} observability warnings occurred"
+            )
         stale_runtime = runtime.get("stale_metrics") or {}
         if int(stale_runtime.get("position_stale_observations") or 0):
             analytics_warnings.append("owned-position stale feature observations occurred")
@@ -239,14 +288,132 @@ class V2ReportGenerator:
         if persistence_rejections:
             blockers.append("execution compatibility persistence failed")
             blockers = list(dict.fromkeys(blockers))
+        safe_degradation_classes: dict[str, dict[str, Any]] = {}
+        for item in incidents:
+            if item.get("event_type") != "V2_SAFE_DEGRADED":
+                continue
+            payload = item.get("payload") or {}
+            code = str(payload.get("code") or "SAFE_DEGRADED_UNKNOWN")
+            row = safe_degradation_classes.setdefault(code, {
+                "code": code,
+                "count": 0,
+                "symbols": set(),
+                "strategies": set(),
+                "first_occurrence": None,
+                "last_occurrence": None,
+                "mutation_skipped": True,
+                "self_recovered": False,
+                "maximum_duration_seconds": 0.0,
+                "safety_invariant": None,
+                "recommended_general_fix": (
+                    "improve exact optional-action evidence acquisition "
+                    "without weakening the mutation gate"
+                ),
+                "replay_coverage_status": (
+                    "COVERED"
+                    if code in {
+                        "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+                        "MANAGEMENT_UPDATE_SKIPPED_STALE_INPUT",
+                        "MANAGEMENT_UPDATE_SKIPPED_REMOTE_FLAT",
+                    }
+                    else "PENDING"
+                ),
+            })
+            row["count"] += int(payload.get("occurrence_count") or 1)
+            if payload.get("symbol"):
+                row["symbols"].add(str(payload["symbol"]))
+            if payload.get("strategy"):
+                row["strategies"].add(str(payload["strategy"]))
+            first = payload.get("first_seen_at")
+            last = payload.get("last_seen_at")
+            if first and (
+                row["first_occurrence"] is None
+                or str(first) < str(row["first_occurrence"])
+            ):
+                row["first_occurrence"] = first
+            if last and (
+                row["last_occurrence"] is None
+                or str(last) > str(row["last_occurrence"])
+            ):
+                row["last_occurrence"] = last
+            evidence = payload.get("evidence") or {}
+            row["mutation_skipped"] = bool(
+                row["mutation_skipped"]
+                and not payload.get("exchange_mutation_attempted")
+            )
+            row["self_recovered"] = bool(
+                row["self_recovered"] or evidence.get("self_recovered")
+            )
+            row["safety_invariant"] = (
+                row["safety_invariant"]
+                or evidence.get("safety_invariant")
+                or (
+                    "existing authoritative protection remained valid and "
+                    "no ambiguous mutation was submitted"
+                )
+            )
+            try:
+                if first and last:
+                    duration = (
+                        datetime.fromisoformat(str(last))
+                        - datetime.fromisoformat(str(first))
+                    ).total_seconds()
+                    row["maximum_duration_seconds"] = max(
+                        row["maximum_duration_seconds"], duration
+                    )
+            except ValueError:
+                pass
+        normalized_degradations = []
+        for row in safe_degradation_classes.values():
+            normalized_degradations.append({
+                **row,
+                "symbols": sorted(row["symbols"]),
+                "strategies": sorted(row["strategies"]),
+                "priority": {
+                    "safety_relevance": 1,
+                    "frequency": int(row["count"]),
+                    "operational_impact": (
+                        2 if row["mutation_skipped"] else 3
+                    ),
+                    "implementation_effort": (
+                        "LOW"
+                        if row["replay_coverage_status"] == "COVERED"
+                        else "MEDIUM"
+                    ),
+                },
+            })
+        functional_result = (
+            "FAIL"
+            if blockers
+            else (
+                "PASS_WITH_WARNINGS"
+                if safe_degraded_events or observability_warning_count
+                else "PASS"
+            )
+        )
         return {
             "run_id": run_id, "generated_at": generated_at.isoformat(),
-            "functional_result": "FAIL" if blockers else "PASS",
+            "functional_result": functional_result,
             "functional_blockers": blockers,
             "analytics_result": analytics_result,
             "analytics_blockers": analytics_blockers,
             "analytics_warnings": analytics_warnings,
             "total_cycle_failures": total_failures,
+            "safety_critical_failures": safety_critical_failures,
+            "data_integrity_failures": data_integrity_failures,
+            "unexpected_cycle_failures": unexpected_cycle_failures,
+            "safe_degraded_events": safe_degraded_events,
+            "expected_rejections": int(
+                runtime.get("expected_rejections") or 0
+            ),
+            "observability_warnings": observability_warning_count,
+            "certification_mode": str(
+                runtime.get("certification_mode") or "STRICT"
+            ),
+            "safe_degradation_classes": sorted(
+                normalized_degradations,
+                key=lambda item: (-int(item["count"]), str(item["code"])),
+            ),
             "unique_cycle_failure_fingerprints": len(fingerprints),
             "symbols_attempted": symbols_attempted,
             "symbols_successful": symbols_successful,

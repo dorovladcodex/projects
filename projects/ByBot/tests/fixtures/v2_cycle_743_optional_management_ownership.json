@@ -1,0 +1,13 @@
+{
+  "run_id": "demo-v2-20260730T181055863Z",
+  "cycle_id": "demo-v2-20260730T181055863Z:743",
+  "stage": "position_monitoring",
+  "old_exception": "DemoSafetyError",
+  "old_message": "stale protection update ownership could not be confirmed",
+  "authoritative_position_remained_protected_before_close": true,
+  "ambiguous_exchange_mutation_submitted": false,
+  "position_closed_safely": true,
+  "expected_classification": "SAFE_DEGRADED",
+  "expected_code": "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+  "expected_cycle_failure_increment": 0
+}

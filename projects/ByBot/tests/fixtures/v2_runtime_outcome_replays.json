@@ -1,0 +1,57 @@
+[
+  {
+    "name": "fill_to_protection_propagation_race",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "exact_realtime_order_attribution_race",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "execution_history_propagation",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "terminal_residual_order_propagation",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "stale_ticker_paired_with_trades_timestamp",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "safe_stale_management_deferral",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "optional_management_update_ownership_unconfirmed",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "simultaneous_close_terminalization",
+    "classification": "SUCCESS",
+    "mutation_allowed": false
+  },
+  {
+    "name": "status_timeout_during_terminalization",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  },
+  {
+    "name": "postgresql_startup_readiness",
+    "classification": "OBSERVABILITY_WARNING",
+    "mutation_allowed": false
+  },
+  {
+    "name": "dependency_degradation_and_recovery",
+    "classification": "SAFE_DEGRADED",
+    "mutation_allowed": false
+  }
+]

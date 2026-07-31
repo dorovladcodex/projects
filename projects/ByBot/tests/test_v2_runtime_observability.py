@@ -626,6 +626,56 @@ def test_zero_trades_with_healthy_cycles_is_functional_pass(tmp_path) -> None:
     ).generate("r")
 
     assert report["functional_result"] == "PASS"
+
+
+def test_safe_degradation_produces_pass_with_warnings(tmp_path) -> None:
+    runtime_payload = {
+        "accepted_symbols": ["BTCUSDT"],
+        "symbol_cycle_metrics": {
+            "BTCUSDT": {
+                "cycles_attempted": 2,
+                "cycles_succeeded": 2,
+                "cycles_failed": 0,
+            }
+        },
+        "enabled_strategies": ["VolumeBreakoutStrategy"],
+        "strategy_evaluation_counts": {"VolumeBreakoutStrategy": 2},
+        "safety_critical_failures": 0,
+        "data_integrity_failures": 0,
+        "unexpected_cycle_failures": 0,
+        "safe_degraded_events": 1,
+        "observability_warnings": 0,
+        "certification_mode": "DISCOVERY",
+    }
+    incident = {
+        "id": "safe",
+        "run_id": "r",
+        "event_type": "V2_SAFE_DEGRADED",
+        "payload": {
+            "classification": "SAFE_DEGRADED",
+            "code": "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+            "message": "optional update skipped",
+            "processing_stage": "position_monitoring",
+            "symbol": "BTCUSDT",
+            "strategy": "VolumeBreakoutStrategy",
+            "first_seen_at": "2026-07-31T00:00:00+00:00",
+            "last_seen_at": "2026-07-31T00:00:01+00:00",
+            "occurrence_count": 1,
+            "exchange_mutation_attempted": False,
+            "evidence": {
+                "existing_exchange_protection_remained_valid": True,
+            },
+        },
+    }
+    report = V2ReportGenerator(
+        _report_repo(runtime_payload, [incident]), str(tmp_path)
+    ).generate("r")
+
+    assert report["functional_result"] == "PASS_WITH_WARNINGS"
+    assert report["analytics_result"] == "PASS_WITH_WARNINGS"
+    assert report["total_cycle_failures"] == 0
+    assert report["safe_degraded_events"] == 1
+    assert report["safe_degradation_classes"][0]["count"] == 1
     assert report["completed_trades"] == 0
 
 

@@ -37,6 +37,12 @@ from app.models import (
     SignalRiskPreview,
     Symbol,
 )
+from app.v2.outcomes import (
+    OptionalManagementGateEvidence,
+    RuntimeOutcome,
+    SafeDegradedOutcome,
+    classify_optional_management_gate,
+)
 
 
 DEMO_REST_URL = "https://api-demo.bybit.com"
@@ -3754,23 +3760,58 @@ class DemoExecutionService:
         if self.client is None:
             raise DemoSafetyError("Demo exchange client is unavailable")
         current_rules = rules or self.client.get_instrument(record.symbol)
-        authoritative = position or _owned_position(
-            self.client.get_positions(record.symbol), record
+        position_rows = (
+            [position]
+            if position is not None
+            else self.client.get_positions(record.symbol)
         )
+        authoritative = position or _owned_position(position_rows, record)
         if authoritative is None:
+            open_positions = [
+                item
+                for item in position_rows
+                if _decimal(item.get("size"), default="0") > 0
+            ]
+            if not open_positions:
+                reconciled = self._reconcile_execution_rest_locked(record)
+                raise SafeDegradedOutcome(
+                    "optional management update skipped because the owned "
+                    "position became authoritatively flat",
+                    code="MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+                    evidence={
+                        "execution_id": str(record.id),
+                        "symbol": record.symbol.value,
+                        "requested_update_type": requested_update_type,
+                        "authoritative_position_size": "0",
+                        "authoritative_remote_flat": True,
+                        "durable_state_after_reconciliation": (
+                            reconciled.state.value
+                        ),
+                        "existing_protection_confirmed": (
+                            record.protection_confirmed
+                        ),
+                        "exchange_mutation_attempted": False,
+                        "safety_invariant": (
+                            "no open exchange position existed and no optional "
+                            "protection mutation was submitted"
+                        ),
+                    },
+                )
             self._persist_protection_data_state(
                 record,
                 state=ProtectionDataState.PROTECTION_DATA_CONFLICT,
                 event_type="PROTECTION_DATA_CONFLICT",
                 observed_at=observed_at,
                 evidence={
-                    "defer_reason": "exact owned position unavailable",
+                    "defer_reason": (
+                        "current open position ownership unavailable"
+                    ),
                     "requested_update_type": requested_update_type,
                     "cycle_failure_emitted": True,
                 },
             )
             raise DemoSafetyError(
-                "stale protection update ownership could not be confirmed"
+                "current open position ownership could not be confirmed"
             )
         self._validate_protection_position_identity(
             record, rules=current_rules, position=authoritative
@@ -4204,6 +4245,16 @@ class DemoExecutionService:
                 verified_at=verified_at,
             )
 
+        self._guard_optional_management_mutation(
+            record,
+            rules=rules,
+            position=owned_before,
+            position_rows=before,
+            requested_update_type=requested_update_type,
+            decision_context=decision_context,
+            observed_at=verified_at,
+        )
+
         mutation_response: dict[str, Any] | None = None
         try:
             if before_mutation_hook is not None:
@@ -4335,6 +4386,132 @@ class DemoExecutionService:
             decision_context=decision_context,
         )
         raise DemoSafetyError("updated trailing protection could not be verified")
+
+    def _guard_optional_management_mutation(
+        self,
+        record: DemoExecutionRecord,
+        *,
+        rules: InstrumentRules,
+        position: dict[str, Any],
+        position_rows: list[dict[str, Any]],
+        requested_update_type: str,
+        decision_context: dict[str, Any],
+        observed_at: datetime,
+    ) -> None:
+        """Prove current protection and its exact replace targets before mutation."""
+
+        if record.take_profit is None or record.stop_loss is None:
+            raise DemoSafetyError(
+                "current active protection ownership could not be confirmed"
+            )
+        if not record.protection_confirmed or not _normalized_protection_matches(
+            position,
+            record.take_profit,
+            record.stop_loss,
+            rules,
+            record.side,
+        ):
+            raise DemoSafetyError(
+                "current active protection ownership could not be confirmed"
+            )
+        open_orders = self.client.get_open_orders(symbol=record.symbol)
+        _capture_protection_order_ownership(record, open_orders, position_rows)
+        expected_ids = {
+            "TakeProfit": record.tp_order_id,
+            "StopLoss": record.sl_order_id,
+        }
+        conflicts: list[str] = []
+        missing: list[str] = []
+        for stop_type, order_id in expected_ids.items():
+            if not order_id:
+                missing.append(stop_type)
+                continue
+            exact = next(
+                (
+                    item
+                    for item in open_orders
+                    if str(item.get("orderId") or "") == order_id
+                ),
+                None,
+            )
+            if exact is None:
+                missing.append(stop_type)
+            elif not _is_owned_bybit_protection_order(
+                exact, record, position_rows
+            ):
+                conflicts.append(order_id)
+        gate = classify_optional_management_gate(
+            OptionalManagementGateEvidence(
+                remote_position_open=True,
+                position_ownership_confirmed=True,
+                current_protection_confirmed=True,
+                replace_targets_confirmed=not missing and not conflicts,
+                input_fresh=True,
+                ownership_conflict=bool(conflicts),
+            )
+        )
+        if gate.classification == RuntimeOutcome.SAFETY_CRITICAL:
+            raise DemoSafetyError(
+                "current active protection order ownership conflicts with "
+                "the durable execution"
+            )
+        if gate.classification == RuntimeOutcome.SUCCESS:
+            previously_degraded = (
+                record.protection_data_evidence.get("code")
+                == "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED"
+            )
+            record.protection_orders_verified_at = observed_at
+            if previously_degraded:
+                record.protection_data_evidence = {
+                    **record.protection_data_evidence,
+                    "self_recovered": True,
+                    "recovered_at": observed_at.isoformat(),
+                    "proposed_replace_target_ownership_confirmed": True,
+                }
+            record.updated_at = observed_at
+            if self.repository.save_demo_execution(
+                record,
+                event_type=(
+                    "MANAGEMENT_UPDATE_OWNERSHIP_RECOVERED"
+                    if previously_degraded
+                    else "MANAGEMENT_MUTATION_GATE_CONFIRMED"
+                ),
+            ) is False:
+                raise DemoSafetyError(
+                    "management mutation gate persistence failed"
+                )
+            return
+        evidence = {
+            **decision_context,
+            "classification": "SAFE_DEGRADED",
+            "code": "MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+            "requested_update_type": requested_update_type,
+            "missing_replace_targets": missing,
+            "tp_order_id": record.tp_order_id,
+            "sl_order_id": record.sl_order_id,
+            "current_position_ownership_confirmed": True,
+            "current_protection_ownership_confirmed": True,
+            "proposed_replace_target_ownership_confirmed": False,
+            "existing_exchange_protection_remained_valid": True,
+            "exchange_mutation_attempted": False,
+            "observed_at": observed_at.isoformat(),
+        }
+        record.protection_data_evidence = {
+            **record.protection_data_evidence,
+            **evidence,
+        }
+        record.updated_at = observed_at
+        if self.repository.save_demo_execution(
+            record,
+            event_type="MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+        ) is False:
+            raise DemoSafetyError("management skip persistence failed")
+        raise SafeDegradedOutcome(
+            "optional management update ownership could not be confirmed; "
+            "existing exact protection retained",
+            code="MANAGEMENT_UPDATE_SKIPPED_OWNERSHIP_UNCONFIRMED",
+            evidence=evidence,
+        )
 
     def _validate_protection_update_context(
         self,
@@ -4833,6 +5010,19 @@ class DemoExecutionService:
                 if record.protection_data_state
                 == ProtectionDataState.PROTECTION_UPDATE_DEFERRED_STALE_PRICE
                 and record.state not in TERMINAL_DEMO_STATES
+            ],
+            "active_safe_degraded_executions": [
+                {
+                    "execution_id": str(record.id),
+                    "symbol": record.symbol.value,
+                    "code": record.protection_data_evidence.get("code"),
+                    "evidence": dict(record.protection_data_evidence),
+                }
+                for record in scoped
+                if record.state not in TERMINAL_DEMO_STATES
+                and record.protection_data_evidence.get("classification")
+                == "SAFE_DEGRADED"
+                and not record.protection_data_evidence.get("self_recovered")
             ],
         }
 

@@ -30,6 +30,13 @@ from app.v2.market import (
 from app.v2.logging import configure_v2_logging
 from app.v2.models import NewsModelUsage, StrategyName, V2Incident, V2SignalCandidate
 from app.v2.news import V2ExternalTrendService, V2NewsAggregator
+from app.v2.outcomes import (
+    DataIntegrityCriticalOutcome,
+    NON_FAILURE_OUTCOMES,
+    RuntimeOutcome,
+    RuntimeOutcomeError,
+    typed_outcome,
+)
 from app.v2.portfolio import PortfolioRiskService, correlation_group
 from app.v2.research import CalibrationObservation, EmpiricalEdgeCalibrator
 from app.v2.scoring import AdmissionContext, CommonScoringPipeline
@@ -243,6 +250,21 @@ class V2Runtime:
         self.failure_occurrences: dict[str, int] = dict(
             restored.get("failure_occurrences") or {}
         )
+        self.outcome_occurrences: dict[str, int] = dict(
+            restored.get("outcome_occurrences") or {}
+        )
+        self.outcome_first_seen: dict[str, str] = dict(
+            restored.get("outcome_first_seen") or {}
+        )
+        self.outcome_classification_counts: dict[str, int] = dict(
+            restored.get("outcome_classification_counts") or {}
+        )
+        self.outcome_code_counts: dict[str, int] = dict(
+            restored.get("outcome_code_counts") or {}
+        )
+        self.critical_classification_counts: dict[str, int] = dict(
+            restored.get("critical_classification_counts") or {}
+        )
         self.dependency_health = ExternalDependencyHealth(
             run_id=run_id,
             repository=repository,
@@ -399,7 +421,7 @@ class V2Runtime:
         ):
             try:
                 self._enforce_terminalization_invariants()
-                self._monitor_positions()
+                self._monitor_positions(cycle_id)
             except Exception as exc:
                 if not self._handle_dependency_failure(
                     exc, stage="position_monitoring", cycle_id=cycle_id
@@ -1272,12 +1294,30 @@ class V2Runtime:
         source: str | None = None,
         input_field: str | None = None,
     ) -> None:
+        outcome = typed_outcome(exc)
+        if outcome is not None and outcome.classification in NON_FAILURE_OUTCOMES:
+            self._record_non_failure_outcome(
+                exc,
+                stage=stage,
+                cycle_id=cycle_id,
+                symbol=symbol,
+                strategy=strategy,
+                source=source,
+                input_field=input_field,
+            )
+            return
         message = _sanitize_runtime_error(str(exc))
         fingerprint = _failure_fingerprint(
             exc, stage=stage, symbol=symbol, strategy=strategy
         )
         count = self.failure_occurrences.get(fingerprint, 0) + 1
         self.failure_occurrences[fingerprint] = count
+        critical_key = (
+            outcome.classification.value
+            if outcome is not None
+            else "UNEXPECTED_CYCLE_FAILURE"
+        )
+        self._increment(self.critical_classification_counts, critical_key)
         now = datetime.now(timezone.utc)
         payload = {
             "exception_class": type(exc).__name__, "message": message,
@@ -1288,6 +1328,19 @@ class V2Runtime:
             "relevant_input_field": input_field,
             "transient": _is_transient_failure(exc),
             "occurrence_count": count, "last_seen_at": now.isoformat(),
+            "outcome_classification": (
+                outcome.classification.value
+                if outcome is not None
+                else "UNEXPECTED_CYCLE_FAILURE"
+            ),
+            "outcome_code": (
+                outcome.code if outcome is not None else "UNHANDLED_EXCEPTION"
+            ),
+            "exchange_mutation_attempted": (
+                outcome.exchange_mutation_attempted
+                if outcome is not None else None
+            ),
+            "outcome_evidence": outcome.evidence if outcome is not None else {},
         }
         incident = V2Incident(
             id=uuid5(NAMESPACE_URL, f"bybot-v2-failure:{self.run_id}:{fingerprint}"),
@@ -1295,12 +1348,15 @@ class V2Runtime:
             error_category=type(exc).__name__, payload=payload, occurred_at=now,
         )
         self.repository.save_v2_incident(incident)
-        if count >= self.settings.v2_cycle_failure_repeat_limit:
-            self.failure_circuit_breaker_active = True
-            self.stop_new_entries = True
-            reason = f"repeated V2 failure circuit breaker: {stage}/{fingerprint}"
-            if reason not in self.run_invalid_reasons:
-                self.run_invalid_reasons.append(reason)
+        self.failure_circuit_breaker_active = True
+        self.stop_new_entries = True
+        self.run_valid = False
+        reason = (
+            f"{payload['outcome_classification']}:"
+            f"{payload['outcome_code']}:{stage}/{fingerprint}"
+        )
+        if reason not in self.run_invalid_reasons:
+            self.run_invalid_reasons.append(reason)
         self.logger.exception(
             "V2 isolated failure: %s", message,
             exc_info=(type(exc), exc, exc.__traceback__),
@@ -1313,6 +1369,101 @@ class V2Runtime:
                 "error_category": type(exc).__name__,
                 "processing_stage": stage, "source": source,
                 "traceback_fingerprint": fingerprint, "cycle_id": cycle_id,
+            },
+        )
+
+    def _record_non_failure_outcome(
+        self,
+        exc: RuntimeOutcomeError,
+        *,
+        stage: str,
+        cycle_id: str,
+        symbol: Symbol | None = None,
+        strategy: str | None = None,
+        source: str | None = None,
+        input_field: str | None = None,
+        execution_id: Any | None = None,
+    ) -> None:
+        outcome = exc.details
+        now = datetime.now(timezone.utc)
+        fingerprint = hashlib.sha256(
+            (
+                f"{self.run_id}:{outcome.classification.value}:{outcome.code}:"
+                f"{stage}:{symbol.value if symbol else ''}:"
+                f"{strategy or ''}:{execution_id or ''}"
+            ).encode()
+        ).hexdigest()[:24]
+        count = self.outcome_occurrences.get(fingerprint, 0) + 1
+        self.outcome_occurrences[fingerprint] = count
+        self._increment(
+            self.outcome_classification_counts,
+            outcome.classification.value,
+        )
+        self._increment(self.outcome_code_counts, outcome.code)
+        first_seen = self.outcome_first_seen.setdefault(
+            fingerprint, now.isoformat()
+        )
+        event_type = {
+            RuntimeOutcome.SAFE_DEGRADED: "V2_SAFE_DEGRADED",
+            RuntimeOutcome.EXPECTED_REJECTION: "V2_EXPECTED_REJECTION",
+            RuntimeOutcome.OBSERVABILITY_WARNING: "V2_OBSERVABILITY_WARNING",
+            RuntimeOutcome.SUCCESS: "V2_SUCCESS",
+        }[outcome.classification]
+        payload = {
+            "classification": outcome.classification.value,
+            "code": outcome.code,
+            "message": _sanitize_runtime_error(str(exc)),
+            "processing_stage": stage,
+            "cycle_id": cycle_id,
+            "symbol": symbol.value if symbol else None,
+            "strategy": strategy,
+            "source": source,
+            "relevant_input_field": input_field,
+            "first_seen_at": first_seen,
+            "last_seen_at": now.isoformat(),
+            "occurrence_count": count,
+            "exchange_mutation_attempted": outcome.exchange_mutation_attempted,
+            "evidence": outcome.evidence,
+        }
+        saved = self.repository.save_v2_incident(V2Incident(
+            id=uuid5(
+                NAMESPACE_URL,
+                f"bybot-v2-outcome:{self.run_id}:{fingerprint}",
+            ),
+            run_id=self.run_id,
+            event_type=event_type,
+            symbol=symbol,
+            execution_id=execution_id,
+            error_category=outcome.classification.value,
+            payload=payload,
+            occurred_at=now,
+        ))
+        if saved is False:
+            self._record_failure(
+                DataIntegrityCriticalOutcome(
+                    "typed runtime outcome persistence failed",
+                    code="RUNTIME_OUTCOME_PERSISTENCE_FAILED",
+                ),
+                stage="outcome_persistence",
+                cycle_id=cycle_id,
+                symbol=symbol,
+                strategy=strategy,
+            )
+            return
+        self.logger.warning(
+            "V2 %s: %s",
+            outcome.classification.value,
+            payload["message"],
+            extra={
+                "event_timestamp": now,
+                "run_id": self.run_id,
+                "strategy": strategy,
+                "symbol": symbol.value if symbol else None,
+                "event_type": event_type,
+                "execution_environment": "BYBIT_DEMO",
+                "error_category": outcome.code,
+                "processing_stage": stage,
+                "cycle_id": cycle_id,
             },
         )
 
@@ -1441,6 +1592,7 @@ class V2Runtime:
 
     def _runtime_metrics_payload(self) -> dict[str, Any]:
         drain_status = self._update_drain_state()
+        protection_metrics = self._protection_data_metrics()
         return {
             "run_valid": self.run_valid,
             "run_invalid_reasons": list(self.run_invalid_reasons),
@@ -1477,6 +1629,51 @@ class V2Runtime:
                 ),
             },
             "failure_occurrences": self.failure_occurrences,
+            "outcome_occurrences": self.outcome_occurrences,
+            "outcome_first_seen": self.outcome_first_seen,
+            "outcome_classification_counts": self.outcome_classification_counts,
+            "outcome_code_counts": self.outcome_code_counts,
+            "critical_classification_counts": self.critical_classification_counts,
+            "safety_critical_failures": int(
+                self.critical_classification_counts.get(
+                    RuntimeOutcome.SAFETY_CRITICAL.value, 0
+                )
+            ),
+            "data_integrity_failures": int(
+                self.critical_classification_counts.get(
+                    RuntimeOutcome.DATA_INTEGRITY_CRITICAL.value, 0
+                )
+            ),
+            "unexpected_cycle_failures": int(
+                self.critical_classification_counts.get(
+                    "UNEXPECTED_CYCLE_FAILURE", 0
+                )
+            ),
+            "safe_degraded_events": int(
+                self.outcome_classification_counts.get(
+                    RuntimeOutcome.SAFE_DEGRADED.value, 0
+                )
+            ),
+            "expected_rejections": int(
+                self.outcome_classification_counts.get(
+                    RuntimeOutcome.EXPECTED_REJECTION.value, 0
+                )
+            ) + sum(
+                int(self.signal_metrics.get(name) or 0)
+                for name in (
+                    "pre_submit_rejections",
+                    "portfolio_rejections",
+                    "execution_policy_rejections",
+                    "cooldown_rejections",
+                )
+            ),
+            "observability_warnings": int(
+                self.outcome_classification_counts.get(
+                    RuntimeOutcome.OBSERVABILITY_WARNING.value, 0
+                )
+            ),
+            "runtime_outcomes_by_code": dict(self.outcome_code_counts),
+            "certification_mode": self.settings.v2_certification_mode,
             "failure_circuit_breaker_active": self.failure_circuit_breaker_active,
             "external_dependency_health": self.dependency_health.snapshot(),
             "news_metrics": self.news_metrics,
@@ -1486,7 +1683,12 @@ class V2Runtime:
                 "critical_stale_data_incidents": self.features.stale_incidents,
                 "data_age_seconds_by_source": self._data_age_metrics(),
             },
-            "protection_data_metrics": self._protection_data_metrics(),
+            "protection_data_metrics": protection_metrics,
+            "unresolved_safe_degradations": len(
+                protection_metrics.get(
+                    "active_safe_degraded_executions", []
+                )
+            ),
             "liquidation_metrics": self._liquidation_metrics_at(
                 datetime.now(timezone.utc)
             ),
@@ -1531,7 +1733,9 @@ class V2Runtime:
         if callable(saver):
             saver(self.run_id, self._runtime_metrics_payload())
 
-    def _monitor_positions(self) -> None:
+    def _monitor_positions(
+        self, cycle_id: str = "manual-position-monitor"
+    ) -> None:
         prices: dict[Symbol, Decimal] = {}
         open_records: list[Any] = []
         for record in self.repository.load_demo_executions():
@@ -1565,27 +1769,40 @@ class V2Runtime:
                         "classified_as": "stale_feature_warning",
                     },
                 ))
-            self.execution.demo_execution.monitor_strategy_position(
-                str(record.id),
-                management_price,
-                market_price_at=management_price_at,
-                market_price_received_at=management_price_received_at,
-                market_price_source=management_price_source,
-                data_fresh=feature.fresh,
-                stale_feature="; ".join(feature.stale_reasons) or None,
-                stale_age_seconds=max(
-                    (
-                        float(item["observed_age_seconds"])
-                        for item in feature.stale_evidence
-                        if item.get("observed_age_seconds") is not None
+            try:
+                self.execution.demo_execution.monitor_strategy_position(
+                    str(record.id),
+                    management_price,
+                    market_price_at=management_price_at,
+                    market_price_received_at=management_price_received_at,
+                    market_price_source=management_price_source,
+                    data_fresh=feature.fresh,
+                    stale_feature="; ".join(feature.stale_reasons) or None,
+                    stale_age_seconds=max(
+                        (
+                            float(item["observed_age_seconds"])
+                            for item in feature.stale_evidence
+                            if item.get("observed_age_seconds") is not None
+                        ),
+                        default=None,
                     ),
-                    default=None,
-                ),
-                stale_exit_threshold_seconds=float(
-                    self.settings.v2_position_data_stale_exit_seconds
-                ),
-                setup_valid=self._position_setup_still_valid(record, feature),
-            )
+                    stale_exit_threshold_seconds=float(
+                        self.settings.v2_position_data_stale_exit_seconds
+                    ),
+                    setup_valid=self._position_setup_still_valid(record, feature),
+                )
+            except RuntimeOutcomeError as exc:
+                if exc.details.classification not in NON_FAILURE_OUTCOMES:
+                    raise
+                self._record_non_failure_outcome(
+                    exc,
+                    stage="position_monitoring",
+                    cycle_id=cycle_id,
+                    symbol=record.symbol,
+                    strategy=record.strategy_name,
+                    execution_id=record.id,
+                )
+                continue
         marker = getattr(self.portfolio, "mark_to_market", None)
         if callable(marker):
             marker(open_records, prices)
@@ -1682,6 +1899,7 @@ class V2Runtime:
     def _build_status_snapshot(self) -> dict[str, Any]:
         drain_status = self._update_drain_state()
         preflight = self.execution.safety_preflight(require_auto_execution=False)
+        protection_metrics = self._protection_data_metrics()
         active_reservations = [row for row in self.portfolio.reservations if row.state in self.portfolio.ACTIVE]
         accepted = [item.value for item in self.universe.accepted_symbols]
         symbols_attempted = sorted(
@@ -1750,6 +1968,46 @@ class V2Runtime:
             "strategy_not_applicable_counts": self.strategy_not_applicable_counts,
             "total_cycle_failures": sum(self.failure_occurrences.values()),
             "unique_cycle_failure_fingerprints": len(self.failure_occurrences),
+            "safety_critical_failures": int(
+                self.critical_classification_counts.get(
+                    RuntimeOutcome.SAFETY_CRITICAL.value, 0
+                )
+            ),
+            "data_integrity_failures": int(
+                self.critical_classification_counts.get(
+                    RuntimeOutcome.DATA_INTEGRITY_CRITICAL.value, 0
+                )
+            ),
+            "unexpected_cycle_failures": int(
+                self.critical_classification_counts.get(
+                    "UNEXPECTED_CYCLE_FAILURE", 0
+                )
+            ),
+            "safe_degraded_events": int(
+                self.outcome_classification_counts.get(
+                    RuntimeOutcome.SAFE_DEGRADED.value, 0
+                )
+            ),
+            "expected_rejections": int(
+                self.outcome_classification_counts.get(
+                    RuntimeOutcome.EXPECTED_REJECTION.value, 0
+                )
+            ) + sum(
+                int(self.signal_metrics.get(name) or 0)
+                for name in (
+                    "pre_submit_rejections",
+                    "portfolio_rejections",
+                    "execution_policy_rejections",
+                    "cooldown_rejections",
+                )
+            ),
+            "observability_warnings": int(
+                self.outcome_classification_counts.get(
+                    RuntimeOutcome.OBSERVABILITY_WARNING.value, 0
+                )
+            ),
+            "runtime_outcomes_by_code": dict(self.outcome_code_counts),
+            "certification_mode": self.settings.v2_certification_mode,
             "symbols_attempted": symbols_attempted,
             "symbols_successful": symbols_successful,
             "symbols_failed": sorted(set(symbols_attempted) - set(symbols_successful)),
@@ -1802,7 +2060,12 @@ class V2Runtime:
             "stale_rejections_by_symbol": self.stale_metrics["stale_rejections_by_symbol"],
             "stale_rejections_by_strategy": self.stale_metrics["stale_rejections_by_strategy"],
             "data_age_seconds_by_source": self._data_age_metrics(),
-            "protection_data_metrics": self._protection_data_metrics(),
+            "protection_data_metrics": protection_metrics,
+            "unresolved_safe_degradations": len(
+                protection_metrics.get(
+                    "active_safe_degraded_executions", []
+                )
+            ),
             "liquidation_strategy_metrics": self._liquidation_metrics_at(
                 datetime.now(timezone.utc)
             ),

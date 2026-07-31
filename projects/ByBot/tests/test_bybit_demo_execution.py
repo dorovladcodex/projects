@@ -1968,6 +1968,9 @@ def _trailing_record() -> DemoExecutionRecord:
         stop_loss_pct=Decimal("0.25"), take_profit_pct=Decimal("0.5"),
         trailing_stop_pct=Decimal("0.5"), break_even_at_r=Decimal("1"),
         protection_confirmed=True,
+        tp_order_id="cycle-139-tp",
+        sl_order_id="cycle-139-sl",
+        protection_position_idx=0,
     )
 
 
@@ -1997,6 +2000,41 @@ class ProtectionReplayClient(FakeDemoClient):
             return self._position("0.15483")
         stop = self.reflected_stops.pop(0) if len(self.reflected_stops) > 1 else self.reflected_stops[0]
         return self._position(stop)
+
+    def get_open_orders(self, symbol=None, settle_coin=None):
+        current_stop = (
+            self.reflected_stops[-1]
+            if self.mutated and self.reflected_stops
+            else "0.15483"
+        )
+        if current_stop is None:
+            return []
+        common = {
+            "symbol": "WIFUSDT",
+            "side": "Sell",
+            "reduceOnly": "true",
+            "closeOnTrigger": "true",
+            "positionIdx": 0,
+            "qty": "161",
+        }
+        return [
+            {
+                **common,
+                "orderId": "cycle-139-tp",
+                "stopOrderType": "TakeProfit",
+                "createType": "CreateByTakeProfit",
+                "triggerDirection": 1,
+                "triggerPrice": "0.15595",
+            },
+            {
+                **common,
+                "orderId": "cycle-139-sl",
+                "stopOrderType": "StopLoss",
+                "createType": "CreateByStopLoss",
+                "triggerDirection": 2,
+                "triggerPrice": "0.15483",
+            },
+        ]
 
     def set_trading_stop(self, symbol, take_profit, stop_loss):
         self.set_stop_calls.append((symbol, take_profit, stop_loss))
@@ -2225,6 +2263,8 @@ def _cycle_261_record(side: Side = Side.BUY) -> DemoExecutionRecord:
         break_even_at_r=Decimal("1"),
         protection_confirmed=True,
         protection_position_idx=0,
+        tp_order_id="cycle-261-tp",
+        sl_order_id="cycle-261-sl",
     )
 
 
@@ -2280,6 +2320,39 @@ class Cycle261ProtectionClient(FakeDemoClient):
             "trailingStop": "0",
             "positionIdx": 0,
         }]
+
+    def get_open_orders(self, symbol=None, settle_coin=None):
+        opposite = "Sell" if self.record.side == Side.BUY else "Buy"
+        common = {
+            "symbol": self.record.symbol.value,
+            "side": opposite,
+            "reduceOnly": "true",
+            "closeOnTrigger": "true",
+            "positionIdx": 0,
+            "qty": str(self.record.accepted_quantity),
+        }
+        return [
+            {
+                **common,
+                "orderId": "cycle-261-tp",
+                "stopOrderType": "TakeProfit",
+                "createType": "CreateByTakeProfit",
+                "triggerDirection": (
+                    1 if self.record.side == Side.BUY else 2
+                ),
+                "triggerPrice": str(self.record.take_profit),
+            },
+            {
+                **common,
+                "orderId": "cycle-261-sl",
+                "stopOrderType": "StopLoss",
+                "createType": "CreateByStopLoss",
+                "triggerDirection": (
+                    2 if self.record.side == Side.BUY else 1
+                ),
+                "triggerPrice": str(self.record.stop_loss),
+            },
+        ]
 
     def set_trading_stop(self, symbol, take_profit, stop_loss):
         self.set_stop_calls.append((symbol, take_profit, stop_loss))
@@ -2542,6 +2615,9 @@ def _cycle_99_record() -> DemoExecutionRecord:
         trailing_stop_pct=Decimal("0.2"),
         break_even_at_r=Decimal("1"),
         protection_confirmed=True,
+        tp_order_id="cycle-99-tp",
+        sl_order_id="cycle-99-sl",
+        protection_position_idx=0,
         fills=[
             DemoFill(
                 execution_id="cycle-99-entry-exec",
@@ -2600,7 +2676,34 @@ class Cycle99FlatProtectionClient(FakeDemoClient):
         }]
 
     def get_open_orders(self, symbol=None, settle_coin=None):
-        return []
+        if self.closed:
+            return []
+        common = {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "reduceOnly": "true",
+            "closeOnTrigger": "true",
+            "positionIdx": 0,
+            "qty": "0.001",
+        }
+        return [
+            {
+                **common,
+                "orderId": "cycle-99-tp",
+                "stopOrderType": "TakeProfit",
+                "createType": "CreateByTakeProfit",
+                "triggerDirection": 1,
+                "triggerPrice": "65100",
+            },
+            {
+                **common,
+                "orderId": "cycle-99-sl",
+                "stopOrderType": "StopLoss",
+                "createType": "CreateByStopLoss",
+                "triggerDirection": 2,
+                "triggerPrice": "64900",
+            },
+        ]
 
     def set_trading_stop(self, symbol, take_profit, stop_loss):
         self.set_stop_calls += 1
@@ -2857,7 +2960,7 @@ def test_cycle_99_any_remote_open_order_blocks_terminalization_handoff() -> None
     class OpenOrderClient(Cycle99FlatProtectionClient):
         def get_open_orders(self, symbol=None, settle_coin=None):
             if not self.closed:
-                return []
+                return super().get_open_orders(symbol, settle_coin)
             return [{
                 "symbol": "BTCUSDT",
                 "orderId": "manual-unrelated",
