@@ -194,9 +194,22 @@ def test_alive_uvicorn_without_listener_is_restarted() -> None:
     )[1]
     loop = main.split(
         "while ([DateTime]::UtcNow -lt $deadline)", 1
-    )[1].split("$null = Invoke-RestMethod \"$base/v2/stop-new-entries\"", 1)[0]
+    )[1].split("$status = Request-StopNewEntriesBounded", 1)[0]
 
     assert "Assert-SingleUvicornOwner -ExpectedPid $script:process.Id" in loop
     assert "$restartReason = 'listener ownership lost'" in loop
     assert "Wait-UvicornReady -Process $script:process -BaseUrl $base" in loop
     assert "restarting with the same durable run_id" in loop
+
+
+def test_stop_new_entries_uses_bounded_idempotent_phase_confirmation() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    body = source.split("function Request-StopNewEntriesBounded", 1)[1].split(
+        "function Invoke-FinalValidation", 1
+    )[0]
+
+    assert "[int]$MaxAttempts = 3" in body
+    assert "'/v2/stop-new-entries'" in body
+    assert "'/v2/status'" in body
+    assert "'DRAINING', 'RECONCILING', 'FINISHED'" in body
+    assert "STOP NEW ENTRIES could not be confirmed" in body

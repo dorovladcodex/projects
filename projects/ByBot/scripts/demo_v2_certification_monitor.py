@@ -164,6 +164,68 @@ def main() -> int:
                 ),
                 protection_timeout_seconds=args.protection_timeout_seconds,
             )
+            if durable_finished_shutdown_ready(
+                durable_runtime=durable_runtime,
+                active=active,
+                evidence=fallback,
+            ):
+                records = [
+                    item for item in repository.load_demo_executions()
+                    if item.run_id == args.run_id
+                ]
+                completed = [
+                    item for item in records
+                    if item.state.value in TERMINAL_STATES
+                ]
+                warnings = int(
+                    durable_runtime.get("safe_degraded_events") or 0
+                ) + int(durable_runtime.get("observability_warnings") or 0)
+                snapshot = {
+                    "timestamp": now.isoformat(),
+                    "phase": "FINISHED",
+                    "runner_alive": runner_alive,
+                    "uvicorn_alive": uvicorn_alive,
+                    "port_listening": listener,
+                    "monitor_state": "HEALTHY",
+                    "status_available": False,
+                    "normal_finalized_shutdown": True,
+                    "active_executions": 0,
+                    "completed_executions": len(completed),
+                    "remote_positions": 0,
+                    "remote_orders": 0,
+                    "cycle_failures": 0,
+                    "safety_critical_failures": int(
+                        durable_runtime.get("safety_critical_failures") or 0
+                    ),
+                    "data_integrity_failures": int(
+                        durable_runtime.get("data_integrity_failures") or 0
+                    ),
+                    "unexpected_cycle_failures": int(
+                        durable_runtime.get("unexpected_cycle_failures") or 0
+                    ),
+                    "safe_degraded_events": int(
+                        durable_runtime.get("safe_degraded_events") or 0
+                    ),
+                    "persistence_status": "OK",
+                    "durable_pnl": decimal_sum(
+                        item.realized_exchange_pnl for item in completed
+                    ),
+                    "authoritative_pnl": decimal_sum(
+                        item.authoritative_closed_pnl for item in completed
+                    ),
+                    "blockers": [],
+                }
+                write_jsonl(samples_path, snapshot)
+                write_jsonl(events_path, snapshot)
+                write_json(result_path, {
+                    "result": "PASS_WITH_WARNINGS" if warnings else "PASS",
+                    "run_phase": "FINISHED",
+                    "polls": polls + 1,
+                    "deep_events": deep_events + 1,
+                    "final": snapshot,
+                    "monitor_health": health.snapshot(now=now),
+                })
+                return 0
             decision = health.record_status_failure(
                 now=now,
                 evidence=fallback,
@@ -471,6 +533,40 @@ def durable_fallback(
         if item.run_id == run_id and item.state.value not in TERMINAL_STATES
     ]
     return bool(runtime), records, runtime
+
+
+def durable_finished_shutdown_ready(
+    *,
+    durable_runtime: dict[str, Any],
+    active: list[Any],
+    evidence: StatusFallbackEvidence,
+) -> bool:
+    """Accept endpoint loss only after durable FINISHED and authoritative flat."""
+    finalization = durable_runtime.get("run_finalization") or {}
+    if str(finalization.get("phase") or "") != "FINISHED":
+        return False
+    if active or not evidence.persistence_ok:
+        return False
+    if not evidence.authoritative_check_complete:
+        return False
+    if evidence.kill_switch_active:
+        return False
+    if (
+        evidence.executions
+        or evidence.unrelated_positions
+        or evidence.unrelated_orders
+        or evidence.ownership_conflicts
+    ):
+        return False
+    if int(durable_runtime.get("safety_critical_failures") or 0):
+        return False
+    if int(durable_runtime.get("data_integrity_failures") or 0):
+        return False
+    if int(durable_runtime.get("unexpected_cycle_failures") or 0):
+        return False
+    if int(durable_runtime.get("unresolved_safe_degradations") or 0):
+        return False
+    return True
 
 
 def collect_status_fallback_evidence(

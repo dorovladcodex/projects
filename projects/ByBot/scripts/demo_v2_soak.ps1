@@ -385,6 +385,53 @@ function Assert-AuthoritativeOrderOwnership {
     }
 }
 
+function Request-StopNewEntriesBounded {
+    param(
+        [string]$BaseUrl,
+        [System.Diagnostics.Process]$Process,
+        [int]$MaxAttempts = 3
+    )
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        if ($Process.HasExited) {
+            throw 'FastAPI exited before stop-new-entries was confirmed.'
+        }
+        try {
+            $response = Invoke-RestMethod `
+                ($BaseUrl + '/v2/stop-new-entries') -Method Post -TimeoutSec 5
+            if ([string]$response.run_phase -in @(
+                'DRAINING', 'RECONCILING', 'FINISHED'
+            )) {
+                return $response
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+            Write-Warning (
+                'STOP NEW ENTRIES request did not return authoritatively; ' +
+                'checking durable runtime phase. attempt=' + $attempt
+            )
+        }
+        try {
+            $status = Invoke-RestMethod `
+                ($BaseUrl + '/v2/status') -TimeoutSec 5
+            if ([string]$status.run_phase -in @(
+                'DRAINING', 'RECONCILING', 'FINISHED'
+            )) {
+                return $status
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+        }
+        if ($attempt -lt $MaxAttempts) {
+            Start-Sleep -Seconds 2
+        }
+    }
+    throw (
+        'STOP NEW ENTRIES could not be confirmed after ' + $MaxAttempts +
+        ' bounded attempts: ' + $lastError
+    )
+}
+
 function Invoke-FinalValidation {
     if ($script:finalValidationRan) { return }
     $script:finalValidationRan = $true
@@ -514,7 +561,8 @@ try {
             } catch { Write-Warning 'Transient status failure; durable reconciliation remains authoritative.' }
         }
 
-        $null = Invoke-RestMethod "$base/v2/stop-new-entries" -Method Post -TimeoutSec 5
+        $status = Request-StopNewEntriesBounded `
+            -BaseUrl $base -Process $script:process
         $drainComplete = $false
         $drainTimedOut = $false
         $drainBlockers = @()

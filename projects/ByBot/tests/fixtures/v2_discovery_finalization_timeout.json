@@ -1,0 +1,20 @@
+{
+  "run_id": "demo-v2-20260731T063201928Z",
+  "incident_at": "2026-08-01T06:32:38Z",
+  "durable_phase": "FINISHED",
+  "runner_alive_at_monitor_decision": true,
+  "uvicorn_alive_at_monitor_decision": false,
+  "port_listening": false,
+  "active_executions": 0,
+  "remote_positions": 0,
+  "remote_orders": 0,
+  "unresolved_executions": 0,
+  "safety_critical_failures": 0,
+  "data_integrity_failures": 0,
+  "unexpected_cycle_failures": 0,
+  "durable_pnl": "-8.63260436",
+  "authoritative_pnl": "-8.63260436",
+  "old_monitor_result": "FAIL",
+  "expected_monitor_result": "PASS",
+  "runner_error": "stop-new-entries request timed out after durable FINISHED"
+}

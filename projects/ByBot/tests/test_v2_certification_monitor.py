@@ -18,6 +18,7 @@ from app.v2.certification_monitor import (
 )
 from scripts.demo_v2_certification_monitor import (
     collect_status_fallback_evidence,
+    durable_finished_shutdown_ready,
     runtime_blockers,
 )
 from scripts.demo_v2_protection_pending_canary import decimal_duration_ms
@@ -129,6 +130,70 @@ def test_safe_degradation_is_not_a_monitor_blocker() -> None:
         "ownership_conflicts": 0,
     }
     assert runtime_blockers(v2, demo, []) == []
+
+
+def test_durable_finished_flat_shutdown_is_not_fail_fast() -> None:
+    case = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "v2_discovery_finalization_timeout.json"
+        ).read_text(encoding="utf-8")
+    )
+    runtime = {
+        "run_finalization": {"phase": case["durable_phase"]},
+        "safety_critical_failures": case["safety_critical_failures"],
+        "data_integrity_failures": case["data_integrity_failures"],
+        "unexpected_cycle_failures": case["unexpected_cycle_failures"],
+        "unresolved_safe_degradations": 0,
+    }
+    fallback = evidence(
+        runner=case["runner_alive_at_monitor_decision"],
+        uvicorn=case["uvicorn_alive_at_monitor_decision"],
+        listener=case["port_listening"],
+    )
+
+    assert durable_finished_shutdown_ready(
+        durable_runtime=runtime,
+        active=[SimpleNamespace(id="active")] * case["active_executions"],
+        evidence=fallback,
+    )
+    assert case["durable_pnl"] == case["authoritative_pnl"]
+    assert case["expected_monitor_result"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("phase", "active", "unrelated_orders", "complete"),
+    [
+        ("DRAINING", [], 0, True),
+        ("FINISHED", [SimpleNamespace(id="active")], 0, True),
+        ("FINISHED", [], 1, True),
+        ("FINISHED", [], 0, False),
+    ],
+)
+def test_nonfinal_or_ambiguous_shutdown_remains_fail_closed(
+    phase, active, unrelated_orders, complete
+) -> None:
+    runtime = {
+        "run_finalization": {"phase": phase},
+        "safety_critical_failures": 0,
+        "data_integrity_failures": 0,
+        "unexpected_cycle_failures": 0,
+        "unresolved_safe_degradations": 0,
+    }
+    fallback = evidence(
+        runner=True,
+        uvicorn=False,
+        listener=False,
+        unrelated_orders=unrelated_orders,
+        complete=complete,
+    )
+
+    assert not durable_finished_shutdown_ready(
+        durable_runtime=runtime,
+        active=active,
+        evidence=fallback,
+    )
 
 
 @pytest.mark.parametrize(
