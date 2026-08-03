@@ -166,6 +166,35 @@ def analyze_demo_v2_run(
         for name in ("summary.json", "runner-report.json")
         if (run_dir / name).exists()
     }
+    run_state_loader = getattr(repo, "load_v2_run_state", None)
+    durable_run_state = (
+        dict(run_state_loader(run_id) or {})
+        if callable(run_state_loader)
+        else {}
+    )
+    durable_runtime = dict(durable_run_state.get("runtime") or {})
+    artifact_run_phase = next((
+        value.get("run_phase")
+        or (value.get("run_finalization") or {}).get("phase")
+        for value in artifact_inputs.values()
+        if isinstance(value, dict)
+        and (
+            value.get("run_phase")
+            or (value.get("run_finalization") or {}).get("phase")
+        )
+    ), None)
+    artifact_cycle_failures = next((
+        value.get("total_cycle_failures")
+        for value in artifact_inputs.values()
+        if isinstance(value, dict)
+        and value.get("total_cycle_failures") is not None
+    ), None)
+    durable_run_phase = (
+        (durable_runtime.get("run_finalization") or {}).get("phase")
+        or durable_runtime.get("run_phase")
+        or durable_run_state.get("status")
+    )
+    durable_cycle_failures = _durable_cycle_failures(durable_runtime)
 
     recovery_rows: list[dict[str, Any]] = []
     for record in unresolved:
@@ -297,22 +326,24 @@ def analyze_demo_v2_run(
         "remote_unrelated_open_orders": len(diagnostics.unrelated_open_orders),
         "diagnostics_passed": diagnostics.passed,
         "artifact_inputs_found": sorted(artifact_inputs),
-        "artifact_run_phase": next((
-            value.get("run_phase")
-            or (value.get("run_finalization") or {}).get("phase")
-            for value in artifact_inputs.values()
-            if isinstance(value, dict)
-            and (
-                value.get("run_phase")
-                or (value.get("run_finalization") or {}).get("phase")
-            )
-        ), None),
-        "artifact_cycle_failures": next((
-            value.get("total_cycle_failures")
-            for value in artifact_inputs.values()
-            if isinstance(value, dict)
-            and value.get("total_cycle_failures") is not None
-        ), None),
+        "artifact_run_phase": artifact_run_phase or durable_run_phase,
+        "artifact_cycle_failures": (
+            artifact_cycle_failures
+            if artifact_cycle_failures is not None
+            else durable_cycle_failures
+        ),
+        "run_phase_source": (
+            "artifact" if artifact_run_phase is not None
+            else "durable_v2_runs" if durable_run_phase is not None
+            else None
+        ),
+        "cycle_failures_source": (
+            "artifact" if artifact_cycle_failures is not None
+            else "durable_v2_runs"
+            if durable_cycle_failures is not None
+            else None
+        ),
+        "durable_run_state_found": bool(durable_run_state),
     }
     summary = {
         **status,
@@ -364,6 +395,23 @@ def _read_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, json.JSONDecodeError) as exc:
         return {"artifact_read_error": type(exc).__name__}
+
+
+def _durable_cycle_failures(runtime: dict[str, Any]) -> int | None:
+    value = runtime.get("total_cycle_failures")
+    if value is not None:
+        return int(value)
+    occurrences = runtime.get("failure_occurrences")
+    if isinstance(occurrences, dict):
+        return sum(int(count or 0) for count in occurrences.values())
+    metrics = runtime.get("symbol_cycle_metrics")
+    if isinstance(metrics, dict):
+        return sum(
+            int((item or {}).get("cycles_failed") or 0)
+            for item in metrics.values()
+            if isinstance(item, dict)
+        )
+    return None
 
 
 def _weighted_execution_price(rows: list[dict[str, Any]]) -> Decimal:

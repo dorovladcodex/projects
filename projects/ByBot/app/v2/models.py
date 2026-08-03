@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ExecutionEnvironment, Symbol
 
@@ -246,6 +246,13 @@ class PreSubmitRejectionAudit(BaseModel):
     reservation_id: UUID | None = None
     reservation_release_result: str | None = None
     rejected_at: datetime
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def normalize_legacy_code(cls, value: Any) -> Any:
+        if value == "FINAL_MARKET_DATA_STALE":
+            return PreSubmitRejectionCode.PRE_SUBMIT_MARKET_DATA_STALE
+        return value
 
 
 class V2SignalCandidate(BaseModel):
