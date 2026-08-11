@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
@@ -551,39 +552,42 @@ def evaluate_hypothetical_touch(
     trades: Sequence[tuple[datetime, Decimal]],
     midpoints: Sequence[tuple[datetime, Decimal]],
     endpoint_tolerance_seconds: int = 3,
+    paths_sorted: bool = False,
 ) -> HypotheticalTouchOutcome:
     cutoff = quote.quote_time + timedelta(seconds=horizon_seconds)
-    eligible = sorted(
-        (
-            (timestamp, price) for timestamp, price in trades
-            if quote.quote_time < timestamp <= cutoff
-        ),
-        key=lambda item: item[0],
+    trade_path = list(trades) if paths_sorted else sorted(trades, key=lambda item: item[0])
+    midpoint_path = (
+        list(midpoints) if paths_sorted else sorted(midpoints, key=lambda item: item[0])
     )
+    trade_times = [row[0] for row in trade_path]
+    midpoint_times = [row[0] for row in midpoint_path]
+    eligible = trade_path[
+        bisect_right(trade_times, quote.quote_time):bisect_right(trade_times, cutoff)
+    ]
     if quote.side == "BUY":
         touches = [row for row in eligible if row[1] <= quote.quote_price]
     else:
         touches = [row for row in eligible if row[1] >= quote.quote_price]
     touch = touches[0] if touches else None
-    horizon_endpoint = next(
-        (
-            (timestamp, mid) for timestamp, mid in sorted(midpoints)
-            if timestamp >= cutoff
-            and (timestamp - cutoff).total_seconds() <= endpoint_tolerance_seconds
-        ),
-        None,
+    endpoint_index = bisect_left(midpoint_times, cutoff)
+    horizon_endpoint = (
+        midpoint_path[endpoint_index]
+        if endpoint_index < len(midpoint_path)
+        and (midpoint_path[endpoint_index][0] - cutoff).total_seconds()
+        <= endpoint_tolerance_seconds
+        else None
     )
     complete = evaluated_at >= cutoff and horizon_endpoint is not None
     markout = None
     if touch is not None:
         markout_target = touch[0] + timedelta(seconds=horizon_seconds)
-        endpoint = next(
-            (
-                (timestamp, mid) for timestamp, mid in sorted(midpoints)
-                if timestamp >= markout_target
-                and (timestamp - markout_target).total_seconds() <= endpoint_tolerance_seconds
-            ),
-            None,
+        markout_index = bisect_left(midpoint_times, markout_target)
+        endpoint = (
+            midpoint_path[markout_index]
+            if markout_index < len(midpoint_path)
+            and (midpoint_path[markout_index][0] - markout_target).total_seconds()
+            <= endpoint_tolerance_seconds
+            else None
         )
         if endpoint is not None:
             direction = ONE if quote.side == "BUY" else Decimal("-1")

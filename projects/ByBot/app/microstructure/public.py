@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 from statistics import pstdev
 from threading import RLock
+import time
 from typing import Any, Callable, Sequence
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -502,12 +504,17 @@ def refresh_market_state(
     symbols: Sequence[str],
     *,
     stale_book_seconds: float = 15,
+    stage_timings_ms: dict[str, float] | None = None,
 ) -> dict[str, str]:
     now = utc_now()
     failures: dict[str, str] = {}
+    rest_ms = 0.0
+    oi_ms = 0.0
     try:
+        started = time.perf_counter()
         spot_rows, spot_at = client.tickers("spot")
         linear_rows, linear_at = client.tickers("linear")
+        rest_ms += (time.perf_counter() - started) * 1000
         maps = {
             "spot": {str(row.get("symbol")): row for row in spot_rows},
             "linear": {str(row.get("symbol")): row for row in linear_rows},
@@ -519,7 +526,9 @@ def refresh_market_state(
                     state.ingest_ticker(category, symbol, row, timestamp, now)
                 age = state.book_age_seconds(category, symbol, now)
                 if age is None or age > stale_book_seconds:
+                    started = time.perf_counter()
                     book = client.orderbook(category, symbol)
+                    rest_ms += (time.perf_counter() - started) * 1000
                     book_at = _millisecond_time(book.get("cts") or book.get("ts")) or now
                     state.ingest_orderbook(
                         category, symbol, book.get("b") or [], book.get("a") or [],
@@ -527,11 +536,26 @@ def refresh_market_state(
                         update_id=int(book["u"]) if book.get("u") is not None else None,
                         sequence=int(book["seq"]) if book.get("seq") is not None else None,
                     )
-            oi, oi_at = client.open_interest(symbol)
-            if oi is not None and oi_at is not None:
-                state.ingest_open_interest(symbol, oi, oi_at)
+        oi_started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=max(1, min(5, len(symbols)))) as executor:
+            futures = {
+                executor.submit(client.open_interest, symbol): symbol
+                for symbol in symbols
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    oi, oi_at = future.result()
+                    if oi is not None and oi_at is not None:
+                        state.ingest_open_interest(symbol, oi, oi_at)
+                except Exception as exc:
+                    failures[f"oi:{symbol}"] = type(exc).__name__
+        oi_ms += (time.perf_counter() - oi_started) * 1000
     except Exception as exc:
         failures["global"] = type(exc).__name__
+    if stage_timings_ms is not None:
+        stage_timings_ms["required_rest_refresh_ms"] = rest_ms
+        stage_timings_ms["oi_refresh_ms"] = oi_ms
     return failures
 
 

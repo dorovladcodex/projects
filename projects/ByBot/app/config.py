@@ -144,6 +144,15 @@ class Settings(BaseSettings):
     v5_spot_taker_fee_bps: Decimal | None = Field(default=None, ge=0)
     v5_perp_maker_fee_bps: Decimal | None = Field(default=None, ge=0)
     v5_perp_taker_fee_bps: Decimal | None = Field(default=None, ge=0)
+    v5_fee_source: str | None = None
+    v5_fee_schedule: str | None = None
+    # This optional schedule is research-only and can never replace the active
+    # account fees above.  It remains disabled unless explicitly requested.
+    v5_mnt_discount_scenario_enabled: bool = False
+    v5_mnt_spot_maker_fee_bps: Decimal = Field(default=Decimal("7.5"), ge=0)
+    v5_mnt_spot_taker_fee_bps: Decimal = Field(default=Decimal("7.5"), ge=0)
+    v5_mnt_perp_maker_fee_bps: Decimal = Field(default=Decimal("1.8"), ge=0)
+    v5_mnt_perp_taker_fee_bps: Decimal = Field(default=Decimal("4.95"), ge=0)
     v5_spot_borrow_apr_bps: Decimal | None = Field(default=None, ge=0)
     # Isolated public-market telemetry. This collector has no execution path.
     microstructure_capture_cadence_seconds: int = Field(default=10, ge=1, le=300)

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Lock
+from time import perf_counter
 from typing import Any, Callable, Sequence
 
 from app.config import Settings
@@ -28,6 +31,20 @@ from app.microstructure.public import (
 from app.microstructure.storage import MicrostructureStorage, write_json_atomic
 from app.v5.models import CarryLabel, CarryOpportunity, DataAvailability, FundingPayment
 from app.v5.research import CarryPathPoint, build_carry_label
+
+
+FUTURE_LABEL_HORIZONS: tuple[tuple[str, timedelta | int], ...] = (
+    ("12h", timedelta(hours=12)),
+    ("24h", timedelta(hours=24)),
+    ("48h", timedelta(hours=48)),
+    ("72h", timedelta(hours=72)),
+    ("1_funding_interval", 1),
+    ("2_funding_intervals", 2),
+    ("3_funding_intervals", 3),
+    ("6_funding_intervals", 6),
+)
+MAKER_BATCH_SIZE = 1_000
+LABEL_BATCH_SIZE = 256
 
 
 def utc_now() -> datetime:
@@ -71,6 +88,9 @@ class CollectorConfiguration:
     public_rest_url: str
     candidate_symbols: tuple[str, ...]
     account_fees_bps: dict[str, Decimal | None]
+    fee_source: str | None
+    fee_schedule: str | None
+    offline_fee_scenarios: dict[str, Any]
 
     @classmethod
     def from_settings(cls, settings: Settings, root: Path) -> "CollectorConfiguration":
@@ -103,6 +123,30 @@ class CollectorConfiguration:
                 "perp_maker": settings.v5_perp_maker_fee_bps,
                 "perp_taker": settings.v5_perp_taker_fee_bps,
             },
+            fee_source=settings.v5_fee_source,
+            fee_schedule=settings.v5_fee_schedule,
+            offline_fee_scenarios={
+                "MNT_DISCOUNT_SCENARIO": {
+                    "enabled_for_offline_research": (
+                        settings.v5_mnt_discount_scenario_enabled
+                    ),
+                    "authoritative_account_rate": False,
+                    "fees": {
+                        "spot_maker_fee_bps": str(
+                            settings.v5_mnt_spot_maker_fee_bps
+                        ),
+                        "spot_taker_fee_bps": str(
+                            settings.v5_mnt_spot_taker_fee_bps
+                        ),
+                        "perp_maker_fee_bps": str(
+                            settings.v5_mnt_perp_maker_fee_bps
+                        ),
+                        "perp_taker_fee_bps": str(
+                            settings.v5_mnt_perp_taker_fee_bps
+                        ),
+                    },
+                }
+            },
         )
 
     def public_payload(self) -> dict[str, Any]:
@@ -134,15 +178,87 @@ class CollectorConfiguration:
         }
         return {
             "source": "MANUALLY_CONFIGURABLE_ACCOUNT_SPECIFIC_SETTINGS",
+            "fee_source": self.fee_source or "UNCONFIRMED",
+            "fee_schedule": self.fee_schedule or "UNCONFIRMED",
             "status": (
                 "CONFIGURED"
                 if all(value is not None for value in self.account_fees_bps.values())
                 else "UNKNOWN"
             ),
             "fees": values,
+            "offline_research_scenarios": self.offline_fee_scenarios,
             "public_fee_schedule_substituted": False,
             "legacy_directional_cost_substituted": False,
         }
+
+
+class StageTimingMetrics:
+    """Low-overhead, bounded in-memory stage timing distribution."""
+
+    def __init__(self, max_samples: int = 10_000) -> None:
+        self._samples: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=max_samples)
+        )
+        self._last: dict[str, float] = {}
+        self._lock = Lock()
+
+    def record(self, name: str, milliseconds: float) -> None:
+        with self._lock:
+            value = max(0.0, float(milliseconds))
+            self._samples[name].append(value)
+            self._last[name] = value
+
+    def snapshot(self) -> dict[str, dict[str, float | int | None]]:
+        with self._lock:
+            copied = {name: sorted(values) for name, values in self._samples.items()}
+            last = dict(self._last)
+        return {
+            name: {
+                "count": len(values),
+                "p50": _float_percentile(values, 0.50),
+                "p90": _float_percentile(values, 0.90),
+                "p95": _float_percentile(values, 0.95),
+                "p99": _float_percentile(values, 0.99),
+                "max": values[-1] if values else None,
+                "last": last.get(name),
+            }
+            for name, values in copied.items()
+        }
+
+
+def advance_fixed_deadline(deadline: float, current: float, cadence: float) -> float:
+    """Advance to the first future slot without replaying missed snapshots."""
+    if cadence <= 0:
+        raise ValueError("cadence must be positive")
+    candidate = deadline + cadence
+    if candidate <= current:
+        missed = int((current - candidate) // cadence) + 1
+        candidate += missed * cadence
+    return candidate
+
+
+async def _wait_until(stop_event: asyncio.Event, deadline: float) -> bool:
+    timeout = max(0.0, deadline - asyncio.get_running_loop().time())
+    if timeout == 0:
+        return not stop_event.is_set()
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=timeout)
+        return False
+    except asyncio.TimeoutError:
+        return True
+
+
+async def _next_worker_signal(
+    queue: asyncio.Queue[None], stop_event: asyncio.Event,
+) -> bool:
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(queue.get(), timeout=0.5)
+            queue.task_done()
+            return True
+        except asyncio.TimeoutError:
+            continue
+    return False
 
 
 class MicrostructureCollector:
@@ -170,6 +286,26 @@ class MicrostructureCollector:
         self.last_funding_failures: dict[str, str] = {}
         self.initialized_at: datetime | None = None
         self._closed = False
+        self.timings = StageTimingMetrics()
+        self._worker_queues: dict[str, asyncio.Queue[None]] = {}
+        self._worker_storages: dict[str, MicrostructureStorage] = {}
+        self._worker_stats: dict[str, dict[str, Any]] = {
+            "maker": {
+                "pending_count": 0, "processed_count": 0,
+                "last_processed_count": 0, "coalesced_wakeups": 0,
+            },
+            "label": {
+                "pending_count": 0, "processed_count": 0,
+                "last_processed_count": 0, "coalesced_wakeups": 0,
+            },
+            "maintenance": {
+                "pending_count": 0, "processed_count": 0,
+                "last_processed_count": 0, "coalesced_wakeups": 0,
+            },
+        }
+        self._last_capture_started_monotonic: float | None = None
+        self._last_capture_interval_seconds: float | None = None
+        self._last_capture_lateness_seconds = 0.0
 
     def initialize(self) -> dict[str, Any]:
         self._write_static_artifacts()
@@ -203,8 +339,13 @@ class MicrostructureCollector:
         }
 
     def capture_once(self, *, completed_at: datetime | None = None) -> dict[str, int]:
+        capture_started = perf_counter()
+        assembly_ms = 0.0
+        persistence_ms = 0.0
         counts = {"captures": 0, "complete": 0, "costs": 0, "quotes": 0}
+        at = completed_at or self.now()
         for symbol in self.symbols:
+            stage_started = perf_counter()
             spot = self.state.snapshot("spot", symbol)
             perpetual = self.state.snapshot("linear", symbol)
             receipt_times = [
@@ -222,6 +363,8 @@ class MicrostructureCollector:
                 max_source_age_ms=self.config.maximum_source_age_ms,
                 max_sync_gap_ms=self.config.maximum_sync_gap_ms,
             )
+            assembly_ms += (perf_counter() - stage_started) * 1000
+            stage_started = perf_counter()
             if prior is not None:
                 gap_seconds = (at - prior).total_seconds()
                 if gap_seconds > self.config.capture_cadence_seconds * 3:
@@ -247,26 +390,57 @@ class MicrostructureCollector:
                 counts["costs"] += int(self.storage.save_taker_cost(cost, at))
             for quote in hypothetical_quotes(snapshot):
                 counts["quotes"] += int(self.storage.save_quote(quote))
+            persistence_ms += (perf_counter() - stage_started) * 1000
         self.capture_cycles += 1
         self.storage.set_state("last_capture_cycle_at", at)
         self.storage.set_state("capture_cycles", self.capture_cycles)
+        self.timings.record("snapshot_assembly_ms", assembly_ms)
+        self.timings.record("snapshot_persistence_ms", persistence_ms)
+        self.timings.record("capture_total_ms", (perf_counter() - capture_started) * 1000)
         return counts
 
-    def refresh_rest(self) -> dict[str, str]:
-        failures = refresh_market_state(self.client, self.state, self.symbols)
-        try:
-            self.clock_offset_ms, self.clock_round_trip_ms = self.client.clock_offset_ms()
-        except Exception as exc:
-            failures["clock"] = type(exc).__name__
+    def refresh_rest(
+        self, *, storage: MicrostructureStorage | None = None,
+    ) -> dict[str, str]:
+        store = storage or self.storage
+        stage_timings: dict[str, float] = {}
+        started = perf_counter()
+        failures = refresh_market_state(
+            self.client,
+            self.state,
+            self.symbols,
+            stage_timings_ms=stage_timings,
+        )
+        total_ms = (perf_counter() - started) * 1000
+        self.timings.record("required_rest_refresh_ms", total_ms)
+        self.timings.record(
+            "oi_refresh_ms", stage_timings.get("oi_refresh_ms", 0.0)
+        )
         self.last_rest_failures = failures
-        self.storage.set_state("last_rest_refresh", {
+        store.set_state("last_rest_refresh", {
             "at": self.now(), "failures": failures,
             "clock_offset_ms": self.clock_offset_ms,
             "clock_round_trip_ms": self.clock_round_trip_ms,
         })
         return failures
 
-    def refresh_funding_events(self) -> dict[str, int]:
+    def refresh_clock_diagnostic(self) -> bool:
+        started = perf_counter()
+        success = True
+        try:
+            self.clock_offset_ms, self.clock_round_trip_ms = self.client.clock_offset_ms()
+            self.last_rest_failures.pop("clock", None)
+        except Exception as exc:
+            self.last_rest_failures["clock"] = type(exc).__name__
+            success = False
+        self.timings.record("clock_diagnostic_ms", (perf_counter() - started) * 1000)
+        return success
+
+    def refresh_funding_events(
+        self, *, storage: MicrostructureStorage | None = None,
+    ) -> dict[str, int]:
+        store = storage or self.storage
+        started = perf_counter()
         observed_at = self.now()
         inserted = 0
         failures: dict[str, str] = {}
@@ -281,7 +455,7 @@ class MicrostructureCollector:
                     context_at = timestamp - timedelta(
                         milliseconds=float(self.clock_offset_ms or Decimal("0"))
                     )
-                    context = self.storage.capture_at_or_before(symbol, context_at)
+                    context = store.capture_at_or_before(symbol, context_at)
                     complete_context = bool(
                         context is not None
                         and context.spot is not None
@@ -321,59 +495,91 @@ class MicrostructureCollector:
                             if complete_context else CoverageState.PARTIAL
                         ),
                     )
-                    inserted += int(self.storage.save_funding_event(event))
+                    inserted += int(store.save_funding_event(event))
             except Exception as exc:
                 failures[symbol] = type(exc).__name__
         self.last_funding_failures = failures
-        self.storage.set_state("last_funding_refresh", {
+        store.set_state("last_funding_refresh", {
             "at": observed_at, "inserted": inserted, "failures": failures,
         })
+        self.timings.record("funding_history_ms", (perf_counter() - started) * 1000)
         return {"inserted": inserted, "failures": len(failures)}
 
-    def evaluate_maker_telemetry(self, *, evaluated_at: datetime | None = None) -> int:
+    def evaluate_maker_telemetry(
+        self,
+        *,
+        evaluated_at: datetime | None = None,
+        batch_limit: int = MAKER_BATCH_SIZE,
+        storage: MicrostructureStorage | None = None,
+    ) -> int:
+        store = storage or self.storage
         at = evaluated_at or self.now()
-        quotes = self.storage.recent_quotes(at - timedelta(seconds=130))
+        work = store.pending_maker_work(
+            evaluated_at=at,
+            horizons_seconds=TOUCH_HORIZONS_SECONDS,
+            limit=batch_limit,
+        )
+        grouped: dict[
+            tuple[str, str], list[tuple[Any, int]]
+        ] = defaultdict(list)
+        for quote, horizon in work:
+            grouped[(quote.symbol, quote.venue_leg)].append((quote, horizon))
         saved = 0
-        for quote in quotes:
-            category = "spot" if quote.venue_leg == "spot" else "linear"
-            trades, mids = self.state.quote_paths(category, quote.symbol)
+        for (symbol, venue_leg), rows in grouped.items():
+            category = "spot" if venue_leg == "spot" else "linear"
+            trades, mids = self.state.quote_paths(category, symbol)
+            first_quote_at = min(quote.quote_time for quote, _ in rows)
             stored_trades, stored_mids = self._paths_from_captures(
-                quote.symbol, quote.venue_leg, quote.quote_time, at
+                symbol, venue_leg, first_quote_at, at, storage=store
             )
             exchange_trades = self._exchange_path_to_local((*stored_trades, *trades))
             exchange_mids = self._exchange_path_to_local(mids)
             trade_path = _deduplicate_path(exchange_trades)
             mid_path = _deduplicate_path((*stored_mids, *exchange_mids))
-            for horizon in TOUCH_HORIZONS_SECONDS:
+            for quote, horizon in rows:
                 result = evaluate_hypothetical_touch(
                     quote,
                     horizon_seconds=horizon,
                     evaluated_at=at,
                     trades=trade_path,
                     midpoints=mid_path,
+                    paths_sorted=True,
                 )
-                saved += int(self.storage.save_touch_outcome(result))
+                saved += int(store.save_touch_outcome(result))
+        self._worker_stats["maker"]["last_processed_count"] = len(work)
+        self._worker_stats["maker"]["processed_count"] += len(work)
+        self._worker_stats["maker"]["pending_count"] = store.pending_maker_count(
+            evaluated_at=at,
+            horizons_seconds=TOUCH_HORIZONS_SECONDS,
+        )
         return saved
 
-    def mature_future_labels(self, *, evaluated_at: datetime | None = None) -> int:
+    def mature_future_labels(
+        self,
+        *,
+        evaluated_at: datetime | None = None,
+        batch_limit: int = LABEL_BATCH_SIZE,
+        storage: MicrostructureStorage | None = None,
+    ) -> int:
+        store = storage or self.storage
         at = evaluated_at or self.now()
         saved = 0
-        horizon_specs: list[tuple[str, timedelta | int]] = [
-            ("12h", timedelta(hours=12)),
-            ("24h", timedelta(hours=24)),
-            ("48h", timedelta(hours=48)),
-            ("72h", timedelta(hours=72)),
-            ("1_funding_interval", 1),
-            ("2_funding_intervals", 2),
-            ("3_funding_intervals", 3),
-            ("6_funding_intervals", 6),
-        ]
-        for horizon, spec in horizon_specs:
+        processed = 0
+        for horizon, spec in FUTURE_LABEL_HORIZONS:
             for notional in self.config.notionals_usdt:
-                rows = self.storage.opportunities_missing_label(
-                    horizon=horizon, notional_usdt=notional, limit=2_000
+                remaining = batch_limit - processed
+                if remaining <= 0:
+                    break
+                rows = store.due_opportunities_missing_label(
+                    horizon=horizon,
+                    notional_usdt=notional,
+                    evaluated_at=at,
+                    fixed_delta=spec if isinstance(spec, timedelta) else None,
+                    funding_intervals=spec if isinstance(spec, int) else None,
+                    limit=remaining,
                 )
                 for row in rows:
+                    processed += 1
                     canonical_payload = row.get("canonical_opportunity") or {}
                     try:
                         opportunity = CarryOpportunity.model_validate(canonical_payload)
@@ -390,10 +596,10 @@ class MicrostructureCollector:
                     target = opportunity.timestamp + delta
                     if target > at:
                         continue
-                    captures = self.storage.captures_between(
+                    captures = store.captures_between(
                         opportunity.symbol, opportunity.timestamp, target
                     )
-                    funding = self.storage.funding_between(
+                    funding = store.funding_between(
                         opportunity.symbol, opportunity.timestamp, target
                     )
                     label = self._build_label(
@@ -409,7 +615,7 @@ class MicrostructureCollector:
                         opportunity, captures, funding, label
                     )
                     payload["fee_configuration"] = self.config.cost_payload()
-                    saved += int(self.storage.save_label(
+                    saved += int(store.save_label(
                         label_id=stable_id(
                             "carry-label", opportunity.opportunity_id, horizon, notional
                         ),
@@ -420,11 +626,22 @@ class MicrostructureCollector:
                         coverage=label.coverage.value,
                         payload=payload,
                     ))
+            if processed >= batch_limit:
+                break
+        self._worker_stats["label"]["last_processed_count"] = processed
+        self._worker_stats["label"]["processed_count"] += processed
+        self._worker_stats["label"]["pending_count"] = self._due_label_count(
+            at, storage=store
+        )
         return saved
 
-    def write_reports(self) -> dict[str, Any]:
-        quality = self.storage.data_quality()
-        funding = self.storage.funding_summary()
+    def write_reports(
+        self, *, storage: MicrostructureStorage | None = None,
+    ) -> dict[str, Any]:
+        store = storage or self.storage
+        started = perf_counter()
+        quality = store.data_quality()
+        funding = store.funding_summary()
         quality["funding_persistence"] = funding
         quality["websocket_reconnects"] = dict(self.state.reconnects)
         quality["last_websocket_errors"] = dict(self.state.last_error)
@@ -435,7 +652,7 @@ class MicrostructureCollector:
             str(self.clock_round_trip_ms)
             if self.clock_round_trip_ms is not None else None
         )
-        readiness = self.storage.readiness(symbol_count=len(self.symbols))
+        readiness = store.readiness(symbol_count=len(self.symbols))
         readiness["funding_persistence"] = funding
         readiness["gates"]["account_specific_fees_configured"] = all(
             value is not None for value in self.config.account_fees_bps.values()
@@ -443,10 +660,21 @@ class MicrostructureCollector:
         readiness["ready_for_frozen_v5_carry_analysis"] = all(
             readiness["gates"].values()
         )
+        worker_status = self._research_worker_status()
+        quality["stage_timings_ms"] = self.timings.snapshot()
+        quality["research_workers"] = worker_status
+        quality["collector_health"] = self._health_state()
+        readiness["stage_timings_ms"] = quality["stage_timings_ms"]
+        readiness["research_workers"] = worker_status
+        readiness["collector_health"] = quality["collector_health"]
         write_json_atomic(self.config.artifact_dir / "data-quality.json", quality)
         write_json_atomic(
             self.config.artifact_dir / "collection-readiness.json", readiness
         )
+        elapsed_ms = (perf_counter() - started) * 1000
+        self.timings.record("readiness_generation_ms", elapsed_ms)
+        store.set_state("stage_timing_metrics", self.timings.snapshot())
+        store.set_state("research_worker_status", worker_status)
         return {"quality": quality, "readiness": readiness}
 
     def status(self) -> dict[str, Any]:
@@ -462,6 +690,11 @@ class MicrostructureCollector:
             "funding_failures": self.last_funding_failures,
             "websocket_reconnects": dict(self.state.reconnects),
             "websocket_last_message_at": dict(self.state.last_message_at),
+            "health": self._health_state(),
+            "stage_timings_ms": self.timings.snapshot(),
+            "research_workers": self._research_worker_status(),
+            "last_capture_interval_seconds": self._last_capture_interval_seconds,
+            "last_capture_lateness_seconds": self._last_capture_lateness_seconds,
             "exchange_execution_capability": self.client.exchange_mutation_capable,
         }
 
@@ -482,33 +715,28 @@ class MicrostructureCollector:
                 category="linear", url=self.config.linear_ws_url, state=self.state
             ),
         )
-        tasks = [asyncio.create_task(pump.run(self.symbols)) for pump in pumps]
-        loop = asyncio.get_running_loop()
-        next_capture = loop.time()
-        next_rest = loop.time() + self.config.rest_refresh_seconds
-        next_funding = loop.time()
-        next_report = loop.time()
+        self._worker_queues = {
+            "maker": asyncio.Queue(maxsize=1),
+            "label": asyncio.Queue(maxsize=1),
+            "maintenance": asyncio.Queue(maxsize=1),
+        }
+        self._worker_storages = {
+            name: MicrostructureStorage(self.config.artifact_dir)
+            for name in self._worker_queues
+        }
+        pump_tasks = [asyncio.create_task(pump.run(self.symbols)) for pump in pumps]
+        worker_tasks = [
+            asyncio.create_task(
+                self._capture_worker(stop_event, max_capture_cycles=max_capture_cycles)
+            ),
+            asyncio.create_task(self._maker_outcome_worker(stop_event)),
+            asyncio.create_task(self._future_label_worker(stop_event)),
+            asyncio.create_task(self._periodic_maintenance_worker(stop_event)),
+        ]
+        for name in self._worker_queues:
+            self._signal_worker(name)
         try:
             while not stop_event.is_set():
-                current = loop.time()
-                if current >= next_capture:
-                    await asyncio.to_thread(self.capture_once)
-                    await asyncio.to_thread(self.evaluate_maker_telemetry)
-                    await asyncio.to_thread(self.mature_future_labels)
-                    next_capture += self.config.capture_cadence_seconds
-                    if next_capture <= current:
-                        next_capture = current + self.config.capture_cadence_seconds
-                    if max_capture_cycles is not None and self.capture_cycles >= max_capture_cycles:
-                        stop_event.set()
-                if current >= next_rest:
-                    await asyncio.to_thread(self.refresh_rest)
-                    next_rest = current + self.config.rest_refresh_seconds
-                if current >= next_funding:
-                    await asyncio.to_thread(self.refresh_funding_events)
-                    next_funding = current + self.config.funding_refresh_seconds
-                if current >= next_report:
-                    await asyncio.to_thread(self.write_reports)
-                    next_report = current + self.config.report_refresh_seconds
                 if heartbeat is not None:
                     heartbeat(self.status())
                 try:
@@ -516,18 +744,195 @@ class MicrostructureCollector:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            stop_event.set()
             for pump in pumps:
                 pump.stop()
-            for task in tasks:
+            for task in pump_tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.to_thread(self.evaluate_maker_telemetry)
-            await asyncio.to_thread(self.mature_future_labels)
-            await asyncio.to_thread(self.write_reports)
+            await asyncio.gather(*pump_tasks, return_exceptions=True)
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+            await asyncio.to_thread(
+                self.evaluate_maker_telemetry,
+                batch_limit=MAKER_BATCH_SIZE,
+                storage=self._worker_storages["maker"],
+            )
+            await asyncio.to_thread(
+                self.mature_future_labels,
+                batch_limit=LABEL_BATCH_SIZE,
+                storage=self._worker_storages["label"],
+            )
+            await asyncio.to_thread(
+                self.write_reports, storage=self._worker_storages["maintenance"]
+            )
             self.storage.set_state("last_clean_shutdown_at", self.now())
+
+    async def _capture_worker(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        max_capture_cycles: int | None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        next_capture = loop.time()
+        next_rest = next_capture + self.config.rest_refresh_seconds
+        while not stop_event.is_set():
+            if not await _wait_until(stop_event, next_capture):
+                break
+            cycle_started = loop.time()
+            self._last_capture_lateness_seconds = max(0.0, cycle_started - next_capture)
+            self.timings.record(
+                "capture_schedule_lateness_ms",
+                self._last_capture_lateness_seconds * 1000,
+            )
+            if self._last_capture_started_monotonic is not None:
+                self._last_capture_interval_seconds = (
+                    cycle_started - self._last_capture_started_monotonic
+                )
+                self.timings.record(
+                    "capture_start_interval_ms",
+                    self._last_capture_interval_seconds * 1000,
+                )
+            self._last_capture_started_monotonic = cycle_started
+            if cycle_started >= next_rest:
+                await asyncio.to_thread(self.refresh_rest)
+                next_rest = advance_fixed_deadline(
+                    next_rest,
+                    loop.time(),
+                    self.config.rest_refresh_seconds,
+                )
+            await asyncio.to_thread(self.capture_once)
+            for name in self._worker_queues:
+                self._signal_worker(name)
+            next_capture = advance_fixed_deadline(
+                next_capture,
+                loop.time(),
+                self.config.capture_cadence_seconds,
+            )
+            if max_capture_cycles is not None and self.capture_cycles >= max_capture_cycles:
+                stop_event.set()
+
+    async def _maker_outcome_worker(self, stop_event: asyncio.Event) -> None:
+        queue = self._worker_queues["maker"]
+        while await _next_worker_signal(queue, stop_event):
+            started = perf_counter()
+            await asyncio.to_thread(
+                self.evaluate_maker_telemetry,
+                batch_limit=MAKER_BATCH_SIZE,
+                storage=self._worker_storages["maker"],
+            )
+            self.timings.record("maker_worker_ms", (perf_counter() - started) * 1000)
+
+    async def _future_label_worker(self, stop_event: asyncio.Event) -> None:
+        queue = self._worker_queues["label"]
+        while await _next_worker_signal(queue, stop_event):
+            started = perf_counter()
+            await asyncio.to_thread(
+                self.mature_future_labels,
+                batch_limit=LABEL_BATCH_SIZE,
+                storage=self._worker_storages["label"],
+            )
+            self.timings.record("label_worker_ms", (perf_counter() - started) * 1000)
+
+    async def _periodic_maintenance_worker(self, stop_event: asyncio.Event) -> None:
+        queue = self._worker_queues["maintenance"]
+        loop = asyncio.get_running_loop()
+        current = loop.time()
+        next_funding = current
+        next_clock = current + self.config.rest_refresh_seconds
+        next_report = current
+        while await _next_worker_signal(queue, stop_event):
+            current = loop.time()
+            processed = 0
+            if current >= next_funding:
+                await asyncio.to_thread(
+                    self.refresh_funding_events,
+                    storage=self._worker_storages["maintenance"],
+                )
+                processed += 1
+                next_funding = advance_fixed_deadline(
+                    next_funding, loop.time(), self.config.funding_refresh_seconds
+                )
+            current = loop.time()
+            if current >= next_clock:
+                await asyncio.to_thread(self.refresh_clock_diagnostic)
+                processed += 1
+                next_clock = advance_fixed_deadline(
+                    next_clock, loop.time(), self.config.rest_refresh_seconds
+                )
+            current = loop.time()
+            if current >= next_report:
+                await asyncio.to_thread(
+                    self.write_reports,
+                    storage=self._worker_storages["maintenance"],
+                )
+                processed += 1
+                next_report = advance_fixed_deadline(
+                    next_report, loop.time(), self.config.report_refresh_seconds
+                )
+            self._worker_stats["maintenance"]["last_processed_count"] = processed
+            self._worker_stats["maintenance"]["processed_count"] += processed
+
+    def _signal_worker(self, name: str) -> None:
+        queue = self._worker_queues.get(name)
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(None)
+        except asyncio.QueueFull:
+            self._worker_stats[name]["coalesced_wakeups"] += 1
+
+    def _due_label_count(
+        self,
+        evaluated_at: datetime,
+        *,
+        storage: MicrostructureStorage | None = None,
+    ) -> int:
+        store = storage or self.storage
+        total = 0
+        for horizon, spec in FUTURE_LABEL_HORIZONS:
+            for notional in self.config.notionals_usdt:
+                total += store.due_label_count(
+                    horizon=horizon,
+                    notional_usdt=notional,
+                    evaluated_at=evaluated_at,
+                    fixed_delta=spec if isinstance(spec, timedelta) else None,
+                    funding_intervals=spec if isinstance(spec, int) else None,
+                )
+        return total
+
+    def _research_worker_status(self) -> dict[str, Any]:
+        return {
+            name: {
+                **stats,
+                "queue_depth": self._worker_queues[name].qsize()
+                if name in self._worker_queues else 0,
+                "queue_capacity": self._worker_queues[name].maxsize
+                if name in self._worker_queues else 1,
+                "durable_source_of_truth": True,
+                "wakeups_may_coalesce_without_dropping_durable_work": True,
+            }
+            for name, stats in self._worker_stats.items()
+        }
+
+    def _health_state(self) -> str:
+        if (
+            self._last_capture_interval_seconds is not None
+            and self._last_capture_interval_seconds
+            > self.config.capture_cadence_seconds * 3
+        ) or self._last_capture_lateness_seconds > self.config.capture_cadence_seconds:
+            return "CAPTURE_DEGRADED"
+        if (
+            int(self._worker_stats["maker"]["pending_count"]) > MAKER_BATCH_SIZE
+            or int(self._worker_stats["label"]["pending_count"]) > LABEL_BATCH_SIZE
+        ):
+            return "RESEARCH_BACKLOG"
+        return "HEALTHY"
 
     def close(self) -> None:
         if not self._closed:
+            for storage in self._worker_storages.values():
+                storage.close()
+            self._worker_storages.clear()
             self.storage.close()
             self._closed = True
 
@@ -537,8 +942,11 @@ class MicrostructureCollector:
         venue_leg: str,
         start: datetime,
         end: datetime,
+        *,
+        storage: MicrostructureStorage | None = None,
     ) -> tuple[list[tuple[datetime, Decimal]], list[tuple[datetime, Decimal]]]:
-        captures = self.storage.captures_between(symbol, start, end)
+        store = storage or self.storage
+        captures = store.captures_between(symbol, start, end)
         trades: list[tuple[datetime, Decimal]] = []
         mids: list[tuple[datetime, Decimal]] = []
         for capture in captures:
@@ -755,6 +1163,18 @@ def _deduplicate_path(
     rows: Sequence[tuple[datetime, Decimal]],
 ) -> list[tuple[datetime, Decimal]]:
     return sorted({(timestamp, value) for timestamp, value in rows}, key=lambda row: row[0])
+
+
+def _float_percentile(values: Sequence[float], probability: float) -> float | None:
+    if not values:
+        return None
+    position = max(0.0, min(len(values) - 1, (len(values) - 1) * probability))
+    lower = int(position)
+    upper = min(len(values) - 1, lower + 1)
+    if lower == upper:
+        return float(values[lower])
+    fraction = position - lower
+    return float(values[lower] + (values[upper] - values[lower]) * fraction)
 
 
 _AUDIT = """# Market microstructure collector audit

@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import RLock
-from typing import Any, Iterable
+from typing import Any, Iterable, TextIO
 
 from app.microstructure.models import (
     CarryCandidate,
@@ -18,6 +18,21 @@ from app.microstructure.models import (
     SynchronizedSnapshot,
     TakerCostEstimate,
 )
+
+
+_ARTIFACT_FILE_WRITE_LOCKS_GUARD = RLock()
+_ARTIFACT_FILE_WRITE_LOCKS: dict[Path, RLock] = {}
+
+
+def _artifact_file_write_lock(path: Path) -> RLock:
+    """Serialize appends to one artifact file without blocking other datasets."""
+    canonical = path.resolve()
+    with _ARTIFACT_FILE_WRITE_LOCKS_GUARD:
+        lock = _ARTIFACT_FILE_WRITE_LOCKS.get(canonical)
+        if lock is None:
+            lock = RLock()
+            _ARTIFACT_FILE_WRITE_LOCKS[canonical] = lock
+        return lock
 
 
 def utc_now() -> datetime:
@@ -46,6 +61,7 @@ class MicrostructureStorage:
         self.columnar_dir = self.artifact_dir / "columnar-csv"
         self.columnar_dir.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self._artifact_handles: dict[Path, TextIO] = {}
         self.connection = sqlite3.connect(
             self.database_path, timeout=30, check_same_thread=False
         )
@@ -56,6 +72,11 @@ class MicrostructureStorage:
         self._create_schema()
 
     def close(self) -> None:
+        for path, handle in list(self._artifact_handles.items()):
+            with _artifact_file_write_lock(path):
+                handle.flush()
+                handle.close()
+        self._artifact_handles.clear()
         with self._lock:
             self.connection.close()
 
@@ -138,6 +159,8 @@ class MicrostructureStorage:
             payload TEXT NOT NULL,
             PRIMARY KEY(quote_id, horizon_seconds)
         );
+        CREATE INDEX IF NOT EXISTS ix_touch_outcomes_completion
+            ON hypothetical_touch_outcomes(complete, quote_id, horizon_seconds);
         CREATE TABLE IF NOT EXISTS carry_labels (
             label_id TEXT PRIMARY KEY,
             opportunity_id TEXT NOT NULL,
@@ -148,6 +171,14 @@ class MicrostructureStorage:
             payload TEXT NOT NULL,
             UNIQUE(opportunity_id, horizon, notional_usdt)
         );
+        CREATE TABLE IF NOT EXISTS carry_label_schedule (
+            opportunity_id TEXT NOT NULL,
+            horizon TEXT NOT NULL,
+            next_due_at TEXT NOT NULL,
+            PRIMARY KEY(opportunity_id, horizon)
+        );
+        CREATE INDEX IF NOT EXISTS ix_carry_label_schedule_due
+            ON carry_label_schedule(horizon, next_due_at, opportunity_id);
         CREATE TABLE IF NOT EXISTS collection_gaps (
             gap_id TEXT PRIMARY KEY,
             symbol TEXT NOT NULL,
@@ -164,6 +195,7 @@ class MicrostructureStorage:
         """
         with self._lock, self.connection:
             self.connection.executescript(schema)
+        self._backfill_label_schedule()
 
     def persist_universe(self, decisions: Iterable[dict[str, Any]]) -> None:
         rows = list(decisions)
@@ -254,6 +286,7 @@ class MicrostructureStorage:
             ),
         )
         if inserted:
+            self._persist_label_schedule(row.opportunity_id, row.model_dump(mode="json"))
             self._write_raw("carry-opportunities", row.model_dump(mode="json"), row.timestamp)
             self._write_columnar_csv(
                 "carry-opportunities", row.model_dump(mode="json"), row.timestamp
@@ -430,6 +463,82 @@ class MicrostructureStorage:
             ).fetchall()
         return [HypotheticalQuote.model_validate(json.loads(row["payload"])) for row in rows]
 
+    def pending_maker_work(
+        self,
+        *,
+        evaluated_at: datetime,
+        horizons_seconds: tuple[int, ...],
+        recent_window_seconds: int = 130,
+        limit: int = 1_000,
+    ) -> list[tuple[HypotheticalQuote, int]]:
+        """Return only due, unresolved maker horizons in a bounded recent window."""
+        if not horizons_seconds or limit <= 0:
+            return []
+        horizon_values = ",".join("(?)" for _ in horizons_seconds)
+        since = evaluated_at - timedelta(seconds=recent_window_seconds)
+        statement = f"""
+            WITH horizons(horizon_seconds) AS (VALUES {horizon_values})
+            SELECT quote.payload AS quote_payload, horizons.horizon_seconds
+            FROM hypothetical_quotes quote
+            CROSS JOIN horizons
+            LEFT JOIN hypothetical_touch_outcomes outcome
+              ON outcome.quote_id=quote.quote_id
+             AND outcome.horizon_seconds=horizons.horizon_seconds
+            WHERE quote.quote_time>=?
+              AND julianday(quote.quote_time)
+                    + (CAST(horizons.horizon_seconds AS REAL) / 86400.0)
+                  <= julianday(?)
+              AND (outcome.quote_id IS NULL OR outcome.complete=0)
+            ORDER BY quote.quote_time, quote.quote_id, horizons.horizon_seconds
+            LIMIT ?
+        """
+        parameters = (
+            *horizons_seconds,
+            since.isoformat(),
+            evaluated_at.isoformat(),
+            limit,
+        )
+        with self._lock:
+            rows = self.connection.execute(statement, parameters).fetchall()
+        return [
+            (
+                HypotheticalQuote.model_validate(json.loads(row["quote_payload"])),
+                int(row["horizon_seconds"]),
+            )
+            for row in rows
+        ]
+
+    def pending_maker_count(
+        self,
+        *,
+        evaluated_at: datetime,
+        horizons_seconds: tuple[int, ...],
+        recent_window_seconds: int = 130,
+    ) -> int:
+        if not horizons_seconds:
+            return 0
+        horizon_values = ",".join("(?)" for _ in horizons_seconds)
+        since = evaluated_at - timedelta(seconds=recent_window_seconds)
+        statement = f"""
+            WITH horizons(horizon_seconds) AS (VALUES {horizon_values})
+            SELECT COUNT(*)
+            FROM hypothetical_quotes quote
+            CROSS JOIN horizons
+            LEFT JOIN hypothetical_touch_outcomes outcome
+              ON outcome.quote_id=quote.quote_id
+             AND outcome.horizon_seconds=horizons.horizon_seconds
+            WHERE quote.quote_time>=?
+              AND julianday(quote.quote_time)
+                    + (CAST(horizons.horizon_seconds AS REAL) / 86400.0)
+                  <= julianday(?)
+              AND (outcome.quote_id IS NULL OR outcome.complete=0)
+        """
+        with self._lock:
+            return int(self.connection.execute(
+                statement,
+                (*horizons_seconds, since.isoformat(), evaluated_at.isoformat()),
+            ).fetchone()[0])
+
     def capture_at_or_before(
         self, symbol: str, timestamp: datetime,
     ) -> SynchronizedSnapshot | None:
@@ -483,6 +592,115 @@ class MicrostructureStorage:
                 (horizon, str(notional_usdt), limit),
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def due_opportunities_missing_label(
+        self,
+        *,
+        horizon: str,
+        notional_usdt: Decimal,
+        evaluated_at: datetime,
+        fixed_delta: timedelta | None = None,
+        funding_intervals: int | None = None,
+        limit: int = 256,
+    ) -> list[dict[str, Any]]:
+        """Load only opportunities whose requested unresolved label is mature."""
+        if (fixed_delta is None) == (funding_intervals is None):
+            raise ValueError("exactly one label maturity specification is required")
+        statement = """
+            SELECT opportunity.payload
+            FROM carry_opportunities opportunity
+            JOIN carry_label_schedule schedule
+              ON schedule.opportunity_id=opportunity.opportunity_id
+             AND schedule.horizon=?
+            WHERE schedule.next_due_at<=?
+              AND NOT EXISTS (
+                  SELECT 1 FROM carry_labels label
+                  WHERE label.opportunity_id=opportunity.opportunity_id
+                    AND label.horizon=? AND label.notional_usdt=?
+              )
+            ORDER BY opportunity.timestamp, opportunity.opportunity_id
+            LIMIT ?
+        """
+        with self._lock:
+            rows = self.connection.execute(
+                statement,
+                (
+                    horizon,
+                    evaluated_at.isoformat(),
+                    horizon,
+                    str(notional_usdt),
+                    limit,
+                ),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def due_label_count(
+        self,
+        *,
+        horizon: str,
+        notional_usdt: Decimal,
+        evaluated_at: datetime,
+        fixed_delta: timedelta | None = None,
+        funding_intervals: int | None = None,
+    ) -> int:
+        if (fixed_delta is None) == (funding_intervals is None):
+            raise ValueError("exactly one label maturity specification is required")
+        statement = """
+            SELECT COUNT(*)
+            FROM carry_opportunities opportunity
+            JOIN carry_label_schedule schedule
+              ON schedule.opportunity_id=opportunity.opportunity_id
+             AND schedule.horizon=?
+            WHERE schedule.next_due_at<=?
+              AND NOT EXISTS (
+                  SELECT 1 FROM carry_labels label
+                  WHERE label.opportunity_id=opportunity.opportunity_id
+                    AND label.horizon=? AND label.notional_usdt=?
+              )
+        """
+        with self._lock:
+            return int(self.connection.execute(
+                statement,
+                (
+                    horizon,
+                    evaluated_at.isoformat(),
+                    horizon,
+                    str(notional_usdt),
+                ),
+            ).fetchone()[0])
+
+    def _persist_label_schedule(
+        self, opportunity_id: str, payload: dict[str, Any],
+    ) -> None:
+        rows = _label_schedule_rows(payload)
+        with self._lock, self.connection:
+            self.connection.executemany(
+                """
+                INSERT OR IGNORE INTO carry_label_schedule(
+                    opportunity_id, horizon, next_due_at
+                ) VALUES (?, ?, ?)
+                """,
+                [(opportunity_id, horizon, due_at.isoformat()) for horizon, due_at in rows],
+            )
+
+    def _backfill_label_schedule(self) -> None:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT opportunity.opportunity_id, opportunity.payload
+                FROM carry_opportunities opportunity
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM carry_label_schedule schedule
+                    WHERE schedule.opportunity_id=opportunity.opportunity_id
+                )
+                """
+            ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            self._persist_label_schedule(str(row["opportunity_id"]), payload)
 
     def has_label(
         self, opportunity_id: str, horizon: str, notional_usdt: Decimal,
@@ -790,8 +1008,10 @@ class MicrostructureStorage:
         directory = self.raw_dir / record_type
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{timestamp.astimezone(timezone.utc).date().isoformat()}.jsonl"
-        with self._lock, path.open("a", encoding="utf-8") as handle:
+        with _artifact_file_write_lock(path):
+            handle = self._append_handle(path)
             handle.write(_json(payload) + "\n")
+            handle.flush()
 
     def _write_columnar_csv(
         self,
@@ -811,13 +1031,55 @@ class MicrostructureStorage:
             )
             for key, value in payload.items()
         }
-        with self._lock:
+        with _artifact_file_write_lock(path):
             exists = path.exists() and path.stat().st_size > 0
-            with path.open("a", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(flattened))
-                if not exists:
-                    writer.writeheader()
-                writer.writerow(flattened)
+            handle = self._append_handle(path, newline="")
+            writer = csv.DictWriter(handle, fieldnames=list(flattened))
+            if not exists:
+                writer.writeheader()
+            writer.writerow(flattened)
+            handle.flush()
+
+    def _append_handle(self, path: Path, *, newline: str | None = None) -> TextIO:
+        handle = self._artifact_handles.get(path)
+        if handle is None or handle.closed:
+            handle = path.open(
+                "a", encoding="utf-8", newline=newline, buffering=1
+            )
+            self._artifact_handles[path] = handle
+        return handle
+
+
+def _label_schedule_rows(payload: dict[str, Any]) -> list[tuple[str, datetime]]:
+    canonical = payload.get("canonical_opportunity") or {}
+    timestamp_value = canonical.get("timestamp") or payload.get("timestamp")
+    if not timestamp_value:
+        return []
+    try:
+        timestamp = _parse_time(str(timestamp_value))
+    except (TypeError, ValueError):
+        return []
+    rows = [
+        ("12h", timestamp + timedelta(hours=12)),
+        ("24h", timestamp + timedelta(hours=24)),
+        ("48h", timestamp + timedelta(hours=48)),
+        ("72h", timestamp + timedelta(hours=72)),
+    ]
+    interval_value = canonical.get("funding_interval_hours")
+    if interval_value not in (None, ""):
+        try:
+            interval_hours = Decimal(str(interval_value))
+        except (ArithmeticError, ValueError):
+            interval_hours = Decimal("0")
+        if interval_hours > 0:
+            for count in (1, 2, 3, 6):
+                rows.append((
+                    f"{count}_funding_interval" + ("s" if count != 1 else ""),
+                    timestamp + timedelta(
+                        seconds=float(interval_hours * Decimal("3600") * count)
+                    ),
+                ))
+    return rows
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
