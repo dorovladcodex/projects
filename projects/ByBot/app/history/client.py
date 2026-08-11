@@ -23,6 +23,9 @@ KLINE_PAGE_LIMIT = 1000
 FUNDING_PAGE_LIMIT = 200
 OPEN_INTEREST_PAGE_LIMIT = 200
 
+# Bybit settles linear perpetual funding every 8h for the common case.
+FUNDING_SETTLEMENT_MS = 8 * 3_600_000
+
 _USER_AGENT = "ByBot-History/1.0 READ_ONLY"
 
 
@@ -254,9 +257,11 @@ class BybitHistoryClient:
                 cursor = window_end
 
     def iter_funding(self, symbol: str, start_ms: int, end_ms: int) -> Iterator[list[FundingRate]]:
-        # Funding cadence varies by symbol, so advance from observed data when a
-        # page is full and by a conservative window when it is not.
-        window = FUNDING_PAGE_LIMIT * 3_600_000
+        # Size the window for the common 8h settlement cadence so a full page
+        # carries ~200 rows. A 1h-funding symbol simply fills the page early and
+        # the cursor advances from the last row, so the shorter cadence stays
+        # correct; assuming 1h for everyone instead wastes 8x the requests.
+        window = FUNDING_PAGE_LIMIT * FUNDING_SETTLEMENT_MS
         cursor = start_ms
         while cursor < end_ms:
             window_end = min(cursor + window, end_ms)

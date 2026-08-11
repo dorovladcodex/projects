@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.history.client import (
+    FUNDING_SETTLEMENT_MS,
     KLINE_PAGE_LIMIT,
     BybitHistoryClient,
     HistoryRequestError,
@@ -238,6 +239,31 @@ def test_iter_funding_advances_by_last_row_on_full_page() -> None:
 
     assert len(pages) == 1
     assert transport.calls[1][1]["startTime"] == str(199 * 100 + 2)
+
+
+def test_funding_window_is_sized_for_the_8h_settlement_cadence() -> None:
+    """A 1h-sized window would return ~25 rows per page and waste 8x requests."""
+    transport = RecordingTransport([ok([])])
+    list(client(transport).iter_funding("BTCUSDT", T0, T0 + 10 * 200 * FUNDING_SETTLEMENT_MS))
+
+    requested = int(transport.calls[0][1]["endTime"]) - int(transport.calls[0][1]["startTime"])
+    assert requested == 200 * FUNDING_SETTLEMENT_MS
+
+
+def test_iter_funding_still_advances_correctly_for_a_faster_cadence() -> None:
+    """Hourly funding fills the page early; the cursor must follow the data."""
+    hourly = [
+        {"symbol": "BTCUSDT", "fundingRate": "0.0001",
+         "fundingRateTimestamp": str(T0 + i * 3_600_000)}
+        for i in range(200)
+    ]
+    transport = RecordingTransport([ok(hourly), ok([])])
+    pages = list(
+        client(transport).iter_funding("BTCUSDT", T0, T0 + 400 * FUNDING_SETTLEMENT_MS)
+    )
+
+    assert len(pages) == 1
+    assert transport.calls[1][1]["startTime"] == str(T0 + 199 * 3_600_000 + 1)
 
 
 def test_iter_open_interest_paginates() -> None:
