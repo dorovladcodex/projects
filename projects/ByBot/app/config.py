@@ -135,6 +135,40 @@ class Settings(BaseSettings):
     v4_alpha_enabled: bool = False
     v4_alpha_shadow_only: bool = True
     v4_opportunity_cadence_seconds: int = Field(default=60, ge=5, le=3600)
+    # V5 remains research-only. Account fees deliberately default to UNKNOWN;
+    # public fee schedules must not be treated as account-specific evidence.
+    v5_alpha_enabled: bool = False
+    v5_alpha_shadow_only: bool = True
+    v5_shadow_cadence_seconds: int = Field(default=60, ge=5, le=3600)
+    v5_spot_maker_fee_bps: Decimal | None = Field(default=None, ge=0)
+    v5_spot_taker_fee_bps: Decimal | None = Field(default=None, ge=0)
+    v5_perp_maker_fee_bps: Decimal | None = Field(default=None, ge=0)
+    v5_perp_taker_fee_bps: Decimal | None = Field(default=None, ge=0)
+    v5_spot_borrow_apr_bps: Decimal | None = Field(default=None, ge=0)
+    # Isolated public-market telemetry. This collector has no execution path.
+    microstructure_capture_cadence_seconds: int = Field(default=10, ge=1, le=300)
+    microstructure_rest_refresh_seconds: int = Field(default=60, ge=10, le=3600)
+    microstructure_funding_refresh_seconds: int = Field(default=300, ge=60, le=3600)
+    microstructure_report_refresh_seconds: int = Field(default=60, ge=10, le=3600)
+    microstructure_universe_size: int = Field(default=5, ge=1, le=20)
+    microstructure_min_leg_turnover_24h_usdt: Decimal = Field(
+        default=Decimal("10000000"), ge=0
+    )
+    microstructure_max_selection_spread_bps: Decimal = Field(
+        default=Decimal("5"), gt=0, le=100
+    )
+    microstructure_max_source_age_ms: Decimal = Field(
+        default=Decimal("5000"), gt=0, le=60000
+    )
+    microstructure_max_sync_gap_ms: Decimal = Field(
+        default=Decimal("2000"), gt=0, le=60000
+    )
+    microstructure_spot_ws_url: str = "wss://stream.bybit.com/v5/public/spot"
+    microstructure_linear_ws_url: str = "wss://stream.bybit.com/v5/public/linear"
+    microstructure_artifact_directory: str = "artifacts/microstructure-shadow"
+    microstructure_notionals_usdt: tuple[Decimal, ...] = (
+        Decimal("100"), Decimal("200"), Decimal("500"), Decimal("1000"),
+    )
     startup_hard_timeout_seconds: int = Field(default=60, ge=30, le=120)
     startup_step_timeout_seconds: int = Field(default=30, ge=5, le=60)
     startup_diagnostic_threshold_seconds: int = Field(default=10, ge=1, le=30)
@@ -419,6 +453,8 @@ class Settings(BaseSettings):
         """
         if self.v4_alpha_enabled and not self.v4_alpha_shadow_only:
             raise ValueError("V4_ALPHA_ENABLED requires V4_ALPHA_SHADOW_ONLY=true")
+        if self.v5_alpha_enabled and not self.v5_alpha_shadow_only:
+            raise ValueError("V5_ALPHA_ENABLED requires V5_ALPHA_SHADOW_ONLY=true")
         if (
             self.v2_terminalization_warning_seconds
             >= self.v2_terminalization_hard_failure_seconds
