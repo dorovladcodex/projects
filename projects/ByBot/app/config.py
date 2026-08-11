@@ -131,6 +131,10 @@ class Settings(BaseSettings):
     # V2 is an explicit, Demo-only runtime. Defaults never submit an order.
     v2_enabled: bool = False
     v2_auto_demo_execution: bool = False
+    # V4 is an additive alpha-research collector.  Execution is not implemented.
+    v4_alpha_enabled: bool = False
+    v4_alpha_shadow_only: bool = True
+    v4_opportunity_cadence_seconds: int = Field(default=60, ge=5, le=3600)
     startup_hard_timeout_seconds: int = Field(default=60, ge=30, le=120)
     startup_step_timeout_seconds: int = Field(default=30, ge=5, le=60)
     startup_diagnostic_threshold_seconds: int = Field(default=10, ge=1, le=30)
@@ -413,6 +417,8 @@ class Settings(BaseSettings):
         read-only inspection.  The credential, domain and explicit authorization
         checks belong to the mutation guard in ``app.bybit.demo``.
         """
+        if self.v4_alpha_enabled and not self.v4_alpha_shadow_only:
+            raise ValueError("V4_ALPHA_ENABLED requires V4_ALPHA_SHADOW_ONLY=true")
         if (
             self.v2_terminalization_warning_seconds
             >= self.v2_terminalization_hard_failure_seconds

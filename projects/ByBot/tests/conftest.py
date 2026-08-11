@@ -21,6 +21,8 @@ _SAFE_TEST_ENV = {
     "DEMO_CANARY_ENABLED": "false",
     "V2_ENABLED": "false",
     "V2_AUTO_DEMO_EXECUTION": "false",
+    "V4_ALPHA_ENABLED": "false",
+    "V4_ALPHA_SHADOW_ONLY": "true",
     "AUTO_PAPER_EXECUTION": "false",
     "MARKET_DATA_PROVIDER": "MOCK",
     "NEWS_CLASSIFIER_MODE": "mock",

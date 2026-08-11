@@ -42,6 +42,7 @@ from app.v2.research import CalibrationObservation, EmpiricalEdgeCalibrator
 from app.v2.scoring import AdmissionContext, CommonScoringPipeline
 from app.v2.strategies import MemeTrendContext, NewsStrategyContext, build_v2_strategies
 from app.v2.universe import SymbolUniverseService
+from app.v4.shadow import V4ShadowCollector
 
 
 def protection_management_price_input(
@@ -76,6 +77,10 @@ class V2Runtime:
         self.execution = execution
         self.external_trends = external_trends
         self.run_id = run_id
+        self.v4_shadow = (
+            V4ShadowCollector(settings, repository, run_id=run_id)
+            if settings.v4_alpha_enabled else None
+        )
         self.scoring = CommonScoringPipeline(settings)
         self.strategies = build_v2_strategies(settings)
         self.websocket = BybitPublicWebSocketEngine(settings, features)
@@ -675,6 +680,16 @@ class V2Runtime:
                 continue
             metric["latest_feature_timestamp"] = feature.timestamp.isoformat()
             self._update_liquidation_symbol_status(feature)
+            if self.v4_shadow is not None:
+                try:
+                    self.v4_shadow.observe(feature, cycle_id=cycle_id)
+                except Exception as exc:
+                    # V4 is observability-only and must never alter V2 execution,
+                    # admission, risk or cycle-failure behavior.
+                    self.logger.warning(
+                        "V4 shadow collection warning: %s", type(exc).__name__,
+                        extra={"cycle_id": cycle_id, "symbol": symbol.value},
+                    )
             for strategy in self.strategies:
                 await asyncio.sleep(0)
                 if not strategy.enabled or strategy.name == StrategyName.NEWS_MOMENTUM_V2:
@@ -1912,6 +1927,15 @@ class V2Runtime:
         )
         return {
             "enabled": self.settings.v2_enabled,
+            "v4_alpha": (
+                self.v4_shadow.status() if self.v4_shadow is not None else {
+                    "enabled": False,
+                    "shadow_only": self.settings.v4_alpha_shadow_only,
+                    "exchange_mutations": 0,
+                    "capacity_mutations": 0,
+                    "production_risk_mutations": 0,
+                }
+            ),
             "execution_environment": "BYBIT_DEMO",
             "auto_demo_execution": self.settings.v2_auto_demo_execution,
             "run_id": self.run_id, "started_at": self.started_at.isoformat(),

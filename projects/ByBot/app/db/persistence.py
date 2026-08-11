@@ -30,6 +30,7 @@ from app.v2.models import (
     PortfolioReservation, ReservationState, UniverseStatus, V2Incident,
     V2SignalCandidate,
 )
+from app.v4.models import V4ForwardLabel, V4Opportunity
 from app.db.url import normalize_database_url
 from app.db.news_repair import audit_news_row, audit_persistence_payload, inspect_or_repair_news_rows, sanitized_validation_error
 from pydantic import ValidationError
@@ -327,6 +328,44 @@ class V2MarketFeatureRow(Base):
     fresh: Mapped[bool] = mapped_column(Boolean, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     __table_args__ = (UniqueConstraint("symbol", "captured_at", name="uq_v2_feature_symbol_time"),)
+
+
+class V4OpportunityRow(Base):
+    __tablename__ = "v4_opportunities"
+    opportunity_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    cycle_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    source: Mapped[str] = mapped_column(String(80), nullable=False)
+    candidate_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    decision: Mapped[str] = mapped_column(String(30), nullable=False)
+    rejected: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    feature_snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    decision_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        Index("ix_v4_opportunity_run_decision", "run_id", "decision_at"),
+        UniqueConstraint(
+            "run_id", "cycle_id", "symbol", "candidate_type",
+            name="uq_v4_opportunity_cycle_symbol_type",
+        ),
+    )
+
+
+class V4ForwardLabelRow(Base):
+    __tablename__ = "v4_forward_labels"
+    opportunity_id: Mapped[str] = mapped_column(
+        ForeignKey("v4_opportunities.opportunity_id"), primary_key=True
+    )
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    decision_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    maximum_horizon_seconds: Mapped[int] = mapped_column(nullable=False)
+    complete: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (Index("ix_v4_label_decision", "decision_at"),)
 
 
 class V2SignalCandidateRow(Base):
@@ -2388,6 +2427,78 @@ class PersistenceRepository:
                 ))
             return True
         except IntegrityError:
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def save_v4_opportunity(self, opportunity: V4Opportunity) -> bool:
+        """Persist one additive shadow/research tape row idempotently."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                key = str(opportunity.opportunity_id)
+                if session.get(V4OpportunityRow, key) is None:
+                    session.add(V4OpportunityRow(
+                        opportunity_id=key,
+                        cycle_id=opportunity.cycle_id,
+                        run_id=opportunity.run_id,
+                        symbol=opportunity.symbol,
+                        side=opportunity.side,
+                        source=opportunity.source,
+                        candidate_type=opportunity.candidate_type,
+                        decision=opportunity.decision.value,
+                        rejected=bool(opportunity.rejection_reasons),
+                        feature_snapshot_at=opportunity.feature_snapshot_time,
+                        decision_at=opportunity.decision_time,
+                        payload=opportunity.model_dump(mode="json"),
+                        created_at=datetime.now(timezone.utc),
+                    ))
+            return True
+        except IntegrityError:
+            return True
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return False
+
+    def load_v4_opportunities(self, run_id: str | None = None) -> list[V4Opportunity]:
+        if not self.available:
+            return []
+        try:
+            with Session(self.engine) as session:
+                statement = select(V4OpportunityRow).order_by(V4OpportunityRow.decision_at)
+                if run_id:
+                    statement = statement.where(V4OpportunityRow.run_id == run_id)
+                return [
+                    V4Opportunity.model_validate(row.payload)
+                    for row in session.scalars(statement).all()
+                ]
+        except SQLAlchemyError as exc:
+            self._failed(exc)
+            return []
+
+    def save_v4_forward_label(self, label: V4ForwardLabel) -> bool:
+        """Upsert a progressively maturing market-path label."""
+        if not self.available:
+            return False
+        try:
+            with Session(self.engine) as session, session.begin():
+                key = str(label.opportunity_id)
+                row = session.get(V4ForwardLabelRow, key)
+                values = {
+                    "symbol": label.symbol,
+                    "decision_at": label.decision_time,
+                    "maximum_horizon_seconds": label.maximum_horizon_seconds,
+                    "complete": label.complete,
+                    "payload": label.model_dump(mode="json"),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+                if row is None:
+                    session.add(V4ForwardLabelRow(opportunity_id=key, **values))
+                else:
+                    for name, value in values.items():
+                        setattr(row, name, value)
             return True
         except SQLAlchemyError as exc:
             self._failed(exc)
