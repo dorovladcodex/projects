@@ -121,6 +121,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  fold {definition.index} ({span:5.0f}d): {metrics.summary()}")
         if report.holdout is not None:
             print(f"\nfrozen holdout: {report.holdout.summary()}")
+        print(
+            f"fill rate: {report.fill_rate * 100:.1f}% "
+            f"({report.fill_filled:,}/{report.fill_requested:,} intended trades happened)"
+        )
 
         print("\ncost stress:")
         stress_positive: dict[str, int] = {}

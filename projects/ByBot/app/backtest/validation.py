@@ -59,10 +59,21 @@ class WalkForwardReport:
     folds: list[Metrics]
     holdout: Metrics | None
     fold_definitions: list[Fold]
+    fill_requested: int = 0
+    fill_filled: int = 0
 
     @property
     def positive_folds(self) -> int:
         return sum(1 for fold in self.folds if fold.expectancy_bps > 0)
+
+    @property
+    def fill_rate(self) -> float:
+        """How often an intended trade actually happened.
+
+        A maker result is only meaningful next to this number: cheap fees on
+        orders that never fill are not cheap execution.
+        """
+        return self.fill_filled / self.fill_requested if self.fill_requested else 1.0
 
 
 def run_walk_forward(
@@ -93,19 +104,36 @@ def run_walk_forward(
     development, holdout = split_holdout(dataset.timeline, holdout_fraction)
     folds = chronological_folds(development, fold_count)
 
+    requested = filled = 0
+
+    def tally(result) -> None:
+        nonlocal requested, filled
+        stats = getattr(result, "fills", None)
+        if stats is not None:
+            requested += stats.requested
+            filled += stats.filled
+
     fold_metrics: list[Metrics] = []
     for fold in folds:
         window = dataset.slice(fold.test_from_ms, fold.test_to_ms + 1)
         strategy = strategy_factory()
         strategy.prepare(dataset)
-        fold_metrics.append(measure(build_engine().run(strategy, window)))
+        result = build_engine().run(strategy, window)
+        tally(result)
+        fold_metrics.append(measure(result))
 
     holdout_metrics: Metrics | None = None
     if holdout:
         strategy = strategy_factory()
         strategy.prepare(dataset)
-        holdout_metrics = measure(build_engine().run(strategy, holdout))
+        result = build_engine().run(strategy, holdout)
+        tally(result)
+        holdout_metrics = measure(result)
 
     return WalkForwardReport(
-        folds=fold_metrics, holdout=holdout_metrics, fold_definitions=folds
+        folds=fold_metrics,
+        holdout=holdout_metrics,
+        fold_definitions=folds,
+        fill_requested=requested,
+        fill_filled=filled,
     )

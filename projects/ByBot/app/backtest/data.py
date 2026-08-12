@@ -40,6 +40,17 @@ class SymbolHistory:
     def spot_at(self, start_ms: int) -> Bar | None:
         return self.spot.get(start_ms)
 
+    def previous_close(self, start_ms: int) -> float | None:
+        """Close of the bar before this one.
+
+        A resting maker order is placed off the last price the strategy could
+        actually see, which exists whether or not the symbol is currently held.
+        """
+        position = self._index.get(start_ms)
+        if position is None or position == 0:
+            return None
+        return self.perp[position - 1].close
+
     def has_both_legs(self, start_ms: int) -> bool:
         return start_ms in self._index and start_ms in self.spot
 

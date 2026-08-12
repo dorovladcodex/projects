@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Protocol
 
 from app.backtest.costs import CostModel, Liquidity
 from app.backtest.data import Dataset
+from app.backtest.execution import Fill, FillStats, build_fill_model
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,7 @@ class PortfolioResult:
     total_turnover: float = 0.0
     funding_events: int = 0
     rebalances: int = 0
+    fills: FillStats = field(default_factory=FillStats)
 
     @property
     def final_equity(self) -> float:
@@ -71,12 +72,13 @@ class PortfolioResult:
 
 
 class PortfolioEngine:
-    """Dollar-neutral long/short perpetual book with explicit rebalance costs.
+    """Dollar-neutral long/short perpetual book with explicit fills and costs.
 
-    PnL accrues per bar on the notional actually held during that bar, so a
-    rebalance costs exactly the traded difference rather than a full round
-    trip. Funding is charged the way the exchange charges it: the long side
-    pays when the rate is positive, the short side receives.
+    A decision taken on bar t is executed on bar t+1. Taker orders cross at
+    that bar's open; maker orders rest at the previous close and fill only if
+    the bar trades through them, so an unfilled intent simply does not happen.
+    PnL is split at the fill price within the execution bar rather than
+    assumed to start at its close.
     """
 
     def __init__(
@@ -94,25 +96,33 @@ class PortfolioEngine:
         self._trade_bps = float(costs.entry_bps("perp", liquidity))
 
     def run(self, strategy: PortfolioStrategy, timeline: list[int]) -> PortfolioResult:
+        fills = build_fill_model(self.liquidity)
         result = PortfolioResult(starting_equity=self.starting_equity)
         positions: dict[str, float] = {}
         open_episodes: dict[str, Episode] = {}
-        previous_close: dict[str, float] = {}
+        reference: dict[str, float] = {}
         pnl = 0.0
         pending: dict[str, float] | None = None
 
         for timestamp in timeline:
-            # 1. Price move on the notional held coming into this bar.
+            # 1. Execute the previous bar's decision on this bar.
+            if pending is not None:
+                pnl += self._rebalance(
+                    pending, positions, open_episodes, reference, timestamp, result, fills
+                )
+                pending = None
+
+            # 2. Carry every position to this bar's close from its reference.
             for symbol, notional in positions.items():
                 bar = self.dataset.symbols[symbol].perp_at(timestamp)
-                last = previous_close.get(symbol)
-                if bar is None or last is None or last <= 0:
+                base = reference.get(symbol)
+                if bar is None or base is None or base <= 0:
                     continue
-                move = notional * (bar.close / last - 1.0)
+                move = notional * (bar.close / base - 1.0)
                 pnl += move
                 open_episodes[symbol].price_pnl += move
 
-            # 2. Funding settled during this bar.
+            # 3. Funding settled during this bar.
             for symbol, notional in positions.items():
                 rate = self.dataset.symbols[symbol].funding.get(timestamp)
                 if rate is None:
@@ -124,17 +134,10 @@ class PortfolioEngine:
                 open_episodes[symbol].funding_pnl += amount
                 result.funding_events += 1
 
-            # 3. Apply the previous bar's decision at this bar's open.
-            if pending is not None:
-                pnl -= self._rebalance(
-                    pending, positions, open_episodes, timestamp, result
-                )
-                pending = None
-
             for symbol in positions:
                 bar = self.dataset.symbols[symbol].perp_at(timestamp)
                 if bar is not None:
-                    previous_close[symbol] = bar.close
+                    reference[symbol] = bar.close
 
             equity = self.starting_equity + pnl
             result.equity_curve.append((timestamp, equity))
@@ -149,9 +152,13 @@ class PortfolioEngine:
             )
 
         if timeline and positions:
-            pnl -= self._rebalance({}, positions, open_episodes, timeline[-1], result)
+            pnl += self._rebalance(
+                {}, positions, open_episodes, reference, timeline[-1], result, fills,
+                force=True,
+            )
             result.equity_curve[-1] = (timeline[-1], self.starting_equity + pnl)
 
+        result.fills = fills.stats
         return result
 
     def _rebalance(
@@ -159,32 +166,55 @@ class PortfolioEngine:
         targets: dict[str, float],
         positions: dict[str, float],
         open_episodes: dict[str, Episode],
+        reference: dict[str, float],
         timestamp: int,
         result: PortfolioResult,
+        fills,
+        *,
+        force: bool = False,
     ) -> float:
-        cost = 0.0
-        touched = set(positions) | set(targets)
+        pnl = 0.0
         changed = False
 
-        for symbol in touched:
+        for symbol in set(positions) | set(targets):
             current = positions.get(symbol, 0.0)
             target = targets.get(symbol, 0.0)
-
-            history = self.dataset.symbols.get(symbol)
-            if history is None or history.perp_at(timestamp) is None:
-                # No price means no fill; carry the existing position forward.
-                continue
-
             delta = target - current
             if abs(delta) < 1e-9:
                 continue
 
-            changed = True
+            history = self.dataset.symbols.get(symbol)
+            bar = history.perp_at(timestamp) if history else None
+            if bar is None:
+                # No price means no fill; the position simply persists.
+                continue
+
+            # Where a resting order would sit is the last visible price, which
+            # exists even for a symbol the book does not hold yet. That is a
+            # different thing from the PnL basis of an existing position.
+            resting = history.previous_close(timestamp)
+            fill = fills.attempt(bar, resting, buying=delta > 0)
+            if fill is None:
+                fills.stats.missed_notional += abs(delta)
+                if not force:
+                    # A missed post-only order is a trade that did not happen.
+                    continue
+                # The final unwind is not optional: cross the spread to flatten
+                # rather than end the backtest holding an unreported position.
+                fill = Fill(price=bar.open, liquidity=Liquidity.TAKER)
+
+            base = reference.get(symbol)
+            if base is not None and base > 0 and current != 0.0:
+                # Split the bar at the fill: the old size earns up to the fill.
+                pnl += current * (fill.price / base - 1.0)
+                open_episodes[symbol].price_pnl += current * (fill.price / base - 1.0)
+
             traded = abs(delta)
             fee = traded * self._trade_bps / 10_000.0
-            cost += fee
+            pnl -= fee
             result.total_costs += fee
             result.total_turnover += traded
+            changed = True
 
             if current == 0.0:
                 open_episodes[symbol] = Episode(symbol=symbol, opened_ms=timestamp)
@@ -193,6 +223,7 @@ class PortfolioEngine:
                 episode.costs += fee
                 episode.peak_notional = max(episode.peak_notional, abs(target))
 
+            reference[symbol] = fill.price
             if target == 0.0:
                 positions.pop(symbol, None)
                 if episode is not None:
@@ -204,4 +235,4 @@ class PortfolioEngine:
 
         if changed:
             result.rebalances += 1
-        return cost
+        return pnl
