@@ -16,13 +16,15 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.history.client import BybitHistoryClient  # noqa: E402
-from app.history.ingest import HistoryBackfill, SeriesReport  # noqa: E402
+from app.history.ingest import HistoryBackfill  # noqa: E402
 from app.history.models import KlineInterval, OpenInterestInterval  # noqa: E402
 from app.history.storage import HistoryStorage, psycopg_dsn  # noqa: E402
 
@@ -75,7 +77,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="minimum seconds between public requests",
     )
     parser.add_argument("--report-only", action="store_true", help="print coverage and exit")
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="symbols fetched concurrently; each worker holds its own client and connection",
+    )
     return parser
+
+
+PRINT_LOCK = Lock()
+
+
+def backfill_symbol(symbol: str, args, dsn: str) -> tuple[str, int, int]:
+    """Fetch one symbol end to end.
+
+    Each worker builds its own client and storage: the request throttle is
+    per-client state and psycopg connections are not shared across threads.
+    """
+    client = BybitHistoryClient(
+        args.base_url, min_request_interval_seconds=args.request_interval
+    )
+    storage = HistoryStorage(dsn)
+    backfill = HistoryBackfill(client, storage)
+    start_ms, end_ms = parse_day(args.start), parse_day(args.end)
+    kline_interval = KlineInterval(args.interval)
+
+    inserted = 0
+    reports = []
+    if "kline" in args.series:
+        reports.append(backfill.klines(symbol, kline_interval, start_ms, end_ms))
+    if "spot" in args.series:
+        reports.append(backfill.spot_klines(symbol, kline_interval, start_ms, end_ms))
+    if "funding" in args.series:
+        reports.append(backfill.funding(symbol, start_ms, end_ms))
+    if "open_interest" in args.series:
+        reports.append(
+            backfill.open_interest(
+                symbol, OpenInterestInterval(args.oi_interval), start_ms, end_ms
+            )
+        )
+
+    inserted = sum(report.inserted for report in reports)
+    with PRINT_LOCK:
+        print(symbol, flush=True)
+        for report in reports:
+            print(f"  {report.summary()}", flush=True)
+    return symbol, inserted, client.request_count
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,39 +153,35 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    client = BybitHistoryClient(
-        args.base_url, min_request_interval_seconds=args.request_interval
-    )
-
-    def emit(report: SeriesReport) -> None:
-        print(f"  {report.summary()}", flush=True)
-
-    backfill = HistoryBackfill(client, storage, progress=emit)
     kline_interval = KlineInterval(args.interval)
-    oi_interval = OpenInterestInterval(args.oi_interval)
+    workers = max(1, args.workers)
+    total_inserted = total_requests = 0
 
-    total_inserted = 0
-    for symbol in args.symbols:
-        print(f"{symbol}", flush=True)
-        if "kline" in args.series:
-            total_inserted += backfill.klines(symbol, kline_interval, start_ms, end_ms).inserted
-        if "spot" in args.series:
-            total_inserted += backfill.spot_klines(
-                symbol, kline_interval, start_ms, end_ms
-            ).inserted
-        if "funding" in args.series:
-            total_inserted += backfill.funding(symbol, start_ms, end_ms).inserted
-        if "open_interest" in args.series:
-            total_inserted += backfill.open_interest(
-                symbol, oi_interval, start_ms, end_ms
-            ).inserted
+    if workers == 1:
+        for symbol in args.symbols:
+            _, inserted, requests = backfill_symbol(symbol, args, dsn)
+            total_inserted += inserted
+            total_requests += requests
+    else:
+        print(f"fetching {len(args.symbols)} symbols with {workers} workers\n", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(backfill_symbol, symbol, args, dsn) for symbol in args.symbols
+            ]
+            for future in as_completed(futures):
+                _, inserted, requests = future.result()
+                total_inserted += inserted
+                total_requests += requests
 
-    print(f"\ninserted {total_inserted:,} new rows; {client.request_count:,} public requests")
+    print(f"\ninserted {total_inserted:,} new rows; {total_requests:,} public requests")
 
     if "kline" in args.series:
+        reporter = HistoryBackfill(
+            BybitHistoryClient(args.base_url), HistoryStorage(dsn)
+        )
         print("\ncoverage:")
         for symbol in args.symbols:
-            gap = backfill.gap_report(symbol, kline_interval)
+            gap = reporter.gap_report(symbol, kline_interval)
             print(
                 f"  {symbol:10s} stored={gap.stored_rows:>9,} expected={gap.expected_rows:>9,} "
                 f"missing={gap.missing_rows:>7,} ({gap.coverage_pct:5.2f}%)"
