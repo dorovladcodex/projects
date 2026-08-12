@@ -104,16 +104,31 @@ class Gate:
     detail: str
 
 
-def promotion_gates(folds: list[Metrics], holdout: Metrics | None) -> list[Gate]:
+MINIMUM_OOS_TRADES = 30
+MINIMUM_HOLDOUT_TRADES = 30
+MAXIMUM_FOLD_PROFIT_SHARE = 0.50
+
+
+def promotion_gates(
+    folds: list[Metrics],
+    holdout: Metrics | None,
+    *,
+    stress_positive_folds: dict[str, int] | None = None,
+) -> list[Gate]:
     """Pre-registered pass/fail criteria, checked after the run, never tuned.
 
     These mirror the gates the V3/V4 labs already apply so a result here is
-    comparable with the project's existing evidence standard.
+    comparable with the project's existing evidence standard, plus three the
+    first full run showed were missing: a holdout can pass on a handful of
+    trades, one fold can carry the entire profit, and a result can be alive at
+    modelled costs but dead at double them.
     """
     positive = sum(1 for fold in folds if fold.expectancy_bps > 0)
     total_trades = sum(fold.trades for fold in folds)
     aggregate = sum(fold.net_pnl for fold in folds)
     worst_dd = max((fold.max_drawdown_pct for fold in folds), default=0.0)
+    best_fold = max((fold.net_pnl for fold in folds), default=0.0)
+    share = best_fold / aggregate if aggregate > 0 else 1.0
 
     gates = [
         Gate(
@@ -128,8 +143,13 @@ def promotion_gates(folds: list[Metrics], holdout: Metrics | None) -> list[Gate]
         ),
         Gate(
             "minimum_30_oos_trades",
-            total_trades >= 30,
+            total_trades >= MINIMUM_OOS_TRADES,
             f"{total_trades} trades",
+        ),
+        Gate(
+            "no_single_fold_dominates_profit",
+            share <= MAXIMUM_FOLD_PROFIT_SHARE and bool(folds),
+            f"best fold holds {share * 100:.1f}% of aggregate profit",
         ),
         Gate(
             "aggregate_net_positive",
@@ -151,4 +171,23 @@ def promotion_gates(folds: list[Metrics], holdout: Metrics | None) -> list[Gate]
                 f"expectancy {holdout.expectancy_bps:+.2f} bps",
             )
         )
+        gates.append(
+            Gate(
+                "holdout_has_enough_trades",
+                holdout.trades >= MINIMUM_HOLDOUT_TRADES,
+                f"{holdout.trades} holdout trades "
+                f"(a positive sign on a handful of them is not evidence)",
+            )
+        )
+    if stress_positive_folds:
+        for multiplier, count in sorted(stress_positive_folds.items()):
+            if multiplier == "1.0":
+                continue
+            gates.append(
+                Gate(
+                    f"survives_{multiplier}x_costs",
+                    count >= max(1, len(folds) - 1),
+                    f"{count}/{len(folds)} folds positive at {multiplier}x costs",
+                )
+            )
     return gates

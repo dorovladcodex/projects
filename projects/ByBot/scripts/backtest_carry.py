@@ -114,7 +114,8 @@ def main(argv: list[str] | None = None) -> int:
     if report.holdout is not None:
         print(f"\nfrozen holdout: {report.holdout.summary()}")
 
-    print("\ncost stress (taker, multiplied):")
+    print("\ncost stress (multiplied):")
+    stress_positive: dict[str, int] = {}
     for multiplier in STRESS_MULTIPLIERS:
         stress = run_walk_forward(
             dataset,
@@ -126,13 +127,16 @@ def main(argv: list[str] | None = None) -> int:
             liquidity=liquidity,
         )
         aggregate = sum(fold.net_pnl for fold in stress.folds)
+        stress_positive[str(multiplier)] = stress.positive_folds
         print(
             f"  x{multiplier}: net {aggregate:+9.2f}  "
             f"positive folds {stress.positive_folds}/{len(stress.folds)}"
         )
 
     print("\npromotion gates:")
-    gates = promotion_gates(report.folds, report.holdout)
+    gates = promotion_gates(
+        report.folds, report.holdout, stress_positive_folds=stress_positive
+    )
     for gate in gates:
         print(f"  {'PASS' if gate.passed else 'FAIL'}  {gate.name:32s} {gate.detail}")
 
@@ -141,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     print("No Demo run is implied by this result; it is offline evidence only.")
 
     if args.json_out:
+        Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "parameters": parameters.__dict__,
             "liquidity": liquidity.value,

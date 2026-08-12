@@ -327,6 +327,46 @@ def test_gates_fail_when_folds_are_negative() -> None:
     assert any(gate.name == "oos_expectancy_positive" and not gate.passed for gate in gates)
 
 
+def _metrics(trades: int, net: float, expectancy: float = 1.0) -> object:
+    from app.backtest.metrics import Metrics
+
+    return Metrics(
+        trades=trades, wins=trades, net_pnl=net, gross_profit=max(net, 0.0),
+        gross_loss=0.0, funding_pnl=net, price_pnl=0.0, costs=0.0,
+        expectancy_bps=expectancy, max_drawdown=0.0, max_drawdown_pct=0.0,
+        sharpe=1.0, median_holding_hours=24.0,
+    )
+
+
+def test_gate_rejects_a_holdout_with_too_few_trades() -> None:
+    """A positive sign on nine trades is not evidence."""
+    folds = [_metrics(50, 100.0) for _ in range(4)]
+    gates = {g.name: g for g in promotion_gates(folds, _metrics(9, 10.92))}
+
+    assert gates["frozen_holdout_positive"].passed is True
+    assert gates["holdout_has_enough_trades"].passed is False
+
+
+def test_gate_rejects_profit_concentrated_in_one_fold() -> None:
+    folds = [_metrics(20, 10.0), _metrics(20, 10.0), _metrics(100, 236.0), _metrics(20, 10.0)]
+    gates = {g.name: g for g in promotion_gates(folds, None)}
+
+    assert gates["no_single_fold_dominates_profit"].passed is False
+
+
+def test_gate_rejects_a_result_that_dies_at_double_costs() -> None:
+    folds = [_metrics(50, 100.0) for _ in range(4)]
+    gates = {
+        g.name: g
+        for g in promotion_gates(
+            folds, None, stress_positive_folds={"1.0": 4, "1.5": 3, "2.0": 0}
+        )
+    }
+
+    assert gates["survives_2.0x_costs"].passed is False
+    assert gates["survives_1.5x_costs"].passed is True
+
+
 def test_gates_require_a_minimum_trade_count() -> None:
     winning = evaluate(
         BacktestEngine(
