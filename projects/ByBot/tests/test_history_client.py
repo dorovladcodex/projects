@@ -132,6 +132,45 @@ def test_open_interest_page_parses() -> None:
     assert points[0].interval is OpenInterestInterval.FIVE_MINUTES
 
 
+def test_malformed_bar_still_aborts_when_no_handler_is_installed() -> None:
+    """Strict by default: a bad row must not pass silently."""
+    bad = [str(T0), "24.633", "24.718", "24.687", "24.687", "128.7", "3177"]
+    with pytest.raises(ValidationError, match="open outside range"):
+        client(RecordingTransport([ok([bad])])).kline_page(
+            "LINKUSDT", KlineInterval.ONE_MINUTE, T0, T0 + MINUTE_MS
+        )
+
+
+def test_malformed_bar_is_quarantined_and_the_page_continues() -> None:
+    """Real Bybit history contains bars whose open sits outside [low, high]."""
+    seen: list[tuple] = []
+    bad = [str(T0), "24.633", "24.718", "24.687", "24.687", "128.7", "3177"]
+    good = bar(T0 + MINUTE_MS)
+    api = client(
+        RecordingTransport([ok([bad, good])]),
+        on_anomaly=lambda *args: seen.append(args),
+    )
+
+    bars = api.kline_page("LINKUSDT", KlineInterval.ONE_MINUTE, T0, T0 + 2 * MINUTE_MS)
+
+    assert len(bars) == 1
+    assert bars[0].start_ms == T0 + MINUTE_MS
+    assert api.anomaly_count == 1
+    assert seen[0][0] == "LINKUSDT"
+    assert seen[0][2] == "linear"
+    assert "open outside range" in seen[0][4]
+
+
+def test_quarantine_handler_receives_the_raw_row_for_audit() -> None:
+    seen: list[tuple] = []
+    bad = [str(T0), "24.633", "24.718", "24.687", "24.687", "128.7", "3177"]
+    client(
+        RecordingTransport([ok([bad])]), on_anomaly=lambda *args: seen.append(args)
+    ).kline_page("LINKUSDT", KlineInterval.ONE_MINUTE, T0, T0 + MINUTE_MS)
+
+    assert seen[0][3] == bad
+
+
 def test_missing_result_is_an_error_not_an_empty_page() -> None:
     transport = RecordingTransport([{"retCode": 0, "retMsg": "OK"}])
     with pytest.raises(HistoryRequestError, match="missing result"):

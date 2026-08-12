@@ -9,6 +9,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from pydantic import ValidationError
+
 from app.history.models import (
     FundingRate,
     Kline,
@@ -18,6 +20,8 @@ from app.history.models import (
 )
 
 HttpGet = Callable[[str, dict[str, str], float], dict[str, Any]]
+# (symbol, interval, category, raw_row, reason)
+AnomalyHandler = Callable[[str, str, str, Any, str], None]
 
 KLINE_PAGE_LIMIT = 1000
 FUNDING_PAGE_LIMIT = 200
@@ -78,7 +82,10 @@ class BybitHistoryClient:
         max_attempts: int = 5,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        on_anomaly: AnomalyHandler | None = None,
     ) -> None:
+        self.on_anomaly = on_anomaly
+        self.anomaly_count = 0
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.http_get = http_get or _default_http_get
@@ -172,19 +179,28 @@ class BybitHistoryClient:
         for row in self._rows(payload):
             if not isinstance(row, list) or len(row) < 7:
                 raise HistoryRequestError(f"unexpected kline row shape: {row!r}")
-            bars.append(
-                Kline(
-                    symbol=symbol,
-                    interval=interval,
-                    start_ms=int(row[0]),
-                    open=_decimal(row[1], "open"),
-                    high=_decimal(row[2], "high"),
-                    low=_decimal(row[3], "low"),
-                    close=_decimal(row[4], "close"),
-                    volume=_decimal(row[5], "volume"),
-                    turnover=_decimal(row[6], "turnover"),
+            try:
+                bars.append(
+                    Kline(
+                        symbol=symbol,
+                        interval=interval,
+                        start_ms=int(row[0]),
+                        open=_decimal(row[1], "open"),
+                        high=_decimal(row[2], "high"),
+                        low=_decimal(row[3], "low"),
+                        close=_decimal(row[4], "close"),
+                        volume=_decimal(row[5], "volume"),
+                        turnover=_decimal(row[6], "turnover"),
+                    )
                 )
-            )
+            except ValidationError as exc:
+                # Real exchange history contains bars whose open sits outside
+                # [low, high]. Without a handler the invariant still aborts the
+                # run; with one the row is set aside and the backfill continues.
+                if self.on_anomaly is None:
+                    raise
+                self.on_anomaly(symbol, interval.value, category, row, str(exc))
+                self.anomaly_count += 1
         bars.sort(key=lambda bar: bar.start_ms)
         return bars
 

@@ -93,10 +93,19 @@ def backfill_symbol(symbol: str, args, dsn: str) -> tuple[str, int, int]:
     Each worker builds its own client and storage: the request throttle is
     per-client state and psycopg connections are not shared across threads.
     """
-    client = BybitHistoryClient(
-        args.base_url, min_request_interval_seconds=args.request_interval
-    )
     storage = HistoryStorage(dsn)
+
+    def quarantine(sym: str, interval: str, category: str, row, reason: str) -> None:
+        storage.quarantine_kline(
+            symbol=sym, interval=interval, start_ms=int(row[0]),
+            category=category, reason=reason, raw_row=row,
+        )
+
+    client = BybitHistoryClient(
+        args.base_url,
+        min_request_interval_seconds=args.request_interval,
+        on_anomaly=quarantine,
+    )
     backfill = HistoryBackfill(client, storage)
     start_ms, end_ms = parse_day(args.start), parse_day(args.end)
     kline_interval = KlineInterval(args.interval)
@@ -121,6 +130,8 @@ def backfill_symbol(symbol: str, args, dsn: str) -> tuple[str, int, int]:
         print(symbol, flush=True)
         for report in reports:
             print(f"  {report.summary()}", flush=True)
+        if client.anomaly_count:
+            print(f"  quarantined {client.anomaly_count} malformed bars", flush=True)
     return symbol, inserted, client.request_count
 
 

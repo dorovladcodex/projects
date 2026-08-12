@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -68,6 +69,23 @@ DDL_STATEMENTS: tuple[str, ...] = (
         timestamp_ms  BIGINT   NOT NULL,
         open_interest NUMERIC  NOT NULL,
         PRIMARY KEY (symbol, interval, timestamp_ms)
+    )
+    """,
+    # Exchange history contains genuinely malformed bars: a zero-volume bar can
+    # carry a price forward as the next bar's open while that bar's low is
+    # computed only over traded prices, leaving open outside [low, high]. Those
+    # rows are retained here rather than dropped, mirroring the production
+    # persistence_quarantine rule that an audit trail is never bypassed.
+    f"""
+    CREATE TABLE IF NOT EXISTS {SCHEMA}.kline_quarantine (
+        symbol     TEXT        NOT NULL,
+        interval   TEXT        NOT NULL,
+        start_ms   BIGINT      NOT NULL,
+        category   TEXT        NOT NULL,
+        reason     TEXT        NOT NULL,
+        raw_row    JSONB       NOT NULL,
+        recorded_at TIMESTAMPTZ NOT NULL,
+        PRIMARY KEY (symbol, interval, start_ms, category)
     )
     """,
     f"""
@@ -240,6 +258,30 @@ class HistoryStorage:
             )
             connection.commit()
         return result
+
+    def quarantine_kline(
+        self, *, symbol: str, interval: str, start_ms: int, category: str,
+        reason: str, raw_row: Any,
+    ) -> None:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"INSERT INTO {SCHEMA}.kline_quarantine "
+                    f"(symbol, interval, start_ms, category, reason, raw_row, recorded_at) "
+                    f"VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (
+                        symbol, interval, start_ms, category, reason,
+                        json.dumps(raw_row, default=str), datetime.now(timezone.utc),
+                    ),
+                )
+            connection.commit()
+
+    def quarantined_count(self) -> int:
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.kline_quarantine")
+                row = cursor.fetchone()
+        return int(row[0]) if row else 0
 
     def write_funding(self, rates: Sequence[FundingRate]) -> WriteResult:
         rows = [(rate.symbol, rate.funding_time_ms, rate.funding_rate) for rate in rates]
