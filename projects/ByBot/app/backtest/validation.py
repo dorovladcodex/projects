@@ -74,7 +74,22 @@ def run_walk_forward(
     holdout_fraction: float = 0.2,
     starting_equity: float = 10_000.0,
     liquidity: Liquidity = Liquidity.TAKER,
+    engine_factory=None,
+    evaluator=None,
 ) -> WalkForwardReport:
+    """Chronological walk-forward with a frozen tail.
+
+    The engine and evaluator are injectable so the carry pair simulator and the
+    rebalanced long/short book are held to exactly the same fold construction,
+    holdout freeze and gate set.
+    """
+    build_engine = engine_factory or (
+        lambda: BacktestEngine(
+            dataset, costs, starting_equity=starting_equity, liquidity=liquidity
+        )
+    )
+    measure = evaluator or evaluate
+
     development, holdout = split_holdout(dataset.timeline, holdout_fraction)
     folds = chronological_folds(development, fold_count)
 
@@ -83,19 +98,13 @@ def run_walk_forward(
         window = dataset.slice(fold.test_from_ms, fold.test_to_ms + 1)
         strategy = strategy_factory()
         strategy.prepare(dataset)
-        engine = BacktestEngine(
-            dataset, costs, starting_equity=starting_equity, liquidity=liquidity
-        )
-        fold_metrics.append(evaluate(engine.run(strategy, window)))
+        fold_metrics.append(measure(build_engine().run(strategy, window)))
 
     holdout_metrics: Metrics | None = None
     if holdout:
         strategy = strategy_factory()
         strategy.prepare(dataset)
-        engine = BacktestEngine(
-            dataset, costs, starting_equity=starting_equity, liquidity=liquidity
-        )
-        holdout_metrics = evaluate(engine.run(strategy, holdout))
+        holdout_metrics = measure(build_engine().run(strategy, holdout))
 
     return WalkForwardReport(
         folds=fold_metrics, holdout=holdout_metrics, fold_definitions=folds

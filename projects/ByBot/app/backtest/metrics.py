@@ -71,19 +71,31 @@ def _sharpe(curve: list[tuple[int, float]]) -> float:
 
 
 def evaluate(result: BacktestResult) -> Metrics:
-    trades = result.trades
+    return _summarise(result.trades, result.equity_curve, result.net_pnl)
+
+
+def evaluate_portfolio(result) -> Metrics:
+    """Same metrics for a rebalanced long/short book.
+
+    Its position episodes expose the same net/bps/holding surface as a carry
+    trade, so one summariser serves both and the gates stay comparable.
+    """
+    return _summarise(result.episodes, result.equity_curve, result.net_pnl)
+
+
+def _summarise(trades, equity_curve, total_net) -> Metrics:
     nets = [trade.net_pnl for trade in trades]
     wins = sum(1 for value in nets if value > 0)
     gross_profit = sum(value for value in nets if value > 0)
     gross_loss = -sum(value for value in nets if value < 0)
     holdings = sorted(trade.holding_hours for trade in trades)
     median_holding = holdings[len(holdings) // 2] if holdings else 0.0
-    max_dd, max_dd_pct = _drawdown(result.equity_curve)
+    max_dd, max_dd_pct = _drawdown(equity_curve)
 
     return Metrics(
         trades=len(trades),
         wins=wins,
-        net_pnl=result.net_pnl,
+        net_pnl=total_net,
         gross_profit=gross_profit,
         gross_loss=gross_loss,
         funding_pnl=sum(trade.funding_pnl for trade in trades),
@@ -92,7 +104,7 @@ def evaluate(result: BacktestResult) -> Metrics:
         expectancy_bps=fmean([trade.net_bps for trade in trades]) if trades else 0.0,
         max_drawdown=max_dd,
         max_drawdown_pct=max_dd_pct,
-        sharpe=_sharpe(result.equity_curve),
+        sharpe=_sharpe(equity_curve),
         median_holding_hours=median_holding,
     )
 
