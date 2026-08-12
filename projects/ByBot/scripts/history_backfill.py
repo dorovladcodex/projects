@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--to", dest="end", required=True, help="UTC day, YYYY-MM-DD")
     parser.add_argument(
         "--series", nargs="+", default=["kline"],
-        choices=["kline", "funding", "open_interest"],
+        choices=["kline", "spot", "funding", "open_interest"],
     )
     parser.add_argument(
         "--interval", default=KlineInterval.ONE_MINUTE.value,
@@ -123,6 +123,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{symbol}", flush=True)
         if "kline" in args.series:
             total_inserted += backfill.klines(symbol, kline_interval, start_ms, end_ms).inserted
+        if "spot" in args.series:
+            total_inserted += backfill.spot_klines(
+                symbol, kline_interval, start_ms, end_ms
+            ).inserted
         if "funding" in args.series:
             total_inserted += backfill.funding(symbol, start_ms, end_ms).inserted
         if "open_interest" in args.series:

@@ -36,6 +36,23 @@ DDL_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (symbol, interval, start_ms)
     )
     """,
+    # Spot lives in its own table rather than a category column on kline: the
+    # symbol strings collide (spot BTCUSDT vs linear BTCUSDT), and a separate
+    # table keeps the two instruments explicit at every join.
+    f"""
+    CREATE TABLE IF NOT EXISTS {SCHEMA}.spot_kline (
+        symbol      TEXT     NOT NULL,
+        interval    TEXT     NOT NULL,
+        start_ms    BIGINT   NOT NULL,
+        open        NUMERIC  NOT NULL,
+        high        NUMERIC  NOT NULL,
+        low         NUMERIC  NOT NULL,
+        close       NUMERIC  NOT NULL,
+        volume      NUMERIC  NOT NULL,
+        turnover    NUMERIC  NOT NULL,
+        PRIMARY KEY (symbol, interval, start_ms)
+    )
+    """,
     f"""
     CREATE TABLE IF NOT EXISTS {SCHEMA}.funding_rate (
         symbol          TEXT     NOT NULL,
@@ -193,6 +210,31 @@ class HistoryStorage:
             result = self._bulk_upsert(
                 connection,
                 "kline",
+                ("symbol", "interval", "start_ms", "open", "high", "low", "close", "volume", "turnover"),
+                rows,
+            )
+            connection.commit()
+        return result
+
+    def write_spot_klines(self, bars: Sequence[Kline]) -> WriteResult:
+        rows = [
+            (
+                bar.symbol,
+                bar.interval.value,
+                bar.start_ms,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.volume,
+                bar.turnover,
+            )
+            for bar in bars
+        ]
+        with self.connect() as connection:
+            result = self._bulk_upsert(
+                connection,
+                "spot_kline",
                 ("symbol", "interval", "start_ms", "open", "high", "low", "close", "volume", "turnover"),
                 rows,
             )

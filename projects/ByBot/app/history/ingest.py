@@ -11,6 +11,7 @@ from app.history.storage import HistoryStorage, WriteResult
 ProgressHook = Callable[["SeriesReport"], None]
 
 SERIES_KLINE = "kline"
+SERIES_SPOT_KLINE = "spot_kline"
 SERIES_FUNDING = "funding_rate"
 SERIES_OPEN_INTEREST = "open_interest"
 
@@ -131,6 +132,25 @@ class HistoryBackfill:
         with self.storage.session():
             for page in self.client.iter_klines(symbol, interval, start_ms, end_ms):
                 self._accumulate(report, self.storage.write_klines(page))
+        return self._finish(report, started)
+
+    def spot_klines(
+        self, symbol: str, interval: KlineInterval, start_ms: int, end_ms: int
+    ) -> SeriesReport:
+        """Backfill the spot leg needed to evaluate cash-and-carry honestly."""
+        report = SeriesReport(
+            series=SERIES_SPOT_KLINE,
+            symbol=symbol,
+            interval=interval.value,
+            requested_from_ms=start_ms,
+            requested_to_ms=end_ms,
+        )
+        started = self._monotonic()
+        with self.storage.session():
+            for page in self.client.iter_klines(
+                symbol, interval, start_ms, end_ms, category="spot"
+            ):
+                self._accumulate(report, self.storage.write_spot_klines(page))
         return self._finish(report, started)
 
     def funding(self, symbol: str, start_ms: int, end_ms: int) -> SeriesReport:

@@ -147,12 +147,20 @@ class BybitHistoryClient:
     # -------------------------------------------------------------- one page
 
     def kline_page(
-        self, symbol: str, interval: KlineInterval, start_ms: int, end_ms: int
+        self,
+        symbol: str,
+        interval: KlineInterval,
+        start_ms: int,
+        end_ms: int,
+        *,
+        category: str = "linear",
     ) -> list[Kline]:
+        if category not in ("linear", "spot"):
+            raise ValueError(f"unsupported kline category: {category}")
         payload = self.get(
             "/v5/market/kline",
             {
-                "category": "linear",
+                "category": category,
                 "symbol": symbol,
                 "interval": interval.value,
                 "start": str(start_ms),
@@ -237,7 +245,13 @@ class BybitHistoryClient:
     # ------------------------------------------------------------ pagination
 
     def iter_klines(
-        self, symbol: str, interval: KlineInterval, start_ms: int, end_ms: int
+        self,
+        symbol: str,
+        interval: KlineInterval,
+        start_ms: int,
+        end_ms: int,
+        *,
+        category: str = "linear",
     ) -> Iterator[list[Kline]]:
         """Yield ascending kline pages covering [start_ms, end_ms).
 
@@ -249,7 +263,7 @@ class BybitHistoryClient:
         cursor = start_ms
         while cursor < end_ms:
             window_end = min(cursor + window, end_ms)
-            page = self.kline_page(symbol, interval, cursor, window_end)
+            page = self.kline_page(symbol, interval, cursor, window_end, category=category)
             if page:
                 yield page
                 cursor = max(page[-1].start_ms + interval.milliseconds, cursor + 1)
