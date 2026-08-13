@@ -103,13 +103,20 @@ def load_dataset(
     from_ms: int,
     to_ms: int,
     with_spot: bool = True,
+    interval: str = "60",
 ) -> Dataset:
-    """Read hourly perpetual, spot and funding history into memory.
+    """Read perpetual, spot and funding history into memory.
 
     Nothing is interpolated. A missing bar stays missing so the engine can
     decline to trade rather than invent a price.
+
+    `interval` selects the decision clock. At "1" a resting order is exposed
+    for one minute instead of one hour, which is the only way a maker fill
+    test means anything: an hourly bar's range already contains every minute
+    inside it, so an hour-long resting order is reached almost always.
     """
     dataset = Dataset()
+    bar_ms = 60_000 if interval == "1" else 3_600_000
     with psycopg.connect(psycopg_dsn(dsn)) as connection:
         for symbol in symbols:
             history = SymbolHistory(symbol=symbol)
@@ -117,9 +124,9 @@ def load_dataset(
             for start_ms, open_, high, low, close in _rows(
                 connection,
                 f"SELECT start_ms, open, high, low, close FROM {SCHEMA}.kline "
-                f"WHERE symbol=%s AND interval='60' AND start_ms >= %s AND start_ms < %s "
+                f"WHERE symbol=%s AND interval=%s AND start_ms >= %s AND start_ms < %s "
                 f"ORDER BY start_ms",
-                (symbol, from_ms, to_ms),
+                (symbol, interval, from_ms, to_ms),
             ):
                 history.perp.append(
                     Bar(int(start_ms), float(open_), float(high), float(low), float(close))
@@ -129,8 +136,8 @@ def load_dataset(
                 for start_ms, open_, high, low, close in _rows(
                     connection,
                     f"SELECT start_ms, open, high, low, close FROM {SCHEMA}.spot_kline "
-                    f"WHERE symbol=%s AND interval='60' AND start_ms >= %s AND start_ms < %s",
-                    (symbol, from_ms, to_ms),
+                    f"WHERE symbol=%s AND interval=%s AND start_ms >= %s AND start_ms < %s",
+                    (symbol, interval, from_ms, to_ms),
                 ):
                     history.spot[int(start_ms)] = Bar(
                         int(start_ms), float(open_), float(high), float(low), float(close)
@@ -142,8 +149,8 @@ def load_dataset(
                 f"WHERE symbol=%s AND funding_time_ms >= %s AND funding_time_ms < %s",
                 (symbol, from_ms, to_ms),
             ):
-                # Attribute each settlement to the hour bucket that contains it.
-                bucket = (int(funding_time_ms) // HOUR_MS) * HOUR_MS
+                # Attribute each settlement to the bar that contains it.
+                bucket = (int(funding_time_ms) // bar_ms) * bar_ms
                 history.funding[bucket] = Decimal(rate)
 
             history.build_index()

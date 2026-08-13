@@ -20,6 +20,19 @@ class CrossSectionalParameters:
     basket_size: int = 3
     gross_notional: float = 4_000.0
     min_observations: int = 5
+    # Sub-hourly cadence, used when the decision clock is 1m. Overrides
+    # rebalance_hours when set.
+    rebalance_minutes: int | None = None
+
+    @property
+    def rebalance_ms(self) -> int:
+        if self.rebalance_minutes is not None:
+            return self.rebalance_minutes * 60_000
+        return self.rebalance_hours * HOUR_MS
+
+    @property
+    def lookback_ms(self) -> int:
+        return self.lookback_hours * HOUR_MS
 
 
 def _price_at_or_before(history: SymbolHistory, timestamp_ms: int) -> float | None:
@@ -60,7 +73,7 @@ class _CrossSectionalBase:
         if self._anchor_ms is None:
             return False
         elapsed = timestamp_ms - self._anchor_ms
-        return elapsed % (self.parameters.rebalance_hours * HOUR_MS) == 0
+        return elapsed % self.parameters.rebalance_ms == 0
 
     def decide(self, context: PortfolioContext) -> dict[str, float]:
         if not self._is_rebalance_bar(context.timestamp_ms):

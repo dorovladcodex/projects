@@ -274,6 +274,28 @@ def test_book_is_only_rebalanced_on_schedule() -> None:
     assert on_schedule != held
 
 
+def test_rebalance_minutes_overrides_the_hourly_cadence() -> None:
+    """The 1m clock needs a sub-hourly cadence; hours cannot express it."""
+    hourly = CrossSectionalParameters(rebalance_hours=6)
+    sub_hourly = CrossSectionalParameters(rebalance_hours=6, rebalance_minutes=15)
+
+    assert hourly.rebalance_ms == 6 * 3_600_000
+    assert sub_hourly.rebalance_ms == 15 * 60_000
+
+
+def test_strategy_rebalances_on_the_minute_schedule() -> None:
+    data = _universe({name: [100.0] * 60 for name in ("AUSDT", "BUSDT", "CUSDT", "DUSDT")})
+    strategy = MomentumStrategy(
+        CrossSectionalParameters(lookback_hours=24, rebalance_minutes=15, basket_size=1)
+    )
+    strategy.prepare(data)
+    held = {"AUSDT": 500.0}
+
+    # The fixture is on an hourly grid, so every bar is a multiple of 15m.
+    assert strategy._is_rebalance_bar(T0 + HOUR) is True
+    assert strategy.decide(PortfolioContext(T0 + 30 * HOUR, data, held, 10_000.0)) != held
+
+
 def test_momentum_refuses_a_stale_price_reference() -> None:
     item = history("AUSDT", [100.0] * 5)
     data = dataset_of(item)
