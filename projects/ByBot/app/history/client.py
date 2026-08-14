@@ -69,6 +69,11 @@ class BybitHistoryClient:
             "/v5/market/funding/history",
             "/v5/market/open-interest",
             "/v5/market/instruments-info",
+            # Live quotes, for basis observation. Still read-only market data;
+            # the allowlist exists to keep order endpoints unreachable, not to
+            # separate historical reads from current ones.
+            "/v5/market/tickers",
+            "/v5/market/orderbook",
         }
     )
 

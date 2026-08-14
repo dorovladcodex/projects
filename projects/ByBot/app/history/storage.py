@@ -88,6 +88,26 @@ DDL_STATEMENTS: tuple[str, ...] = (
         PRIMARY KEY (symbol, interval, start_ms, category)
     )
     """,
+    # Dated-contract history is not served after expiry, so the only way to
+    # build a range for a contract is to record it while it is alive.
+    f"""
+    CREATE TABLE IF NOT EXISTS {SCHEMA}.basis_observation (
+        observed_at_ms   BIGINT  NOT NULL,
+        future_symbol    TEXT    NOT NULL,
+        base_coin        TEXT    NOT NULL,
+        reference_kind   TEXT    NOT NULL,
+        delivery_ms      BIGINT  NOT NULL,
+        future_mid       NUMERIC NOT NULL,
+        reference_mid    NUMERIC NOT NULL,
+        future_spread_bps  NUMERIC NOT NULL,
+        reference_spread_bps NUMERIC NOT NULL,
+        capacity_usd     NUMERIC NOT NULL,
+        basis_bps        NUMERIC NOT NULL,
+        annualised_bps   NUMERIC NOT NULL,
+        net_annualised_bps NUMERIC NOT NULL,
+        PRIMARY KEY (future_symbol, reference_kind, observed_at_ms)
+    )
+    """,
     f"""
     CREATE TABLE IF NOT EXISTS {SCHEMA}.backfill_progress (
         series          TEXT        NOT NULL,
@@ -275,6 +295,48 @@ class HistoryStorage:
                     ),
                 )
             connection.commit()
+
+    def write_basis(self, observations: Sequence[Any]) -> WriteResult:
+        rows = [
+            (
+                item.observed_at_ms, item.future.symbol, item.base_coin,
+                item.reference_kind, item.delivery_ms,
+                item.future.mid, item.reference.mid,
+                item.future.spread_bps, item.reference.spread_bps,
+                item.capacity_usd, item.basis_bps, item.annualised_bps,
+                item.net_annualised_bps(),
+            )
+            for item in observations
+        ]
+        with self.connect() as connection:
+            result = self._bulk_upsert(
+                connection,
+                "basis_observation",
+                (
+                    "observed_at_ms", "future_symbol", "base_coin", "reference_kind",
+                    "delivery_ms", "future_mid", "reference_mid", "future_spread_bps",
+                    "reference_spread_bps", "capacity_usd", "basis_bps",
+                    "annualised_bps", "net_annualised_bps",
+                ),
+                rows,
+            )
+            connection.commit()
+        return result
+
+    def basis_history(self, reference_kind: str = "perp") -> dict[str, list[float]]:
+        """Annualised basis samples per contract, oldest first."""
+        with self.connect() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT future_symbol, annualised_bps FROM {SCHEMA}.basis_observation "
+                    f"WHERE reference_kind = %s ORDER BY observed_at_ms",
+                    (reference_kind,),
+                )
+                rows = cursor.fetchall()
+        history: dict[str, list[float]] = {}
+        for symbol, value in rows:
+            history.setdefault(symbol, []).append(float(value))
+        return history
 
     def quarantined_count(self) -> int:
         with self.connect() as connection:
