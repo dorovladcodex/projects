@@ -48,6 +48,20 @@ def _price_at_or_before(history: SymbolHistory, timestamp_ms: int) -> float | No
     return bar.close
 
 
+def trailing_return(
+    dataset: Dataset, symbol: str, timestamp_ms: int, lookback_hours: int
+) -> float | None:
+    """Return over the lookback, or None if either endpoint is unusable."""
+    history = dataset.symbols.get(symbol)
+    if history is None:
+        return None
+    now = _price_at_or_before(history, timestamp_ms)
+    then = _price_at_or_before(history, timestamp_ms - lookback_hours * HOUR_MS)
+    if now is None or then is None or then <= 0:
+        return None
+    return now / then - 1.0
+
+
 class _CrossSectionalBase:
     """Dollar-neutral long/short basket driven by a ranked signal.
 
@@ -139,6 +153,27 @@ class FundingTiltStrategy(_CrossSectionalBase):
         return -(total * 10_000.0 / days)
 
 
+class ReversionStrategy(_CrossSectionalBase):
+    """Momentum with the sign flipped: long recent losers, short recent winners.
+
+    Reversing a losing strategy does not recover its losses, because costs do
+    not change sign with the position. For gross `G` and cost `C` the two
+    directions net `G - C` and `-G - C`, summing to `-2C`. A reversal only pays
+    if the original gross was negative by more than the round trip.
+
+    It is included because the funding component is the one part that reversal
+    genuinely changes: the long side pays funding and the short side receives
+    it, and funding is positive 72-88% of the time on every symbol here. The
+    price algebra is settled; the funding leg has to be measured.
+    """
+
+    name = "reversion"
+
+    def signal(self, dataset: Dataset, symbol: str, timestamp_ms: int) -> float | None:
+        value = trailing_return(dataset, symbol, timestamp_ms, self.parameters.lookback_hours)
+        return None if value is None else -value
+
+
 class MomentumStrategy(_CrossSectionalBase):
     """Long recent winners, short recent losers, across the perpetual universe.
 
@@ -151,13 +186,4 @@ class MomentumStrategy(_CrossSectionalBase):
     name = "momentum"
 
     def signal(self, dataset: Dataset, symbol: str, timestamp_ms: int) -> float | None:
-        history = dataset.symbols.get(symbol)
-        if history is None:
-            return None
-        now = _price_at_or_before(history, timestamp_ms)
-        then = _price_at_or_before(
-            history, timestamp_ms - self.parameters.lookback_hours * HOUR_MS
-        )
-        if now is None or then is None or then <= 0:
-            return None
-        return now / then - 1.0
+        return trailing_return(dataset, symbol, timestamp_ms, self.parameters.lookback_hours)

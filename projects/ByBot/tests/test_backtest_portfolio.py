@@ -11,6 +11,7 @@ from app.backtest.signals import (
     CrossSectionalParameters,
     FundingTiltStrategy,
     MomentumStrategy,
+    ReversionStrategy,
 )
 from tests.test_backtest_engine import T0, HOUR, dataset_of, free, history
 
@@ -272,6 +273,49 @@ def test_book_is_only_rebalanced_on_schedule() -> None:
 
     on_schedule = strategy.decide(PortfolioContext(T0 + 48 * HOUR, data, held, 10_000.0))
     assert on_schedule != held
+
+
+def test_reversion_is_exactly_the_opposite_book_to_momentum() -> None:
+    data = _universe(
+        {
+            "AUSDT": [100.0] * 40 + [200.0] * 20,
+            "BUSDT": [100.0] * 40 + [150.0] * 20,
+            "CUSDT": [100.0] * 60,
+            "DUSDT": [100.0] * 40 + [50.0] * 20,
+        }
+    )
+    parameters = CrossSectionalParameters(
+        lookback_hours=24, rebalance_hours=24, basket_size=1
+    )
+    momentum, reversion = MomentumStrategy(parameters), ReversionStrategy(parameters)
+    momentum.prepare(data)
+    reversion.prepare(data)
+    context = PortfolioContext(T0 + 48 * HOUR, data, {}, 10_000.0)
+
+    forward = momentum.decide(context)
+    backward = reversion.decide(context)
+
+    assert forward["AUSDT"] > 0 and backward["AUSDT"] < 0
+    assert forward["DUSDT"] < 0 and backward["DUSDT"] > 0
+
+
+def test_reversing_does_not_recover_costs() -> None:
+    """Both directions pay the same toll; the two nets sum to -2 x cost."""
+    data = dataset_of(
+        history("AUSDT", [100.0, 100.0, 110.0, 110.0]),
+        history("BUSDT", [100.0, 100.0, 90.0, 90.0]),
+    )
+    costs = CostModel(perp_taker_bps=Decimal("5.5"), slippage_bps=Decimal("0"))
+    long_book = PortfolioEngine(data, costs).run(
+        Fixed({"AUSDT": 1_000.0, "BUSDT": -1_000.0}), data.timeline
+    )
+    short_book = PortfolioEngine(data, costs).run(
+        Fixed({"AUSDT": -1_000.0, "BUSDT": 1_000.0}), data.timeline
+    )
+
+    assert long_book.net_pnl + short_book.net_pnl == pytest.approx(
+        -(long_book.total_costs + short_book.total_costs)
+    )
 
 
 def test_rebalance_minutes_overrides_the_hourly_cadence() -> None:

@@ -30,11 +30,16 @@ from app.backtest.signals import (  # noqa: E402
     CrossSectionalParameters,
     FundingTiltStrategy,
     MomentumStrategy,
+    ReversionStrategy,
 )
 from app.backtest.validation import run_walk_forward  # noqa: E402
 from scripts.history_backfill import DEFAULT_SYMBOLS, guard_research_database  # noqa: E402
 
-STRATEGIES = {"momentum": MomentumStrategy, "funding_tilt": FundingTiltStrategy}
+STRATEGIES = {
+    "momentum": MomentumStrategy,
+    "reversion": ReversionStrategy,
+    "funding_tilt": FundingTiltStrategy,
+}
 
 # Rebalance cadence in minutes, spanning the untested gap between the
 # production bot's 4.6 minute median and the daily books already rejected.
