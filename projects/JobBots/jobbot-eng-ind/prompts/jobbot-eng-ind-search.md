@@ -35,17 +35,10 @@ Candidate:
 
 Background:
 - Senior software/data engineering profile
-- Strong Oracle PL/SQL
-- Strong SQL
-- ERP / WMS / logistics / retail / enterprise systems
-- Moving toward:
-  - Azure Databricks
-  - Data Platform
-  - Lakehouse
-  - Spark / PySpark
-  - Python
-  - Azure Data Factory
-  - Microsoft Fabric
+- 13+ years with Oracle data platforms, PL/SQL, SQL, Oracle EBS/ERP, WMS, logistics, retail, and enterprise integrations
+- Production experience with OCI, Oracle ODI, Oracle GoldenGate, ETL/ELT, data warehousing, data migration, and replication
+- Current Azure data-engineering experience: Azure Databricks, Data Platform, Lakehouse, Spark/PySpark, Python, Azure Data Factory, and Microsoft Fabric
+- Strong fit for AI-platform and enterprise AI-integration work built on data engineering; prioritize Azure AI/OpenAI, LLM/RAG, MLOps, and production data-pipeline relevance
 
 ## Target Roles
 
@@ -58,6 +51,23 @@ Include only roles that are reasonably close to one or more of these:
 - Data Lakehouse Engineer
 - Analytics Engineer only if clearly engineering-heavy
 - Data Engineer with Azure / Spark / Python / SQL / Lakehouse / Databricks relevance
+- Senior Oracle Data Integration Engineer
+- Senior Oracle Data Engineer
+- Oracle Cloud / OCI Data Engineer
+- Oracle ERP / EBS Integration Engineer
+- Data Migration Engineer (Oracle to Azure)
+- Senior ETL / ELT Engineer
+- Oracle GoldenGate / Data Replication Engineer
+- Senior Data Warehouse Engineer (Oracle / Azure)
+- Supply Chain / Logistics Data Engineer
+- Enterprise Data Platform Engineer
+- Senior AI Engineer / AI Engineer
+- Azure AI Engineer
+- Generative AI / GenAI Engineer
+- LLM Engineer
+- AI Platform Engineer
+- MLOps Engineer
+- Machine Learning Engineer only when it is clearly platform, deployment, or data-engineering focused
 
 ## Geography and Work Mode
 
@@ -133,6 +143,7 @@ Exclude:
 - internships
 - student roles
 - pure BI/reporting roles unless clearly engineering-heavy
+- pure research, academic, or data-science roles without production AI-platform or data-engineering responsibility
 - roles requiring German C1/C2 unless the fit is exceptional
 - remote roles clearly restricted to:
   - US only
@@ -155,16 +166,21 @@ Strong positives:
 - Delta Lake
 - enterprise data pipelines
 - logistics / retail / ERP / WMS relevance
+- Oracle Database / PL/SQL / OCI / Oracle EBS / Oracle ERP / Oracle ODI / Oracle GoldenGate
+- Oracle-to-Azure migration, data replication, and enterprise integrations
+- Azure AI / Azure OpenAI, Generative AI, LLM/RAG, MLOps, LangChain, vector databases, embeddings, and model serving
 - salary plausibly near or above EUR 85,000
 - remote or realistic NRW hybrid setup
 
 ## Search Behavior
 
 Search in multiple passes mentally before producing the final JSON:
-1. English-friendly remote Databricks / Azure / Data Platform roles
-2. NRW hybrid/local direct vacancy pages
-3. Freelance/project roles with strong Databricks/Azure fit
-4. Indexed sources beyond GermanTechJobs if concrete vacancy URLs exist
+1. English-friendly remote Azure / Databricks / Data Platform roles
+2. English-friendly AI engineering, Azure AI/OpenAI, LLM/RAG, MLOps, and AI-platform roles with strong production data relevance
+3. English-friendly Oracle data integration, OCI, Oracle EBS/ERP, migration, replication, and data-warehouse roles
+4. NRW hybrid/local direct vacancy pages
+5. Freelance/project roles with strong Azure, AI-platform, or Oracle enterprise-data fit
+6. Indexed sources beyond GermanTechJobs if concrete vacancy URLs exist
 
 Do not stop early after finding one good source.
 Do not return only one source group if other valid groups exist.
@@ -213,6 +229,26 @@ Required query patterns:
   - `site:boards.greenhouse.io Senior Data Engineer Germany Databricks`
   - `site:jobs.smartrecruiters.com Senior Data Engineer Germany Azure`
   - `site:workdayjobs.com Senior Data Engineer Germany Databricks`
+
+Also run these Oracle/Enterprise Data patterns against every source group where a concrete vacancy detail page can be found:
+- `"Senior Oracle Data Integration Engineer" Germany`
+- `"Senior Oracle Data Engineer" Germany`
+- `"Oracle Cloud Data Engineer" OR "OCI Data Engineer" Germany`
+- `"Oracle ERP Integration Engineer" OR "Oracle EBS Integration Engineer" Germany`
+- `"Data Migration Engineer" Oracle Azure Germany`
+- `"Senior ETL Engineer" OR "Senior ELT Engineer" Oracle Germany`
+- `"Oracle GoldenGate" OR "Data Replication Engineer" Germany`
+- `"Senior Data Warehouse Engineer" Oracle Azure Germany`
+- `"Supply Chain Data Engineer" OR "Logistics Data Engineer" Germany`
+- `"Enterprise Data Platform Engineer" Germany`
+
+Also run these AI Engineering patterns against every source group where a concrete vacancy detail page can be found:
+- `"Senior AI Engineer" OR "AI Engineer" Germany Azure`
+- `"Azure AI Engineer" OR "Azure OpenAI Engineer" Germany`
+- `"Generative AI Engineer" OR "GenAI Engineer" Germany`
+- `"LLM Engineer" OR "RAG Engineer" Germany`
+- `"AI Platform Engineer" Germany`
+- `"MLOps Engineer" Germany Azure`
 
 Source diversity target:
 - Prefer at least 5-10 strong vacancies per represented major source group when available.

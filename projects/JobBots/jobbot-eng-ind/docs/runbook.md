@@ -26,18 +26,22 @@ Full run with Drive and email:
 JOBBOT_ENABLE_DRIVE=1 JOBBOT_ENABLE_GMAIL=1 bash scripts/run_jobbot_eng_ind.sh
 ```
 
-Email sending is on by default in the runner. The default delivery mode is `codex-plugin`, which uses `codex exec` plus the Gmail plugin. Use `JOBBOT_ENABLE_GMAIL=0` only for a one-off run without email.
+Email sending is on by default in the runner. The default delivery mode is `codex-plugin`, which uses `codex exec` plus the Gmail plugin. A Gmail message ID is required before a vacancy is recorded as seen. Use `JOBBOT_ENABLE_GMAIL=0` only for a one-off run without email.
 
-The scheduled runner sends to `dorovlad@gmail.com` by default, uses `.manual-runs/state/seen-vacancies.json` as the shared state file, and includes only new vacancies in the email report.
+The scheduled runner sends to `dorovlad@gmail.com` by default, uses `.manual-runs/state/seen-vacancies.json` as the shared state file, and includes only new vacancies in the email report. The report is grouped into Data Engineering, AI Engineering, and Oracle / Enterprise Data sections.
 
 Before Codex source passes, the scheduled runner fetches public APIs (`Arbeitnow`, `RemoteOK`, `Remotive`) into `raw-source-passes/public-apis.json`. This gives stable direct-source coverage when those APIs expose relevant roles.
 
-Crontab for 12:00 and 16:00 Germany time:
+For production, install and enable the systemd user timer. It handles the Europe/Berlin timezone and daylight-saving transitions:
 
-```cron
-CRON_TZ=Europe/Berlin
-0 12,16 * * * cd /home/dorovlad_codex/projects/projects/JobBots/jobbot-eng-ind && bash scripts/run_scheduled_jobbot_eng_ind.sh >> .manual-runs/scheduled.log 2>&1
+```bash
+cp config/systemd/jobbot-eng-ind.timer ~/.config/systemd/user/
+cp config/systemd/jobbot-eng-ind.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now jobbot-eng-ind.timer
 ```
+
+The repository retains `config/jobbot-eng-ind.cron` only as a reference. Do not enable it together with systemd.
 
 The repository also contains scheduler templates:
 

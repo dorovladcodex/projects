@@ -4,8 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-RUN_DIR="$ROOT_DIR/.manual-runs/smoke-test"
-mkdir -p "$RUN_DIR"
+RUN_DIR="$(mktemp -d "$ROOT_DIR/.manual-runs/smoke-test.XXXXXX")"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -19,5 +18,8 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
   --vacancies-json "$RUN_DIR/vacancies.json" \
   --output-root "$RUN_DIR/output" \
   --state-file "$RUN_DIR/seen-vacancies.json"
+
+PYTHONPATH="$ROOT_DIR/src" "$PYTHON_BIN" -m unittest discover -s "$ROOT_DIR/tests" -v
+bash "$ROOT_DIR/tests/test_gmail_sender.sh"
 
 echo "Smoke test output: $RUN_DIR"

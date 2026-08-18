@@ -7,7 +7,6 @@ TO="${1:-${JOBBOT_EMAIL_TO:-dorovlad@gmail.com}}"
 SUBJECT="${2:-}"
 BODY_FILE="${3:-}"
 ATTACHMENT_FILE="${4:-}"
-CONTENT_TYPE="${JOBBOT_EMAIL_CONTENT_TYPE:-text/plain}"
 
 if [[ -z "$SUBJECT" || -z "$BODY_FILE" ]]; then
   echo "Usage: $0 [to] <subject> <body_file> [attachment_file]" >&2
@@ -24,6 +23,11 @@ if [[ -n "$ATTACHMENT_FILE" && ! -f "$ATTACHMENT_FILE" ]]; then
   exit 2
 fi
 
+if [[ -n "$ATTACHMENT_FILE" ]]; then
+  echo "Automatic JobBot delivery does not support attachments; the report itself contains all new vacancies." >&2
+  exit 2
+fi
+
 if [[ -n "${CODEX_BIN:-}" ]]; then
   :
 elif command -v codex >/dev/null 2>&1; then
@@ -37,26 +41,49 @@ else
   exit 127
 fi
 
+DELIVERY_RESULT="${JOBBOT_GMAIL_RESULT_FILE:-$(mktemp)}"
+RESULT_IS_TEMPORARY=0
+if [[ -z "${JOBBOT_GMAIL_RESULT_FILE:-}" ]]; then
+  RESULT_IS_TEMPORARY=1
+else
+  mkdir -p "$(dirname "$DELIVERY_RESULT")"
+fi
+cleanup() {
+  if [[ "$RESULT_IS_TEMPORARY" == "1" ]]; then
+    rm -f "$DELIVERY_RESULT"
+  fi
+}
+trap cleanup EXIT
+
 PROMPT=$(
   cat <<EOF
-Use the Gmail plugin to send an email immediately.
+Send the JobBot report through the Gmail plugin now.
 
 Requirements:
-- Send to: $TO
-- Use this exact recipient address literally. Do not replace it with "me" or any self-delivery alias.
+- Call the Gmail send-email tool exactly once; do not create a draft and do not run another Codex process.
+- Do not read skill files or reprint the report in your response.
+- Send to the literal address: $TO
 - Subject: $SUBJECT
-- Use content type: $CONTENT_TYPE
-- Use this exact body file: $BODY_FILE
+- Read this body file and use its complete contents as a text/plain MIME body: $BODY_FILE
+- Do not attach files.
+- Only after the Gmail tool confirms success, respond with exactly: JOBBOT_GMAIL_SENT:<message-id>
+- If the Gmail tool fails, explain the failure without this success marker.
 EOF
 )
 
-if [[ -n "$ATTACHMENT_FILE" ]]; then
-  PROMPT+=$'\n'"- Attach this exact file: $ATTACHMENT_FILE"
-fi
-
-PROMPT+=$'\n\n'"Do not create a draft. Send it now and report the Gmail message ID."
-
-"$CODEX_BIN" exec \
+if ! "$CODEX_BIN" exec \
   --skip-git-repo-check \
   --cd "$ROOT_DIR" \
-  "$PROMPT"
+  "$PROMPT" 2>&1 | tee "$DELIVERY_RESULT"; then
+  echo "Gmail delivery command failed." >&2
+  cat "$DELIVERY_RESULT" >&2
+  exit 1
+fi
+
+if ! grep -Eq 'JOBBOT_GMAIL_SENT:[[:alnum:]]+' "$DELIVERY_RESULT"; then
+  echo "Gmail delivery was not confirmed by a Gmail message ID." >&2
+  cat "$DELIVERY_RESULT" >&2
+  exit 1
+fi
+
+cat "$DELIVERY_RESULT"

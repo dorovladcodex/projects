@@ -15,6 +15,7 @@ COVERAGE_JSON="$RUN_DIR/source-coverage.json"
 REJECTS_JSON="$RUN_DIR/rejected-vacancies.json"
 STATE_FILE="${JOBBOT_STATE_FILE:-$ROOT_DIR/.manual-runs/state/seen-vacancies.json}"
 REPORT_ROOT="$RUN_DIR/output"
+PENDING_VACANCIES_JSON="$RUN_DIR/pending-new-vacancies.json"
 SCHEMA_FILE="$ROOT_DIR/schemas/vacancies.schema.json"
 
 mkdir -p "$RAW_DIR" "$REPORT_ROOT" "$(dirname "$STATE_FILE")"
@@ -33,6 +34,26 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 SOURCE_PASS_RETRIES="${JOBBOT_SOURCE_PASS_RETRIES:-2}"
 SOURCE_PASS_RETRY_SLEEP_SECONDS="${JOBBOT_SOURCE_PASS_RETRY_SLEEP_SECONDS:-60}"
 SOURCE_PASS_TIMEOUT_SECONDS="${JOBBOT_SOURCE_PASS_TIMEOUT_SECONDS:-1200}"
+ORACLE_ENTERPRISE_QUERY_BLOCK="
+- \"Senior Oracle Data Integration Engineer\" Germany
+- \"Senior Oracle Data Engineer\" Germany
+- \"Oracle Cloud Data Engineer\" OR \"OCI Data Engineer\" Germany
+- \"Oracle ERP Integration Engineer\" OR \"Oracle EBS Integration Engineer\" Germany
+- \"Data Migration Engineer\" Oracle Azure Germany
+- \"Senior ETL Engineer\" OR \"Senior ELT Engineer\" Oracle Germany
+- \"Oracle GoldenGate\" OR \"Data Replication Engineer\" Germany
+- \"Senior Data Warehouse Engineer\" Oracle Azure Germany
+- \"Supply Chain Data Engineer\" OR \"Logistics Data Engineer\" Germany
+- \"Enterprise Data Platform Engineer\" Germany
+"
+AI_ENGINEERING_QUERY_BLOCK="
+- \"Senior AI Engineer\" OR \"AI Engineer\" Germany Azure
+- \"Azure AI Engineer\" OR \"Azure OpenAI Engineer\" Germany
+- \"Generative AI Engineer\" OR \"GenAI Engineer\" Germany
+- \"LLM Engineer\" OR \"RAG Engineer\" Germany
+- \"AI Platform Engineer\" Germany
+- \"MLOps Engineer\" Germany Azure
+"
 TOOL_BIN_DIR="$ROOT_DIR/.manual-runs/bin"
 mkdir -p "$TOOL_BIN_DIR"
 if [[ ! -x "$TOOL_BIN_DIR/python" ]] && command -v python3 >/dev/null 2>&1; then
@@ -86,12 +107,20 @@ Candidate:
 - Volodymyr, near Dortmund, NRW, Germany.
 - German B1 improving toward B2; English-friendly strongly preferred.
 - Target compensation EUR 85,000+ gross/year where realistic.
-- Senior Oracle PL/SQL, SQL, ERP/WMS/logistics/retail/enterprise systems.
-- Moving toward Azure Databricks, Data Platform, Lakehouse, Spark/PySpark, Python, Azure Data Factory, Microsoft Fabric.
+- 13+ years with Oracle data platforms, PL/SQL, SQL, Oracle EBS/ERP, WMS/logistics/retail, and enterprise integrations.
+- Production experience with OCI, Oracle ODI, Oracle GoldenGate, ETL/ELT, data warehousing, migration, and replication.
+- Current Azure experience: Databricks, Data Platform, Lakehouse, Spark/PySpark, Python, Azure Data Factory, Microsoft Fabric.
+- Strong fit for AI-platform and enterprise AI-integration work; prioritize Azure AI/OpenAI, LLM/RAG, MLOps, and production data relevance.
 
 Include:
 - Senior Data Engineer, Azure Data Engineer, Databricks Data Engineer, Cloud Data Engineer, Data Platform Engineer, Data Lakehouse Engineer.
 - Analytics Engineer only if clearly engineering-heavy.
+- Senior Oracle Data Integration Engineer, Senior Oracle Data Engineer, Oracle Cloud / OCI Data Engineer.
+- Oracle ERP / EBS Integration Engineer, Data Migration Engineer (Oracle to Azure), Senior ETL / ELT Engineer.
+- Oracle GoldenGate / Data Replication Engineer, Senior Data Warehouse Engineer (Oracle / Azure).
+- Supply Chain / Logistics Data Engineer, Enterprise Data Platform Engineer.
+- Senior AI Engineer / AI Engineer, Azure AI Engineer, Generative AI / GenAI Engineer, LLM Engineer, AI Platform Engineer, MLOps Engineer.
+- Machine Learning Engineer only when it is clearly platform, deployment, or data-engineering focused.
 - Germany/EU remote roles compatible with Germany-based candidates.
 - NRW hybrid/local roles near Dortmund, Essen, Duesseldorf, Bochum, Duisburg, Cologne/Koeln, Wuppertal, Ratingen, Neuss.
 - Strong freelance/contract roles if technically strong and remote-friendly.
@@ -136,6 +165,8 @@ Each vacancy must contain exactly:
 Search only this source group. Do not fill with another source group.
 
 Required searches:
+$AI_ENGINEERING_QUERY_BLOCK
+$ORACLE_ENTERPRISE_QUERY_BLOCK
 $query_block
 PROMPT
 )"
@@ -239,31 +270,41 @@ run_source_pass "recruiters" "Recruiters" "
   --coverage-output "$COVERAGE_JSON" \
   --rejects-output "$REJECTS_JSON"
 
-"$PYTHON_BIN" "$ROOT_DIR/src/jobbot_eng_ind.py" \
-  --vacancies-json "$VALID_JSON" \
-  --output-root "$REPORT_ROOT" \
-  --state-file "$STATE_FILE" \
-  ${JOBBOT_NEW_ONLY:+--new-only}
+REPORT_ARGS=(
+  --vacancies-json "$VALID_JSON"
+  --output-root "$REPORT_ROOT"
+  --state-file "$STATE_FILE"
+)
+if [[ "${JOBBOT_NEW_ONLY:-0}" == "1" ]]; then
+  REPORT_ARGS+=(--new-only)
+fi
+if [[ "${JOBBOT_ENABLE_GMAIL:-1}" == "1" ]]; then
+  REPORT_ARGS+=(--no-commit-state --pending-vacancies-file "$PENDING_VACANCIES_JSON")
+fi
+"$PYTHON_BIN" "$ROOT_DIR/src/jobbot_eng_ind.py" "${REPORT_ARGS[@]}"
 
 REPORT_FILE="$(find "$REPORT_ROOT" -name email-report.txt -type f | sort | tail -n 1)"
 
 if [[ "${JOBBOT_ENABLE_GMAIL:-1}" == "1" ]]; then
   DELIVERY_MODE="${JOBBOT_GMAIL_DELIVERY_MODE:-codex-plugin}"
   if [[ "$DELIVERY_MODE" == "codex-plugin" ]]; then
-    bash "$ROOT_DIR/scripts/send_report_via_codex_gmail.sh" \
+    JOBBOT_GMAIL_RESULT_FILE="$RUN_DIR/gmail-delivery-result.txt" bash "$ROOT_DIR/scripts/send_report_via_codex_gmail.sh" \
       "${JOBBOT_EMAIL_TO:-dorovlad@gmail.com}" \
-      "JobBot Eng Ind - English-friendly job results - $(date +%Y-%m-%d)" \
-      "$REPORT_FILE" \
-      "$VALID_JSON"
+      "JobBot Eng Ind - Data, AI & Oracle job results - $(date +%Y-%m-%d)" \
+      "$REPORT_FILE"
   else
     "$PYTHON_BIN" "$ROOT_DIR/src/send_gmail.py" \
       --to "${JOBBOT_EMAIL_TO:-dorovlad@gmail.com}" \
-      --subject "JobBot Eng Ind - English-friendly job results - $(date +%Y-%m-%d)" \
+      --subject "JobBot Eng Ind - Data, AI & Oracle job results - $(date +%Y-%m-%d)" \
       --body-file "$REPORT_FILE" \
       --attachment "$VALID_JSON" \
       --google-client-file "${GOOGLE_CLIENT_FILE:-$ROOT_DIR/credentials/google-oauth-client.json}" \
       --gmail-token-file "${GMAIL_TOKEN_FILE:-$ROOT_DIR/credentials/gmail-token.json}"
   fi
+  "$PYTHON_BIN" "$ROOT_DIR/src/jobbot_eng_ind.py" \
+    --commit-only \
+    --vacancies-json "$PENDING_VACANCIES_JSON" \
+    --state-file "$STATE_FILE"
 fi
 
 echo "Run directory: $RUN_DIR"

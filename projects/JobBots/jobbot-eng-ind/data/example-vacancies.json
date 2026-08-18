@@ -9,6 +9,15 @@
     "url": "https://example.com/job",
     "language": "English required; German is a plus",
     "priority": "A",
-    "analysis": "Example vacancy format for JobBot Eng Ind."
+    "contract_type": "Permanent",
+    "core_tech_match": "Azure, Databricks, Python, SQL",
+    "fit_score": 8.5,
+    "status": "NEW",
+    "analysis": "Example vacancy format for JobBot Eng Ind with a direct role page and Germany-compatible remote work.",
+    "recommendation": "Review the original posting before applying.",
+    "found_at": "2026-08-17T10:00:00+00:00",
+    "source_group": "Company career pages",
+    "language_risk": "low",
+    "salary_likelihood": "high"
   }
 ]

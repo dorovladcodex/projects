@@ -48,6 +48,45 @@ SOURCE_GROUPS = [
 PRIORITY_ORDER = {"A": 0, "A-": 1, "B+": 2, "B": 3, "B-": 4, "C": 5}
 LANGUAGE_RISK_PENALTY = {"low": 0.0, "medium": 0.25, "high": 0.75}
 MAX_OUTPUT_ITEMS = 100
+REMOTE_RESTRICTION_TERMS = [
+    "us-only",
+    "us only",
+    "united states",
+    "usa",
+    "usa only",
+    "united states only",
+    "uk-only",
+    "uk only",
+    "united kingdom only",
+    "spain-only",
+    "spain only",
+    "poland-only",
+    "poland only",
+]
+REMOTE_COMPATIBILITY_TERMS = [
+    "germany",
+    "deutschland",
+    "europe",
+    "emea",
+    "worldwide",
+    "eu",
+    "nrw",
+    "nordrhein-westfalen",
+    "north rhine-westphalia",
+    "dortmund",
+    "essen",
+    "duesseldorf",
+    "düsseldorf",
+    "bochum",
+    "duisburg",
+    "cologne",
+    "koeln",
+    "köln",
+    "wuppertal",
+    "ratingen",
+    "neuss",
+    "holzwickede",
+]
 
 
 def load_json(path: Path, fallback: Any) -> Any:
@@ -83,6 +122,10 @@ def score_vacancy(vacancy: dict[str, Any]) -> float:
         score += 0.5
     if any(term in text for term in ["databricks", "azure", "fabric", "spark", "pyspark", "lakehouse"]):
         score += 0.6
+    if any(term in text for term in ["oracle", "pl/sql", "oci", "oracle ebs", "oracle erp", "oracle odi", "goldengate", "data migration", "data replication", "supply chain", "logistics", "wms"]):
+        score += 0.45
+    if any(term in text for term in ["generative ai", "genai", "llm", "large language model", "mlops", "azure ai", "azure openai", "langchain", "vector database", "embedding", "model serving"]):
+        score += 0.45
     if any(term in text for term in ["remote", "homeoffice", "home office", "100%"]):
         score += 0.25
     if is_nrw_local_hybrid(vacancy):
@@ -109,16 +152,59 @@ def should_reject(vacancy: dict[str, Any]) -> str | None:
         return "generic careers page without direct vacancy detail"
     if not contains_any_role_term(
         role_text,
-        ["data engineer", "databricks", "data platform", "analytics engineer", "etl", "elt", "lakehouse", "data warehouse", "fabric"],
+        [
+            "data engineer",
+            "databricks",
+            "data platform",
+            "analytics engineer",
+            "etl",
+            "elt",
+            "lakehouse",
+            "data warehouse",
+            "fabric",
+            "oracle data integration",
+            "oracle cloud",
+            "oci",
+            "oracle ebs",
+            "oracle erp",
+            "data migration",
+            "goldengate",
+            "data replication",
+            "supply chain",
+            "logistics",
+            "ai engineer",
+            "generative ai",
+            "genai",
+            "llm",
+            "machine learning engineer",
+            "mlops",
+            "ai platform",
+            "azure ai",
+            "azure openai",
+        ],
     ):
         return "weak role match"
-    if "onsite" in text and not any(term in text for term in ["remote", "hybrid", "homeoffice", "home office"]):
+    if vacancy["source_group"] not in SOURCE_GROUPS:
+        return "unknown source group"
+    work_mode = str(vacancy.get("work_mode", "")).lower()
+    if any(term in work_mode for term in ["onsite", "on-site"]) and not any(
+        term in work_mode for term in ["remote", "hybrid", "homeoffice", "home office"]
+    ):
         return "onsite without remote/hybrid signal"
+    if any(term in text for term in REMOTE_RESTRICTION_TERMS):
+        return "remote role restricted outside Germany-compatible locations"
+    if has_remote_signal(vacancy) and not any(contains_role_term(text, term) for term in REMOTE_COMPATIBILITY_TERMS):
+        return "remote role without Germany-compatible location"
     if "german c1" in text and score_vacancy(vacancy) < 8.0:
         return "German C1 role without exceptional fit"
     if "company careers search" in str(vacancy.get("source", "")).lower() and not has_direct_job_url(vacancy):
         return "company careers search without direct vacancy url"
     return None
+
+
+def has_remote_signal(vacancy: dict[str, Any]) -> bool:
+    text = " ".join(str(vacancy.get(field, "")) for field in ["location", "work_mode", "analysis"]).lower()
+    return any(term in text for term in ["remote", "homeoffice", "home office", "mobile work"])
 
 
 def looks_like_generic_careers_page(url: str) -> bool:
@@ -129,6 +215,10 @@ def looks_like_generic_careers_page(url: str) -> bool:
     path = parsed.path.lower().rstrip("/")
     if not parsed.scheme or not parsed.netloc:
         return True
+    last_segment = path.rsplit("/", 1)[-1]
+    # Some company ATS URLs use a generic careers path with a final requisition ID.
+    if re.fullmatch(r"[a-z]{1,4}\d{5,}", last_segment) or re.fullmatch(r"\d{4}-\d{5,}", last_segment):
+        return False
     generic_paths = {
         "",
         "/",
@@ -204,7 +294,9 @@ def is_english_remote(vacancy: dict[str, Any]) -> bool:
     text = " ".join(str(vacancy.get(field, "")) for field in ["location", "work_mode", "language", "analysis"]).lower()
     remote_signal = any(term in text for term in ["remote", "home office", "homeoffice", "fully remote", "full remote", "100% remote"])
     english_signal = "english" in text
-    germany_compatible = not any(term in text for term in ["us-only", "uk-only", "spain-only", "poland-only"])
+    germany_compatible = not any(term in text for term in REMOTE_RESTRICTION_TERMS) and any(
+        contains_role_term(text, term) for term in REMOTE_COMPATIBILITY_TERMS
+    )
     return remote_signal and english_signal and germany_compatible
 
 
@@ -234,12 +326,61 @@ def mix_and_limit(vacancies: list[dict[str, Any]], limit: int) -> list[dict[str,
 
 
 def source_coverage(vacancies: list[dict[str, Any]]) -> list[dict[str, str]]:
-    seen_text = " ".join(str(vacancy.get("source_group", "")) for vacancy in vacancies).lower()
+    seen_groups = {str(vacancy.get("source_group", "")) for vacancy in vacancies}
     coverage = []
     for group in SOURCE_GROUPS:
-        outcome = "strong matches found" if group.lower().split("/")[0] in seen_text else "not represented in validated output"
+        outcome = "strong matches found" if group in seen_groups else "not represented in validated output"
         coverage.append({"source_group": group, "outcome": outcome})
     return coverage
+
+
+def vacancy_identity(vacancy: dict[str, Any]) -> str:
+    def canonical(value: Any) -> str:
+        text = str(value or "").casefold()
+        text = re.sub(
+            r"\b(?:all genders|m\s*/\s*[fw]\s*/\s*(?:d|\*)|[fw]\s*/\s*m\s*/\s*d|d\s*/\s*f\s*/\s*m|w\s*/\s*m\s*/\s*x|gn)(?![a-z0-9])",
+            " ",
+            text,
+        )
+        text = re.sub(r"[^a-z0-9]+", " ", text)
+        return " ".join(text.split())
+
+    return "|".join([canonical(vacancy.get("company")), canonical(vacancy.get("title"))])
+
+
+def validate_vacancies(raw_items: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    accepted: list[dict[str, Any]] = []
+    rejects: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+    seen_urls: set[str] = set()
+    seen_roles: set[str] = set()
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            rejects.append({"reason": "item is not an object", "item": str(raw)})
+            continue
+        vacancy = normalize_vacancy(raw)
+        url = str(vacancy.get("url", "")).strip().lower()
+        key = "|".join(str(vacancy.get(part, "")).strip().lower() for part in ["company", "title", "location", "url"])
+        role = vacancy_identity(vacancy)
+        if key in seen_keys:
+            rejects.append({"reason": "duplicate", "item": vacancy.get("url", "")})
+            continue
+        if url in seen_urls:
+            rejects.append({"reason": "duplicate url", "item": vacancy.get("url", "")})
+            continue
+        if role in seen_roles:
+            rejects.append({"reason": "duplicate role across sources", "item": vacancy.get("url", "")})
+            continue
+        reason = should_reject(vacancy)
+        if reason:
+            rejects.append({"reason": reason, "item": vacancy.get("url", "")})
+            continue
+        seen_keys.add(key)
+        seen_urls.add(url)
+        seen_roles.add(role)
+        vacancy["_rank_score"] = round(score_vacancy(vacancy), 3)
+        accepted.append(vacancy)
+    return accepted, rejects
 
 
 def main() -> None:
@@ -256,34 +397,10 @@ def main() -> None:
     if not isinstance(raw_items, list):
         raise ValueError("Input must be a JSON array or an object with a vacancies array")
 
-    accepted: list[dict[str, Any]] = []
-    rejects: list[dict[str, str]] = []
-    seen_keys: set[str] = set()
-    seen_urls: set[str] = set()
-    for raw in raw_items:
-        if not isinstance(raw, dict):
-            rejects.append({"reason": "item is not an object", "item": str(raw)})
-            continue
-        vacancy = normalize_vacancy(raw)
-        url = str(vacancy.get("url", "")).strip().lower()
-        key = "|".join(str(vacancy.get(part, "")).strip().lower() for part in ["company", "title", "location", "url"])
-        if key in seen_keys:
-            rejects.append({"reason": "duplicate", "item": vacancy.get("url", "")})
-            continue
-        seen_keys.add(key)
-        if url in seen_urls:
-            rejects.append({"reason": "duplicate url", "item": vacancy.get("url", "")})
-            continue
-        seen_urls.add(url)
-        reason = should_reject(vacancy)
-        if reason:
-            rejects.append({"reason": reason, "item": vacancy.get("url", "")})
-            continue
-        vacancy["_rank_score"] = round(score_vacancy(vacancy), 3)
-        accepted.append(vacancy)
+    accepted, rejects = validate_vacancies(raw_items)
 
     accepted.sort(key=lambda item: (-item["_rank_score"], -float(item["fit_score"]), PRIORITY_ORDER.get(item["priority"], 99)))
-    accepted = accepted[:MAX_OUTPUT_ITEMS]
+    accepted = mix_and_limit(accepted, MAX_OUTPUT_ITEMS)
     for item in accepted:
         item.pop("_rank_score", None)
 

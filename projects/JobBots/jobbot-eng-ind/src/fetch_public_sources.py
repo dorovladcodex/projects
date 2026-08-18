@@ -22,6 +22,22 @@ SEARCH_TERMS = [
     "lakehouse",
     "spark",
     "python sql",
+    "oracle data integration",
+    "oracle data engineer",
+    "oci data engineer",
+    "oracle ebs integration",
+    "oracle azure data migration",
+    "senior etl engineer",
+    "oracle goldengate data replication",
+    "oracle data warehouse engineer",
+    "logistics data engineer",
+    "enterprise data platform engineer",
+    "ai engineer",
+    "azure ai engineer",
+    "generative ai engineer",
+    "llm engineer",
+    "ai platform engineer",
+    "mlops engineer",
 ]
 
 TARGET_TERMS = [
@@ -37,6 +53,33 @@ TARGET_TERMS = [
     "elt",
     "python",
     "sql",
+    "oracle",
+    "pl/sql",
+    "oci",
+    "oracle ebs",
+    "oracle erp",
+    "oracle odi",
+    "goldengate",
+    "data migration",
+    "data replication",
+    "data warehouse",
+    "supply chain",
+    "logistics",
+    "wms",
+    "artificial intelligence",
+    "generative ai",
+    "genai",
+    "llm",
+    "large language model",
+    "machine learning",
+    "mlops",
+    "rag",
+    "azure ai",
+    "azure openai",
+    "langchain",
+    "vector database",
+    "embedding",
+    "model serving",
 ]
 
 TARGET_TITLE_TERMS = [
@@ -48,6 +91,30 @@ TARGET_TITLE_TERMS = [
     "azure data",
     "databricks",
     "lakehouse",
+    "oracle data integration",
+    "oracle data engineer",
+    "oracle cloud data engineer",
+    "oci data engineer",
+    "oracle erp integration",
+    "oracle ebs integration",
+    "data migration engineer",
+    "etl engineer",
+    "elt engineer",
+    "oracle goldengate",
+    "data replication engineer",
+    "data warehouse engineer",
+    "supply chain data engineer",
+    "logistics data engineer",
+    "enterprise data platform engineer",
+    "ai engineer",
+    "artificial intelligence engineer",
+    "generative ai engineer",
+    "genai engineer",
+    "llm engineer",
+    "ai platform engineer",
+    "mlops engineer",
+    "machine learning engineer",
+    "applied ai engineer",
 ]
 
 STRONG_BODY_TERMS = [
@@ -62,6 +129,31 @@ STRONG_BODY_TERMS = [
     "data warehouse",
     "etl",
     "elt",
+    "oracle",
+    "pl/sql",
+    "oci",
+    "oracle ebs",
+    "oracle erp",
+    "oracle odi",
+    "goldengate",
+    "data migration",
+    "data replication",
+    "supply chain",
+    "logistics",
+    "wms",
+    "generative ai",
+    "genai",
+    "llm",
+    "large language model",
+    "machine learning",
+    "mlops",
+    "rag",
+    "azure ai",
+    "azure openai",
+    "langchain",
+    "vector database",
+    "embedding",
+    "model serving",
 ]
 
 WEAK_TERMS = [
@@ -95,9 +187,35 @@ WEAK_TERMS = [
     "business consultant",
     "professur",
     "professor",
+    "research scientist",
+    "research engineer",
 ]
 
-REMOTE_COMPATIBLE_TERMS = ["germany", "deutschland", "europe", "emea", "eu", "worldwide", "remote"]
+REMOTE_COMPATIBLE_TERMS = [
+    "germany",
+    "deutschland",
+    "europe",
+    "emea",
+    "eu",
+    "worldwide",
+    "remote",
+    "nrw",
+    "nordrhein-westfalen",
+    "north rhine-westphalia",
+    "dortmund",
+    "essen",
+    "duesseldorf",
+    "düsseldorf",
+    "bochum",
+    "duisburg",
+    "cologne",
+    "koeln",
+    "köln",
+    "wuppertal",
+    "ratingen",
+    "neuss",
+    "holzwickede",
+]
 REMOTE_RESTRICTED_TERMS = ["united states", "usa only", "us only", "uk only", "spain only", "poland only"]
 
 
@@ -311,6 +429,12 @@ def estimate_fit(title: str, location: str, work_mode: str, text: str) -> float:
     for term in ["databricks", "azure", "fabric", "spark", "pyspark", "lakehouse"]:
         if term in haystack:
             score += 0.45
+    for term in ["oracle", "oci", "oracle ebs", "oracle erp", "oracle odi", "goldengate", "data migration", "data replication", "supply chain", "logistics", "wms"]:
+        if term in haystack:
+            score += 0.35
+    for term in ["generative ai", "genai", "llm", "large language model", "mlops", "azure ai", "azure openai", "langchain", "vector database", "embedding", "model serving"]:
+        if term in haystack:
+            score += 0.35
     for term in ["sql", "python", "etl", "elt", "data platform", "data engineer"]:
         if term in haystack:
             score += 0.25
@@ -337,7 +461,43 @@ def summarize_tech_match(title: str, text: str) -> str:
     haystack = f"{title} {text}".lower()
     terms = [
         term
-        for term in ["Azure", "Databricks", "Microsoft Fabric", "Spark", "PySpark", "Python", "SQL", "ETL", "ELT", "Lakehouse", "Kafka", "Airflow", "dbt"]
+        for term in [
+            "Azure",
+            "Databricks",
+            "Microsoft Fabric",
+            "Spark",
+            "PySpark",
+            "Python",
+            "SQL",
+            "ETL",
+            "ELT",
+            "Lakehouse",
+            "Oracle",
+            "PL/SQL",
+            "OCI",
+            "Oracle EBS",
+            "Oracle ERP",
+            "Oracle ODI",
+            "Oracle GoldenGate",
+            "Data migration",
+            "Data replication",
+            "WMS",
+            "Supply chain",
+            "Logistics",
+            "Azure AI",
+            "Azure OpenAI",
+            "Generative AI",
+            "LLM",
+            "RAG",
+            "MLOps",
+            "LangChain",
+            "Vector database",
+            "Embeddings",
+            "Model serving",
+            "Kafka",
+            "Airflow",
+            "dbt",
+        ]
         if contains_term(haystack, term.lower())
     ]
     return ", ".join(terms) if terms else clean_text(title)
